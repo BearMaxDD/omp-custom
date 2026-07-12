@@ -101,7 +101,7 @@ export function renderTopicPacket(packet: BrainstormTopicPacket): string {
  */
 function redactText(text: string): string {
 	return text
-		.replace(/Authorization:\s*\S+/gi, "Authorization:[REDACTED]")
+		.replace(/Authorization:\s*(\S+)\s+\S+/gi, "Authorization: $1 [REDACTED]")
 		.replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]")
 		.replace(/api[_-]?key['"]?\s*[:=]\s*['"]?\S+['"]?/gi, "api_key:[REDACTED]")
 		.replace(/token['"]?\s*[:=]\s*['"]?\S+['"]?/gi, "token:[REDACTED]");
