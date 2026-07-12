@@ -111,16 +111,26 @@ export class TopicStore {
 		this.cachedState = null;
 		const statePath = this.statePath();
 		if (existsSync(statePath)) {
-			try { rmSync(statePath); } catch { /* best-effort */ }
+			try {
+				rmSync(statePath);
+			} catch {
+				/* best-effort */
+			}
 		}
 		try {
 			const dir = this.topicsDir();
 			for (const entry of readdirSync(dir)) {
 				if (entry.endsWith(".jsonl")) {
-					try { rmSync(join(dir, entry)); } catch { /* best-effort */ }
+					try {
+						rmSync(join(dir, entry));
+					} catch {
+						/* best-effort */
+					}
 				}
 			}
-		} catch { /* best-effort */ }
+		} catch {
+			/* best-effort */
+		}
 	}
 
 	// ── Event Log ───────────────────────────────────────────────────

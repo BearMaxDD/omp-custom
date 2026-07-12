@@ -6,24 +6,14 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
-import { TopicStore } from "../../src/brainstorm/topic-store";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { TopicCoordinator } from "../../src/brainstorm/topic-coordinator";
-import type {
-	BrainstormDecision,
-	BrainstormReview,
-	BrainstormTopicState,
-} from "../../src/brainstorm/types";
-import {
-	validTopicInput,
-	makeTopicState,
-	fullCodebaseSnapshot,
-	emptyEvidenceSnapshot,
-	validReview,
-} from "./fixtures";
+import { TopicStore } from "../../src/brainstorm/topic-store";
+import type { BrainstormDecision, BrainstormReview, BrainstormTopicState } from "../../src/brainstorm/types";
+import { emptyEvidenceSnapshot, fullCodebaseSnapshot, makeTopicState, validReview, validTopicInput } from "./fixtures";
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -159,7 +149,9 @@ describe("TopicCoordinator", () => {
 
 		// Attempting to request a review on a decided topic should throw
 		expect(coordinator.current()?.status).toBe("decided");
-		await expect(coordinator.markReviewRequested(topic.topicId, "review-2")).rejects.toThrow(/cannot transition|decided/i);
+		await expect(coordinator.markReviewRequested(topic.topicId, "review-2")).rejects.toThrow(
+			/cannot transition|decided/i,
+		);
 	});
 
 	// ── Decision Recording ──────────────────────────────────────────
@@ -234,6 +226,25 @@ describe("TopicCoordinator", () => {
 		expect(coordinator.current()?.attempt).toBe(2);
 	});
 
+	it("reopened topic can transition back to ready_for_advisor_review via markReady", async () => {
+		const coordinator = fixtureCoordinator();
+		const { topic } = await coordinator.submit(validTopicInput(), fullCodebaseSnapshot());
+		await coordinator.markReviewRequested(topic.topicId, "review-1");
+		await coordinator.acceptReview(validReview(topic));
+		await coordinator.recordDecision(topic.topicId, {
+			topic_id: topic.topicId,
+			decision: "reopen",
+			rationale: "need more constraints",
+			ts: new Date().toISOString(),
+		});
+
+		expect(coordinator.current()?.status).toBe("drafting");
+
+		await coordinator.markReady(topic.topicId);
+
+		expect(coordinator.current()?.status).toBe("ready_for_advisor_review");
+	});
+
 	// ── Recovery ────────────────────────────────────────────────────
 
 	it("recovers current topic from disk after coordinator recreation", async () => {
@@ -246,8 +257,8 @@ describe("TopicCoordinator", () => {
 		const coordinator2 = new TopicCoordinator(new TopicStore(dir));
 		const recovered = coordinator2.current();
 		expect(recovered).not.toBeNull();
-		expect(recovered!.topicId).toBe(topic.topicId);
-		expect(recovered!.status).toBe("ready_for_advisor_review");
+		expect(recovered?.topicId).toBe(topic.topicId);
+		expect(recovered?.status).toBe("ready_for_advisor_review");
 	});
 
 	// ── Read-only Queries ───────────────────────────────────────────
@@ -264,6 +275,6 @@ describe("TopicCoordinator", () => {
 
 		const events = await coordinator.getTopicEvents(topic.topicId);
 		expect(events.length).toBeGreaterThanOrEqual(2);
-		expect(events.map(e => e.event)).toEqual(["topic_created", "review_requested"]);
+		expect(events.map((e) => e.event)).toEqual(["topic_created", "review_requested"]);
 	});
 });

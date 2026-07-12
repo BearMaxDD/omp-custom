@@ -53,7 +53,7 @@ export function buildTopicCodebaseEvidence(
 	}
 
 	const { codebaseMemory } = snapshot;
-	const references = codebaseMemory.references.map(label => ({
+	const references = codebaseMemory.references.map((label) => ({
 		label,
 		source: deriveSource(codebaseMemory.queries),
 	}));
@@ -89,20 +89,16 @@ export function buildTopicCodebaseEvidence(
 function deriveSource(queries: string[]): "graph" | "snippet" | "trace" | "text" {
 	if (queries.includes("get_code_snippet")) return "snippet";
 	if (queries.includes("trace_path")) return "trace";
-	if (queries.some(q => q.startsWith("search_"))) return "graph";
+	if (queries.some((q) => q.startsWith("search_"))) return "graph";
 	return "text";
 }
 
 /** True when at least one query is a recognised read-only codebase tool. */
 function hasRelevantQuery(queries: string[]): boolean {
-	return queries.some(q =>
-		(READ_ONLY_CODEBASE_SUFFIXES as readonly string[]).includes(q),
-	);
+	return queries.some((q) => (READ_ONLY_CODEBASE_SUFFIXES as readonly string[]).includes(q));
 }
 
 /** Keep only recognised read-only codebase tool names. */
 function filterReadOnlyTools(queries: string[]): string[] {
-	return queries.filter(q =>
-		(READ_ONLY_CODEBASE_SUFFIXES as readonly string[]).includes(q),
-	);
+	return queries.filter((q) => (READ_ONLY_CODEBASE_SUFFIXES as readonly string[]).includes(q));
 }

@@ -6,13 +6,13 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
-import type { BrainstormTopicState, BrainstormDecision } from "../../src/brainstorm/types";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { TopicStore } from "../../src/brainstorm/topic-store";
-import { validTopicInput, makeTopicState, fullCodebaseSnapshot, validReview } from "./fixtures";
+import type { BrainstormDecision, BrainstormTopicState } from "../../src/brainstorm/types";
+import { fullCodebaseSnapshot, makeTopicState, validReview, validTopicInput } from "./fixtures";
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -29,7 +29,7 @@ describe("TopicStore", () => {
 
 	it("creates the brainstorms state directory on construction", () => {
 		const dir = tempDir();
-		const store = new TopicStore(dir);
+		const _store = new TopicStore(dir);
 		expect(existsSync(join(dir, "state.json"))).toBe(false); // no state yet
 		expect(existsSync(join(dir, "topics"))).toBe(true); // topics directory created
 	});
@@ -56,10 +56,10 @@ describe("TopicStore", () => {
 
 		const loaded = store.load();
 		expect(loaded).not.toBeNull();
-		expect(loaded!.topicId).toBe(topic.topicId);
-		expect(loaded!.inputHash).toBe(topic.inputHash);
-		expect(loaded!.status).toBe(topic.status);
-		expect(loaded!.attempt).toBe(topic.attempt);
+		expect(loaded?.topicId).toBe(topic.topicId);
+		expect(loaded?.inputHash).toBe(topic.inputHash);
+		expect(loaded?.status).toBe(topic.status);
+		expect(loaded?.attempt).toBe(topic.attempt);
 	});
 
 	it("overwrites state atomically on repeated save", async () => {
@@ -72,7 +72,7 @@ describe("TopicStore", () => {
 		await store.saveState(topic2);
 
 		const loaded = store.load();
-		expect(loaded!.input.title).toBe("second");
+		expect(loaded?.input.title).toBe("second");
 	});
 
 	it("does not leave a dangling .tmp file after successful write", async () => {
@@ -115,7 +115,7 @@ describe("TopicStore", () => {
 
 		const events = await store.readEvents(topic.topicId);
 		expect(events).toHaveLength(3);
-		expect(events.map(e => e.event)).toEqual(["topic_created", "review_requested", "review_received"]);
+		expect(events.map((e) => e.event)).toEqual(["topic_created", "review_requested", "review_received"]);
 	});
 
 	it("tolerates a truncated last line in JSONL (crash recovery)", async () => {
@@ -125,12 +125,18 @@ describe("TopicStore", () => {
 		const logDir = join(dir, "topics");
 
 		const validLine1 = JSON.stringify({
-			event: "topic_created", topicId: topic.topicId, attempt: 1,
-			ts: new Date().toISOString(), schemaVersion: 1,
+			event: "topic_created",
+			topicId: topic.topicId,
+			attempt: 1,
+			ts: new Date().toISOString(),
+			schemaVersion: 1,
 		});
 		const validLine2 = JSON.stringify({
-			event: "review_requested", topicId: topic.topicId, reviewId: "r1",
-			ts: new Date().toISOString(), schemaVersion: 1,
+			event: "review_requested",
+			topicId: topic.topicId,
+			reviewId: "r1",
+			ts: new Date().toISOString(),
+			schemaVersion: 1,
 		});
 		const partialLine = '{"event":"review_received","topicId":"';
 
@@ -139,7 +145,7 @@ describe("TopicStore", () => {
 
 		const events = await store.readEvents(topic.topicId);
 		expect(events).toHaveLength(2);
-		expect(events.map(e => e.event)).toEqual(["topic_created", "review_requested"]);
+		expect(events.map((e) => e.event)).toEqual(["topic_created", "review_requested"]);
 	});
 
 	it("returns empty events for a topic with no log file", async () => {

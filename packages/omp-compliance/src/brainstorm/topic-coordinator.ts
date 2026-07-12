@@ -11,15 +11,10 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { computeTopicFingerprint, normalizeTopicInput } from "./topic-fingerprint";
-import { type TopicEventRecord, TopicStore } from "./topic-store";
-import type {
-	BrainstormDecision,
-	BrainstormReview,
-	BrainstormTopicReadyInput,
-	BrainstormTopicState,
-} from "./types";
 import type { EvidenceSnapshot } from "../signals/types";
+import { computeTopicFingerprint, normalizeTopicInput } from "./topic-fingerprint";
+import type { TopicEventRecord, TopicStore } from "./topic-store";
+import type { BrainstormDecision, BrainstormReview, BrainstormTopicReadyInput, BrainstormTopicState } from "./types";
 
 // ─── Submit Result ───────────────────────────────────────────────────
 
@@ -43,13 +38,13 @@ type BrainstormTopicStatus = BrainstormTopicState["status"];
 
 /** Valid state transitions: source -> [allowed targets]. */
 const TRANSITIONS: Record<BrainstormTopicStatus, BrainstormTopicStatus[]> = {
-	drafting:                     ["ready_for_advisor_review"],
-	ready_for_advisor_review:     ["advisor_reviewing"],
-	advisor_reviewing:            ["awaiting_user_decision", "review_unavailable"],
-	review_unavailable:           ["awaiting_user_decision", "drafting"],
-	awaiting_user_decision:       ["decided", "parked", "drafting"],
-	decided:                      [],
-	parked:                       [],
+	drafting: ["ready_for_advisor_review"],
+	ready_for_advisor_review: ["advisor_reviewing"],
+	advisor_reviewing: ["awaiting_user_decision", "review_unavailable"],
+	review_unavailable: ["awaiting_user_decision", "drafting"],
+	awaiting_user_decision: ["decided", "parked", "drafting"],
+	decided: [],
+	parked: [],
 };
 
 // ─── TopicCoordinator ────────────────────────────────────────────────
@@ -73,10 +68,7 @@ export class TopicCoordinator {
 	 * If another topic is currently waiting for review, returns "conflict".
 	 * Otherwise, creates a new topic and returns kind "created".
 	 */
-	async submit(
-		input: BrainstormTopicReadyInput,
-		evidence: EvidenceSnapshot,
-	): Promise<SubmitTopicResult> {
+	async submit(input: BrainstormTopicReadyInput, evidence: EvidenceSnapshot): Promise<SubmitTopicResult> {
 		const normalized = normalizeTopicInput(input);
 		const inputHash = computeTopicFingerprint(normalized, evidence.codebaseMemory.references);
 		const existingTopic = this.store.load();
@@ -125,6 +117,15 @@ export class TopicCoordinator {
 	}
 
 	/**
+	 * Mark a reopened topic as ready for advisor review again.
+	 * Transitions: drafting -> ready_for_advisor_review
+	 */
+	async markReady(topicId: string): Promise<void> {
+		await this.transition(topicId, "ready_for_advisor_review");
+		await this.store.appendEvent(topicId, "topic_created", { attempt: this.getCurrentOrThrow().attempt });
+	}
+
+	/**
 	 * Accept and store the advisor's review.
 	 * Transitions: advisor_reviewing -> awaiting_user_decision
 	 *              review_unavailable -> awaiting_user_decision (retry)
@@ -142,9 +143,7 @@ export class TopicCoordinator {
 				reviewStatus: review.status,
 			});
 		} else {
-			throw new Error(
-				`Cannot accept review: cannot transition from "${fromStatus}"`,
-			);
+			throw new Error(`Cannot accept review: cannot transition from "${fromStatus}"`);
 		}
 	}
 
@@ -173,9 +172,7 @@ export class TopicCoordinator {
 		this.assertTopicId(topic, decision.topic_id);
 
 		if (topic.status !== "awaiting_user_decision") {
-			throw new Error(
-				`Cannot record decision: topic is "${topic.status}", expected "awaiting_user_decision"`,
-			);
+			throw new Error(`Cannot record decision: topic is "${topic.status}", expected "awaiting_user_decision"`);
 		}
 
 		switch (decision.decision) {
@@ -203,8 +200,8 @@ export class TopicCoordinator {
 				topic.status = "drafting";
 				topic.attempt += 1;
 				// Clear review and decision for the new attempt
-				delete topic.review;
-				delete topic.decision;
+				topic.review = undefined;
+				topic.decision = undefined;
 				await this.store.saveState(topic);
 				await this.store.appendEvent(topicId, "topic_reopened", {
 					newAttempt: topic.attempt,
@@ -241,9 +238,7 @@ export class TopicCoordinator {
 
 	private assertTopicId(topic: BrainstormTopicState, expectedId: string): void {
 		if (topic.topicId !== expectedId) {
-			throw new Error(
-				`Topic ID mismatch: expected "${topic.topicId}", got "${expectedId}"`,
-			);
+			throw new Error(`Topic ID mismatch: expected "${topic.topicId}", got "${expectedId}"`);
 		}
 	}
 
@@ -252,9 +247,7 @@ export class TopicCoordinator {
 	 * — in which case a new submit should return "conflict".
 	 */
 	private isWaitingForReview(status: BrainstormTopicStatus): boolean {
-		return status === "ready_for_advisor_review"
-			|| status === "advisor_reviewing"
-			|| status === "review_unavailable";
+		return status === "ready_for_advisor_review" || status === "advisor_reviewing" || status === "review_unavailable";
 	}
 
 	/**
@@ -264,16 +257,14 @@ export class TopicCoordinator {
 	private async transition(
 		topicId: string,
 		target: BrainstormTopicStatus,
-		extra: Record<string, unknown> = {},
+		_extra: Record<string, unknown> = {},
 	): Promise<void> {
 		const topic = this.getCurrentOrThrow();
 		this.assertTopicId(topic, topicId);
 
 		const allowed = TRANSITIONS[topic.status];
 		if (!allowed?.includes(target)) {
-			throw new Error(
-				`Cannot transition: from "${topic.status}" to "${target}" is not allowed`,
-			);
+			throw new Error(`Cannot transition: from "${topic.status}" to "${target}" is not allowed`);
 		}
 
 		topic.status = target;
