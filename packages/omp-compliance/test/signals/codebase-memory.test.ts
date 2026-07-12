@@ -142,4 +142,23 @@ describe("codebaseIndexReady — 矩阵测试", () => {
 	test.each(cases)("%s %j → indexReady=%s", (toolName, result, ready) => {
 		expect(codebaseIndexReady(toolName, result)).toBe(ready);
 	});
+
+	it("识别真实 MCP fully-qualified index_repository 名称", () => {
+		const result = normalizeCodebaseMemory([
+			{
+				call: {
+					toolCallId: "call-fqn",
+					toolName: "mcp__codebase_memory_mcp__index_repository",
+					serverName: "",
+					params: {},
+				},
+				result: {
+					toolCallId: "call-fqn",
+					success: true,
+					resultRef: JSON.stringify({ status: "indexed" }),
+				},
+			},
+		]);
+		expect(result.indexReady).toBe(true);
+	});
 });

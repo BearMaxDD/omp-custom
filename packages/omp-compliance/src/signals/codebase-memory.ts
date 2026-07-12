@@ -50,11 +50,17 @@ interface SingleInput {
  * - other tools:      never considered index-readiness
  */
 export function codebaseIndexReady(toolName: string, result: { success: boolean; status?: string }): boolean {
+	const normalizedToolName = shortToolName(toolName);
 	return (
 		result.success === true &&
-		((toolName === "index_repository" && (result.status === "indexed" || result.status === "ready")) ||
-			(toolName === "index_status" && result.status === "ready"))
+		((normalizedToolName === "index_repository" && (result.status === "indexed" || result.status === "ready")) ||
+			(normalizedToolName === "index_status" && result.status === "ready"))
 	);
+}
+
+function shortToolName(toolName: string): string {
+	const dotted = toolName.split(".").pop() ?? toolName;
+	return dotted.split("__").pop() ?? dotted;
 }
 
 /**
@@ -98,23 +104,21 @@ export function normalizeCodebaseMemory(paired: PairedInput | SingleInput): {
 	for (const { call, result } of paired) {
 		const toolName = call.toolName;
 		const serverName = call.serverName ?? "";
+		const shortName = shortToolName(toolName);
 
 		// Only consider codebase-memory server tools
 		if (!serverName && toolName.indexOf(".") < 0 && toolName.indexOf("_") >= 0) {
 			// When serverName is absent but the tool name contains underscores
 			// typical of MCP tools, we still check the RECOGNIZED_TOOLS set.
 			// This handles harness variants that don't set serverName explicitly.
-			if (!RECOGNIZED_TOOLS.has(toolName)) {
-				// Also check if toolName ends with a recognized stem
-				const stem = toolName.split(".").pop() ?? "";
-				if (!RECOGNIZED_TOOLS.has(stem)) continue;
+			if (!RECOGNIZED_TOOLS.has(shortName)) {
+				continue;
 			}
 		} else if (serverName !== EXPECTED_SERVER) {
 			continue;
 		}
 
 		// Extract the short tool name (strip server prefix if FQN)
-		const shortName = toolName.includes(".") ? (toolName.split(".").pop() ?? toolName) : toolName;
 		if (!RECOGNIZED_TOOLS.has(shortName)) continue;
 
 		const success = result?.success ?? false;

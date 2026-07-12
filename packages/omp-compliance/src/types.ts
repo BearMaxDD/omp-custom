@@ -22,7 +22,7 @@ export interface RegisteredCommand {
 }
 
 export interface ExtensionContext {
-	extensionName: string;
+	sessionManager: { getSessionId(): string };
 }
 
 export type ExtensionHandler<TEvent, TResult = void> = (
@@ -82,9 +82,24 @@ export type AdvisorRunTrigger = "turn_end" | "compliance_review";
  */
 export interface AgentTool {
 	name: string;
+	label: string;
 	description?: string;
 	parameters?: unknown;
-	handler: (params: Record<string, unknown>) => Promise<unknown>;
+	intent?: "omit" | "optional" | "require";
+	execute: (
+		toolCallId: string,
+		params: Record<string, unknown>,
+		signal?: AbortSignal,
+		onUpdate?: (partial: AgentToolResult) => void,
+		context?: unknown,
+	) => Promise<AgentToolResult>;
+}
+
+export interface AgentToolResult {
+	content: Array<{ type: "text"; text: string }>;
+	details?: unknown;
+	useless?: boolean;
+	isError?: boolean;
 }
 
 /**

@@ -49,13 +49,11 @@ export default function activate(api: ExtensionAPI): void {
 
 	// Session tracking: updated on session_start / session_switch
 	let sessionId: string | null = null;
-	api.on("session_start", (event: unknown) => {
-		const ev = event as { sessionId?: string };
-		if (ev.sessionId) sessionId = ev.sessionId;
+	api.on("session_start", (_event: unknown, context: ExtensionContext) => {
+		sessionId = context.sessionManager.getSessionId();
 	});
-	api.on("session_switch", (event: unknown) => {
-		const ev = event as { sessionId?: string };
-		if (ev.sessionId) sessionId = ev.sessionId;
+	api.on("session_switch", (_event: unknown, context: ExtensionContext) => {
+		sessionId = context.sessionManager.getSessionId();
 	});
 	const reviewDeps: ComplianceReviewDependencies = {
 		sessionId: () => {

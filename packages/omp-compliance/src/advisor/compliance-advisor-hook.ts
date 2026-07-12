@@ -23,7 +23,9 @@ import type { ComplianceReviewEnvelope, ComplianceReviewRegistry } from "./revie
  */
 export function createComplianceAdvisorHook(
 	registry: ComplianceReviewRegistry,
-	runtime: { acceptVerdict: (verdict: Record<string, unknown>) => Promise<void> },
+	runtime: {
+		acceptVerdict: (verdict: Record<string, unknown>) => Promise<{ accepted: boolean; reason?: string }>;
+	},
 ): (event: AdvisorBeforeRunEvent) => AdvisorBeforeRunResult | undefined {
 	return (event: AdvisorBeforeRunEvent): AdvisorBeforeRunResult | undefined => {
 		if (event.trigger !== "compliance_review") {
@@ -59,12 +61,16 @@ export function createComplianceAdvisorHook(
  */
 export function createComplianceVerdictTool(
 	envelope: ComplianceReviewEnvelope,
-	runtime: { acceptVerdict: (verdict: Record<string, unknown>) => Promise<void> },
+	runtime: {
+		acceptVerdict: (verdict: Record<string, unknown>) => Promise<{ accepted: boolean; reason?: string }>;
+	},
 	registry: ComplianceReviewRegistry,
 ): AgentTool {
 	return {
 		name: "compliance_verdict",
+		label: "Compliance Verdict",
 		description: "Submit a compliance verdict after reviewing the task completion",
+		intent: "omit",
 		parameters: {
 			type: "object",
 			properties: {
@@ -89,11 +95,21 @@ export function createComplianceVerdictTool(
 			},
 			required: ["schema_version", "task_id", "contract_hash", "attempt", "status", "findings"],
 		},
-		handler: async (params: Record<string, unknown>): Promise<unknown> => {
+		execute: async (_toolCallId: string, params: Record<string, unknown>) => {
 			validateVerdictIdentity(params, envelope);
-			await runtime.acceptVerdict(params);
+			const result = await runtime.acceptVerdict(params);
+			if (!result.accepted) {
+				return {
+					content: [{ type: "text" as const, text: `Verdict rejected: ${result.reason ?? "unknown reason"}` }],
+					details: result,
+					isError: true,
+				};
+			}
 			registry.consume(envelope.reviewId);
-			return { accepted: true };
+			return {
+				content: [{ type: "text" as const, text: "Compliance verdict accepted." }],
+				details: result,
+			};
 		},
 	};
 }

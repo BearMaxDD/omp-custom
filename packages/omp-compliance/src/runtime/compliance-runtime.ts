@@ -328,9 +328,9 @@ export class ComplianceRuntime {
 	 *
 	 * @param verdict — raw advisor verdict (schema_version, task_id, ...)
 	 */
-	async acceptVerdict(verdict: Record<string, unknown>): Promise<void> {
+	async acceptVerdict(verdict: Record<string, unknown>): Promise<{ accepted: boolean; reason?: string }> {
 		if (!this.taskState) {
-			return;
+			return { accepted: false, reason: "No active compliance task" };
 		}
 
 		// Step 1: Schema + context validation via parseVerdict
@@ -349,7 +349,7 @@ export class ComplianceRuntime {
 					type: "protocol_error",
 					error: `Schema validation failed — ${err.message}`,
 				});
-				return;
+				return { accepted: false, reason: err.message };
 			}
 			throw err;
 		}
@@ -364,7 +364,7 @@ export class ComplianceRuntime {
 				});
 			}
 			// Idempotent reject (already processed) → no-op
-			return;
+			return { accepted: false, reason: sinkResult.reason };
 		}
 
 		// Step 3: Map parsed verdict to state machine transitions
@@ -382,7 +382,7 @@ export class ComplianceRuntime {
 				signalDigest: "advisor-pass",
 				verdictSummary: findings.length > 0 ? findings[0].reason : undefined,
 			});
-			return;
+			return { accepted: true };
 		}
 
 		// Status is "remediate" — extract required fixes from findings
@@ -418,6 +418,7 @@ export class ComplianceRuntime {
 				findings: remediationFindings,
 			});
 		}
+		return { accepted: true };
 	}
 
 	/**
