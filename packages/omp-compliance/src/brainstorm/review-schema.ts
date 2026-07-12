@@ -14,7 +14,7 @@
  * context binding.
  */
 
-import type { BrainstormFinding, BrainstormAlternative, BrainstormReview } from "./types";
+import type { BrainstormAlternative, BrainstormFinding, BrainstormReview } from "./types";
 
 // ─── Error ────────────────────────────────────────────────────────────
 
@@ -47,10 +47,7 @@ const ALLOWED_CONFIDENCES = new Set(["high", "medium", "low"]);
  *
  * Throws BrainstormReviewError on first validation failure.
  */
-export function parseBrainstormReview(
-	raw: Record<string, unknown>,
-	context: ReviewContext,
-): BrainstormReview {
+export function parseBrainstormReview(raw: Record<string, unknown>, context: ReviewContext): BrainstormReview {
 	if (typeof raw !== "object" || raw === null) {
 		throw new BrainstormReviewError("Input must be a non-null object");
 	}
@@ -64,19 +61,21 @@ export function parseBrainstormReview(
 
 	// ── Schema version ─────────────────────────────────────────────
 	if (raw.schema_version !== 1) {
-		throw new BrainstormReviewError(`Missing or invalid schema_version: expected 1`);
+		throw new BrainstormReviewError("Missing or invalid schema_version: expected 1");
 	}
 
 	// ── Identity ───────────────────────────────────────────────────
 	if (raw.topic_id !== context.topicId) {
-		throw new BrainstormReviewError(
-			`topic_id mismatch: expected "${context.topicId}", got "${String(raw.topic_id)}"`,
-		);
+		throw new BrainstormReviewError(`topic_id mismatch: expected "${context.topicId}", got "${String(raw.topic_id)}"`);
 	}
 
-	if (raw.input_hash !== context.inputHash) {
+	const inputHash = raw.input_hash;
+	if (typeof inputHash !== "string" || !inputHash.startsWith("sha256:")) {
+		throw new BrainstormReviewError(`Invalid input_hash: must be a sha256: string, got "${String(inputHash)}"`);
+	}
+	if (inputHash !== context.inputHash) {
 		throw new BrainstormReviewError(
-			`input_hash mismatch: expected "${context.inputHash}", got "${String(raw.input_hash)}"`,
+			`input_hash mismatch: expected "${context.inputHash}", got "${inputHash}"`,
 		);
 	}
 
@@ -114,7 +113,12 @@ export function parseBrainstormReview(
 		const evidence_refs: string[] | undefined = Array.isArray(finding.evidence_refs)
 			? (finding.evidence_refs as string[])
 			: undefined;
-		return { category: finding.category as BrainstormFinding["category"], statement: finding.statement as string, impact: finding.impact as BrainstormFinding["impact"], ...(evidence_refs ? { evidence_refs } : {}) };
+		return {
+			category: finding.category as BrainstormFinding["category"],
+			statement: finding.statement as string,
+			impact: finding.impact as BrainstormFinding["impact"],
+			...(evidence_refs ? { evidence_refs } : {}),
+		};
 	});
 
 	// ── Alternatives ───────────────────────────────────────────────

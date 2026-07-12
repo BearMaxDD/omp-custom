@@ -7,10 +7,8 @@ describe("parseBrainstormReview", () => {
 		const topic = makeTopicState(validTopicInput(), fullCodebaseSnapshot());
 		for (const status of ["support", "challenge", "insufficient_evidence"] as const) {
 			expect(
-				parseBrainstormReview(
-					{ ...validReview(topic), status },
-					{ topicId: topic.topicId, inputHash: topic.inputHash },
-				).status,
+				parseBrainstormReview({ ...validReview(topic), status }, { topicId: topic.topicId, inputHash: topic.inputHash })
+					.status,
 			).toBe(status);
 		}
 	});
@@ -51,3 +49,18 @@ describe("parseBrainstormReview", () => {
 		);
 	});
 });
+
+it("rejects non-string evidence_refs elements", () => {
+  const topic = makeTopicState(validTopicInput(), fullCodebaseSnapshot());
+  const review = validReview(topic, {
+    findings: [{ category: "risk", statement: "test", impact: "high", evidence_refs: [123] as unknown as string[] }],
+  });
+  expect(() => parseBrainstormReview(review as unknown as Record<string, unknown>, { topicId: topic.topic_id, inputHash: topic.inputHash })).toThrow();
+});
+
+it("rejects non-sha256: input_hash strings", () => {
+  const topic = makeTopicState(validTopicInput(), fullCodebaseSnapshot());
+  const review = validReview(topic, { input_hash: "md5:abc" });
+  expect(() => parseBrainstormReview(review as unknown as Record<string, unknown>, { topicId: topic.topic_id, inputHash: topic.inputHash })).toThrow();
+});
+

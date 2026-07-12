@@ -1,9 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import { createBrainstormAdvisorHook } from "../../src/brainstorm/advisor-hook";
+import { BRAINSTORM_READ_ONLY_TOOL_NAMES, isCodebaseReadOnlyName } from "../../src/brainstorm/advisor-rules";
 import { BrainstormReviewRegistry } from "../../src/brainstorm/review-registry";
 import type { BrainstormReviewEnvelope } from "../../src/brainstorm/review-registry";
 import type { TopicCoordinator } from "../../src/brainstorm/topic-coordinator";
-import { BRAINSTORM_READ_ONLY_TOOL_NAMES, isCodebaseReadOnlyName } from "../../src/brainstorm/advisor-rules";
 import type { AdvisorBeforeRunEvent } from "../../src/types";
 
 function makeEnvelope(overrides: Partial<BrainstormReviewEnvelope> = {}): BrainstormReviewEnvelope {
