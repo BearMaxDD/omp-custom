@@ -110,9 +110,14 @@ export function parseBrainstormReview(raw: Record<string, unknown>, context: Rev
 		if (!ALLOWED_IMPACTS.has(finding.impact as string)) {
 			throw new BrainstormReviewError(`findings[${i}].impact is invalid: "${String(finding.impact)}"`);
 		}
-		const evidence_refs: string[] | undefined = Array.isArray(finding.evidence_refs)
-			? (finding.evidence_refs as string[])
-			: undefined;
+		const rawRefs = finding.evidence_refs;
+		let evidence_refs: string[] | undefined;
+		if (rawRefs !== undefined) {
+			if (!Array.isArray(rawRefs) || !rawRefs.every((r: unknown) => typeof r === "string")) {
+				throw new BrainstormReviewError(`findings[${i}].evidence_refs must be an array of strings`);
+			}
+			evidence_refs = rawRefs as string[];
+		}
 		return {
 			category: finding.category as BrainstormFinding["category"],
 			statement: finding.statement as string,
@@ -136,16 +141,17 @@ export function parseBrainstormReview(raw: Record<string, unknown>, context: Rev
 		if (typeof alt.description !== "string" || alt.description.length === 0) {
 			throw new BrainstormReviewError(`alternatives[${i}].description is missing or empty`);
 		}
-		if (!Array.isArray(alt.tradeoffs)) {
-			throw new BrainstormReviewError(`alternatives[${i}].tradeoffs is missing or non-array`);
-		}
 		if (typeof alt.when_to_choose !== "string" || alt.when_to_choose.length === 0) {
 			throw new BrainstormReviewError(`alternatives[${i}].when_to_choose is missing or empty`);
+		}
+		const rawTradeoffs = alt.tradeoffs;
+		if (!Array.isArray(rawTradeoffs) || !rawTradeoffs.every((t: unknown) => typeof t === "string")) {
+			throw new BrainstormReviewError(`alternatives[${i}].tradeoffs must be an array of strings`);
 		}
 		return {
 			name: alt.name as string,
 			description: alt.description as string,
-			tradeoffs: alt.tradeoffs as string[],
+			tradeoffs: rawTradeoffs as string[],
 			when_to_choose: alt.when_to_choose as string,
 		};
 	});
