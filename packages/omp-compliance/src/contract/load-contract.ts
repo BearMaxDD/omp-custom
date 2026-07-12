@@ -37,18 +37,22 @@ export function loadComplianceContract(filePath: string, repoRoot: string): Comp
 		throw new ContractLoadError(`TDD contract file not found: ${resolvedPath}`, resolvedPath);
 	}
 
-	// 2. Resolve symlinks; reject if outside repo root
+	// 2. Resolve symlinks on both paths so /var vs /private/var (macOS) matches.
+	const realRepoRoot = realpathSync(resolvedRoot);
 	let realPath: string;
 	try {
 		realPath = realpathSync(resolvedPath);
-	} catch {
-		realPath = resolvedPath;
+	} catch (err) {
+		throw new ContractLoadError(
+			`Cannot resolve real path for contract: ${resolvedPath} — ${err instanceof Error ? err.message : String(err)}`,
+			resolvedPath,
+		);
 	}
 
-	const rootPrefix = resolvedRoot.endsWith(sep) ? resolvedRoot : resolvedRoot + sep;
-	if (!realPath.startsWith(rootPrefix) && realPath !== resolvedRoot) {
+	const rootPrefix = realRepoRoot.endsWith(sep) ? realRepoRoot : realRepoRoot + sep;
+	if (!realPath.startsWith(rootPrefix) && realPath !== realRepoRoot) {
 		throw new ContractLoadError(
-			`TDD contract path escapes repo root: ${realPath} is outside ${resolvedRoot}`,
+			`TDD contract path escapes repo root: ${realPath} is outside ${realRepoRoot}`,
 			resolvedPath,
 		);
 	}
@@ -66,7 +70,7 @@ export function loadComplianceContract(filePath: string, repoRoot: string): Comp
 	const policy = extractExecutionPolicy(sourceText);
 
 	// 7. Derive task ID from filename stem and normalise relative path
-	const tddPath = relative(resolvedRoot, realPath);
+	const tddPath = relative(realRepoRoot, realPath);
 	const taskId = deriveTaskId(tddPath);
 
 	return {
