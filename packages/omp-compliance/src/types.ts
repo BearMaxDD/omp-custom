@@ -72,7 +72,7 @@ export interface ExtensionAPI {
 /**
  * Advisor run trigger — distinguishes compliance reviews from regular turns.
  */
-export type AdvisorRunTrigger = "turn_end" | "compliance_review";
+export type AdvisorRunTrigger = "turn_end" | "compliance_review" | "brainstorm_review";
 
 /**
  * Minimal AgentTool shape for the Advisor before-run hook.
@@ -126,6 +126,7 @@ export interface AdvisorBeforeRunEvent {
 export interface AdvisorBeforeRunResult {
 	additionalSystemContext?: readonly string[];
 	additionalTools?: readonly AgentTool[];
+	additionalToolNames?: readonly string[];
 	metadata?: Readonly<Record<string, unknown>>;
 }
 
