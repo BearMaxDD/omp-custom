@@ -109,7 +109,7 @@ function setupFixture(tddContent: string = DEFAULT_TDD_MD): FixtureSetup {
 	const store = new EvidenceStore(evidenceDir);
 	const collector = new CollectorRuntime();
 	const registry = new ComplianceReviewRegistry();
-	const runtime = new ComplianceRuntime(store, collector, api, tmpDir, {
+	const runtime = new ComplianceRuntime(() => store, collector, api, tmpDir, {
 		sessionId: () => "test-session",
 		registry,
 		requestAdvisorReview: (_req: AdvisorReviewRequest) => Promise.resolve<AdvisorReviewReceipt>({ reviewId: "test-review", status: "accepted" }),

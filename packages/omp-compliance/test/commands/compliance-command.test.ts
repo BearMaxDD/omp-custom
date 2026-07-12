@@ -111,7 +111,7 @@ beforeEach(() => {
 		requestAdvisorReview: (req: AdvisorReviewRequest) =>
 			Promise.resolve({ reviewId: "test-review", status: "accepted" }),
 	};
-	runtime = new ComplianceRuntime(store, collector, api.toAPI(), tmpDir, reviewDeps);
+	runtime = new ComplianceRuntime(() => store, collector, api.toAPI(), tmpDir, reviewDeps);
 
 	registerComplianceCommand(api.toAPI(), runtime);
 });

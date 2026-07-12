@@ -105,7 +105,7 @@ function setupRuntimeFixture(): ProtocolFixture {
 	const store = new EvidenceStore(evidenceDir);
 	const collector = new CollectorRuntime();
 	const registry = new ComplianceReviewRegistry();
-	const runtime = new ComplianceRuntime(store, collector, api, tmpDir, {
+	const runtime = new ComplianceRuntime(() => store, collector, api, tmpDir, {
 		sessionId: () => "test-session",
 		registry,
 		requestAdvisorReview: (req) => Promise.resolve({ reviewId: "test-review", status: "accepted" }),

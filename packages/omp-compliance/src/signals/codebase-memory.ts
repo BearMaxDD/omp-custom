@@ -31,17 +31,68 @@ const RECOGNIZED_TOOLS: ReadonlySet<string> = new Set([
 const EXPECTED_SERVER = "codebase-memory";
 
 /**
+ * Input types accepted by normalizeCodebaseMemory.
+ *
+ * Array form: paired tool_call / tool_result records from the collector.
+ * Single form: convenience for tests — a tool name and its result object.
+ */
+type PairedInput = ReadonlyArray<{ call: ToolCallRecord; result?: ToolResultRecord }>;
+interface SingleInput {
+	toolName: string;
+	result: { success: boolean; status?: string };
+}
+
+/**
+ * Determine whether a codebase-memory tool result indicates the index is ready.
+ *
+ * - index_repository: success + status in ["indexed", "ready"] → ready
+ * - index_status:     success + status === "ready" → ready
+ * - other tools:      never considered index-readiness
+ */
+export function codebaseIndexReady(toolName: string, result: { success: boolean; status?: string }): boolean {
+	return (
+		result.success === true &&
+		((toolName === "index_repository" && (result.status === "indexed" || result.status === "ready")) ||
+			(toolName === "index_status" && result.status === "ready"))
+	);
+}
+
+/**
+ * Parse a `status` field from a resultRef string if it contains JSON.
+ */
+function parseStatusFromRef(resultRef: string): string | undefined {
+	try {
+		const parsed = JSON.parse(resultRef);
+		if (parsed && typeof parsed === "object" && typeof parsed.status === "string") {
+			return parsed.status;
+		}
+	} catch {
+		// Not valid JSON — no status to extract
+	}
+	return undefined;
+}
+
+/**
  * Normalize paired call/result entries into codebase-memory evidence.
  *
- * Returns a flat list of CodebaseMemoryEvidence for each recognized
- * tool call that was successfully matched.
+ * Returns index readiness flag, query names, and file references.
  */
-export function normalizeCodebaseMemory(paired: ReadonlyArray<{ call: ToolCallRecord; result?: ToolResultRecord }>): {
+export function normalizeCodebaseMemory(
+	paired: PairedInput | SingleInput,
+): {
 	indexReady: boolean;
 	queries: string[];
 	references: string[];
 } {
-	const indexReady = false;
+	// Single-input convenience (test path)
+	if ("toolName" in paired) {
+		return {
+			indexReady: codebaseIndexReady(paired.toolName, paired.result),
+			queries: [],
+			references: [],
+		};
+	}
+
 	const queryNames: string[] = [];
 	const allRefs: string[] = [];
 	const evidences: CodebaseMemoryEvidence[] = [];
@@ -94,12 +145,13 @@ export function normalizeCodebaseMemory(paired: ReadonlyArray<{ call: ToolCallRe
 		});
 	}
 
-	// Determine indexReady: we need at least one index_status call whose
-	// result indicates the index is ready.
+	// Determine indexReady: match on tool name and result status.
 	let isIndexReady = false;
 	for (const ev of evidences) {
-		if (ev.toolName === "index_status" && ev.success) {
+		const status = parseStatusFromRef(ev.resultRef);
+		if (codebaseIndexReady(ev.toolName, { success: ev.success, status })) {
 			isIndexReady = true;
+			break;
 		}
 	}
 
@@ -114,29 +166,15 @@ export function normalizeCodebaseMemory(paired: ReadonlyArray<{ call: ToolCallRe
 
 /** Naive reference extraction from result text. Looks for file:path or path/to/file patterns. */
 function extractReferences(text: string): string[] {
-	if (!text) return [];
 	const refs: string[] = [];
-	// Match "path/to/file.ts:Symbol" patterns (common in search_graph / trace_path results)
-	const refPattern = /[\w./-]+\.[a-z]+(?::\w[\w.]*)?/gi;
-	const matched = text.match(refPattern);
-	if (matched) {
-		for (const m of matched) {
-			// Check extension against the file portion (before optional :Symbol suffix)
-			const filePart = m.includes(":") ? m.slice(0, m.indexOf(":")) : m;
-			if (
-				filePart.includes("/") &&
-				(filePart.endsWith(".ts") ||
-					filePart.endsWith(".js") ||
-					filePart.endsWith(".tsx") ||
-					filePart.endsWith(".jsx") ||
-					filePart.endsWith(".py") ||
-					filePart.endsWith(".go") ||
-					filePart.endsWith(".rs") ||
-					filePart.endsWith(".json"))
-			) {
-				refs.push(m);
-			}
-		}
+	const fileRefPattern = /\bfile:(?:[a-zA-Z]:[\\/])?([^\s,;)]+)/g;
+	let match;
+	while ((match = fileRefPattern.exec(text)) !== null) {
+		refs.push(match[1].replace(/^[\\/]+|\.$/, ""));
+	}
+	const pathPattern = /(?:^|[\s,;])((?:src|app|lib|packages|test)[^\s,;)]+\.(?:ts|tsx|js|jsx|py|rs|go|rb|css|scss|json|md|toml|yaml|yml))/g;
+	while ((match = pathPattern.exec(text)) !== null) {
+		refs.push(match[1]);
 	}
 	return refs;
 }

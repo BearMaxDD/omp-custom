@@ -51,10 +51,11 @@ export interface VerificationRecord {
 export class ComplianceRuntime {
 	private taskState: TaskState | null = null;
 	private contract: ComplianceContract | null = null;
+	private _store: EvidenceStore | null = null;
 	private readonly verdictStore: VerdictStore = { records: [], lastPass: {}, acceptedKeys: new Set() };
 
 	constructor(
-		private readonly store: EvidenceStore,
+		private readonly getEvidenceStore: () => EvidenceStore,
 		private readonly collector: CollectorRuntime,
 		private readonly api: ExtensionAPI,
 		private readonly repoRoot: string,
@@ -465,9 +466,12 @@ export class ComplianceRuntime {
 		return this.collector.collector.snapshot();
 	}
 
-	/** Get the underlying evidence store (for read operations). */
+	/** Get the underlying evidence store (lazily initialized on first access). */
 	get evidenceStore(): EvidenceStore {
-		return this.store;
+		if (!this._store) {
+			this._store = this.getEvidenceStore();
+		}
+		return this._store;
 	}
 
 	// ─── Private helpers ───────────────────────────────────────────
@@ -490,6 +494,6 @@ export class ComplianceRuntime {
 			worktreeFingerprint: extra.worktreeFingerprint ?? this.taskState.worktreeFingerprint,
 		};
 
-		await this.store.append(record);
+		await this.evidenceStore.append(record);
 	}
 }

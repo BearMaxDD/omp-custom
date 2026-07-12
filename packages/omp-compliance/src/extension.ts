@@ -1,4 +1,3 @@
-import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { createComplianceAdvisorHook } from "./advisor/compliance-advisor-hook";
 import { ComplianceReviewRegistry } from "./advisor/review-envelope";
@@ -10,8 +9,22 @@ import { CollectorRuntime } from "./signals/collector-runtime";
 import { registerComplianceCompleteTool } from "./tools/compliance-complete-tool";
 import type { AdvisorBeforeRunEvent, ExtensionAPI, ExtensionContext } from "./types";
 
-/** Default evidence store directory within the repo. */
-const DEFAULT_EVIDENCE_DIR = ".omp/evidence";
+/** Default compliance store directory within the repo. */
+const DEFAULT_COMPLIANCE_DIR = ".omp/compliance";
+
+/**
+ * Create a memoized EvidenceStore factory.
+ * Only instantiates the store (and creates the directory) when first called.
+ */
+function createLazyEvidenceStore(repoRoot: string): () => EvidenceStore {
+	let store: EvidenceStore | null = null;
+	return () => {
+		if (!store) {
+			store = new EvidenceStore(join(repoRoot, DEFAULT_COMPLIANCE_DIR));
+		}
+		return store;
+	};
+}
 
 /**
  * Activate the OMP Compliance extension.
@@ -19,20 +32,17 @@ const DEFAULT_EVIDENCE_DIR = ".omp/evidence";
  * Wires the compliance runtime, registers the /compliance command and
  * compliance_complete tool, and sets up passive event handlers for
  * tool event collection.
+ *
+ * Does NOT create the evidence store directory on activation — it is
+ * created lazily on the first successful /compliance start.
  */
 export default function activate(api: ExtensionAPI): void {
 	// Repo root: conventions assume cwd is repo root at activation
 	const repoRoot = process.cwd();
 
-	// Ensure evidence directory exists
-	const evidenceDir = join(repoRoot, DEFAULT_EVIDENCE_DIR);
-	if (!existsSync(evidenceDir)) {
-		mkdirSync(evidenceDir, { recursive: true });
-	}
-
-	// Core infrastructure
+	// Core infrastructure (store created lazily — no FS side-effects yet)
 	const collector = new CollectorRuntime();
-	const store = new EvidenceStore(evidenceDir);
+	const getEvidenceStore = createLazyEvidenceStore(repoRoot);
 
 	// Review registry — shared between runtime and advisor_before_run hook
 	const registry = new ComplianceReviewRegistry();
@@ -56,8 +66,8 @@ export default function activate(api: ExtensionAPI): void {
 		requestAdvisorReview: (request) => api.requestAdvisorReview(request),
 	};
 
-	// Compliance runtime — the main coordinator
-	const runtime = new ComplianceRuntime(store, collector, api, repoRoot, reviewDeps);
+	// Compliance runtime — the main coordinator (gets factory, not store)
+	const runtime = new ComplianceRuntime(getEvidenceStore, collector, api, repoRoot, reviewDeps);
 
 	// Register advisor_before_run hook
 	api.on("advisor_before_run", (event: unknown, _context: ExtensionContext) => {

@@ -115,7 +115,7 @@ beforeEach(() => {
 			return Promise.resolve(mockRequestReviewReturn);
 		},
 	};
-	runtime = new ComplianceRuntime(store, collector, api, tmpDir, reviewDeps);
+	runtime = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps);
 });
 
 // ─── Tests: Start ───────────────────────────────────────────────────

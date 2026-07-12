@@ -1,4 +1,5 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, test } from "bun:test";
+import { codebaseIndexReady, normalizeCodebaseMemory } from "../../src/signals/codebase-memory";
 import { ToolEventCollector } from "../../src/signals/tool-event-collector";
 import type { ToolCallRecord, ToolResultRecord } from "../../src/signals/types";
 
@@ -30,13 +31,14 @@ describe("codebase-memory 证据采集 — 仅工具名匹配，不基于自然�
 		collector.recordResult(mcpResult("i1", { status: "ok" }));
 		const snap = collector.snapshot();
 		expect(snap.codebaseMemory.queries).not.toContain("index_repository");
-		// index_status should show readiness
+		// status "ok" does not count as indexed or ready
+		expect(snap.codebaseMemory.indexReady).toBe(false);
 	});
 
 	it("index_status 成功时设置 indexReady", () => {
 		const collector = new ToolEventCollector();
 		collector.recordCall(mcpCall("index_status", {}, "idx-ok"));
-		collector.recordResult(mcpResult("idx-ok", { ready: true }));
+		collector.recordResult(mcpResult("idx-ok", { status: "ready" }));
 		const snap = collector.snapshot();
 		expect(snap.codebaseMemory.indexReady).toBe(true);
 	});
@@ -52,20 +54,16 @@ describe("codebase-memory 证据采集 — 仅工具名匹配，不基于自然�
 	it("仅在 index、搜索、源码或调用链证据连续存在时标记 codebase evidence complete", () => {
 		const collector = new ToolEventCollector();
 		collector.recordCall(mcpCall("index_status", {}, "idx-1"));
-		collector.recordResult(mcpResult("idx-1", { ready: true }));
+		collector.recordResult(mcpResult("idx-1", { status: "ready" }));
 		collector.recordCall(mcpCall("search_graph", { query: "TaskTool" }, "sg-1"));
-		collector.recordResult(
-			mcpResult("sg-1", {
-				references: ["src/task/index.ts:TaskTool"],
-			}),
-		);
+		collector.recordResult(mcpResult("sg-1", "Referenced src/task/index.ts:TaskTool"));
 		collector.recordCall(mcpCall("get_code_snippet", { qualified_name: "TaskTool.execute" }, "gcs-1"));
 		collector.recordResult(mcpResult("gcs-1", { code: "function execute()" }));
 		const snap = collector.snapshot();
 		expect(snap.codebaseMemory).toMatchObject({
 			indexReady: true,
 			queries: ["search_graph", "get_code_snippet"],
-			references: ["src/task/index.ts:TaskTool"],
+			references: ["src/task/index.ts"],
 		});
 	});
 
@@ -129,5 +127,19 @@ describe("codebase-memory 证据采集 — 仅工具名匹配，不基于自然�
 		collector.recordResult(mcpResult("sg-b", { references: [] }));
 		const snap = collector.snapshot();
 		expect(snap.codebaseMemory.queries).toEqual(["search_graph"]);
+	});
+});
+
+describe("codebaseIndexReady — 矩阵测试", () => {
+	const cases: Array<[string, { success: boolean; status?: string }, boolean]> = [
+		["index_repository", { success: true, status: "indexed" }, true],
+		["index_repository", { success: true, status: "ready" }, true],
+		["index_repository", { success: false, status: "indexed" }, false],
+		["index_status", { success: true, status: "ready" }, true],
+		["search_graph", { success: true }, false],
+	];
+
+	test.each(cases)("%s %j → indexReady=%s", (toolName, result, ready) => {
+		expect(codebaseIndexReady(toolName, result)).toBe(ready);
 	});
 });
