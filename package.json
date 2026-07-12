@@ -1,0 +1,10 @@
+{
+  "name": "omp-custom",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "check": "biome check --apply packages/",
+    "build": "bun --cwd=packages/omp-compliance run build",
+    "test": "bun --cwd=packages/omp-compliance test"
+  }
+}

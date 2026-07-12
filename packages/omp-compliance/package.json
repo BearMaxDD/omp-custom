@@ -1,0 +1,28 @@
+{
+  "name": "@bearmaxdd/omp-compliance",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./dist/index.js",
+    "./extension": "./dist/extension.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist"],
+  "omp": {
+    "extensions": ["./dist/extension.js"]
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "biome check src test",
+    "test": "bun test --preload ./test/setup.ts"
+  },
+  "peerDependencies": {
+    "@oh-my-pi/pi-coding-agent": "16.4.x"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.7.0"
+  }
+}
