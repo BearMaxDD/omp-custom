@@ -1,0 +1,25 @@
+{
+	"description": "Advisor remediate verdict: tests failed during verification with non-zero exit code",
+	"scenario": "测试失败仍 complete",
+	"verdictTemplate": {
+		"schema_version": 1,
+		"status": "remediate",
+		"findings": [
+			{
+				"id": "verification-failure",
+				"reason": "Verification command failed with exit code 1 — tests did not pass",
+				"category": "test",
+				"severity": "error",
+				"required_fix": "Fix the failing tests and re-run verification until all tests pass (exit code 0)",
+				"evidence_refs": ["evidence://verification"]
+			}
+		]
+	},
+	"assertions": {
+		"finalStatus": "remediation_required",
+		"findingHasFix": true,
+		"fixContains": "exit code",
+		"evidenceFailed": true,
+		"injectionReceived": true
+	}
+}

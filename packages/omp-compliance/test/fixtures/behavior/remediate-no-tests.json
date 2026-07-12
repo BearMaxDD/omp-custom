@@ -1,0 +1,25 @@
+{
+	"description": "Advisor remediate verdict: agent changed production code without writing tests",
+	"scenario": "只改生产代码、未补测试",
+	"verdictTemplate": {
+		"schema_version": 1,
+		"status": "remediate",
+		"findings": [
+			{
+				"id": "missing-tests",
+				"reason": "Production code was modified but no corresponding tests were added or updated",
+				"category": "test",
+				"severity": "error",
+				"required_fix": "Write unit tests covering the modified production code paths — refer to TDD section 'Tests' for the required test cases",
+				"evidence_refs": ["contract://tests-section"]
+			}
+		]
+	},
+	"assertions": {
+		"finalStatus": "remediation_required",
+		"findingCount": 1,
+		"findingHasFix": true,
+		"fixReferences": "TDD",
+		"injectionReceived": true
+	}
+}

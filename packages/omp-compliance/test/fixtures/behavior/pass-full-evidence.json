@@ -1,0 +1,19 @@
+{
+	"description": "Advisor pass verdict: agent provided complete evidence (tests, codebase, delegation, verification)",
+	"scenario": "完整证据与验证",
+	"verdictTemplate": {
+		"schema_version": 1,
+		"status": "pass",
+		"findings": [
+			{
+				"id": "all-evidence-present",
+				"reason": "All required evidence is present: tests pass, codebase-memory tools were used, subagent delegations completed with traceable references, and verification commands passed"
+			}
+		]
+	},
+	"assertions": {
+		"finalStatus": "completed",
+		"isTerminal": true,
+		"injectionReceived": false
+	}
+}
