@@ -6,37 +6,34 @@
  *
  * All types are independent of compliance completion types — a brainstorm
  * topic is not a compliance task and uses its own status machine.
+ *
+ * @see 2026-07-13-omp-advisor-brainstorm-topic-review-trd.md §5
  */
 
 // ─── Topic Kind ──────────────────────────────────────────────────────
 
-/** Supported brainstorm topic kinds. */
-export type BrainstormTopicKind =
-	| "architecture"
-	| "api_design"
-	| "workflow"
-	| "tool_selection"
-	| "refactoring"
-	| "other";
+/** Supported brainstorm topic kinds (TRD §5.1). */
+export type BrainstormTopicKind = "architecture" | "scope" | "contract" | "migration" | "risk" | "implementation_route";
 
 // ─── Ready Input ─────────────────────────────────────────────────────
 
 /**
- * Validated and normalized input for a brainstorm topic.
+ * Validated and normalized input for a brainstorm topic (TRD §5.1).
  *
+ * Snake_case fields — these are a tool-call boundary contract.
  * Strings are trimmed. Lists are deduplicated and sorted. Lengths are
  * capped as documented per field. The input is ready for fingerprint
  * computation and advisor review submission.
  *
  * @remarks
  * - title: max 200 characters
- * - candidateDecision: max 4,000 characters
- * - discussionSummary: max 8,000 characters
- * - constraints / successCriteria / unresolvedQuestions: max 30 items each
+ * - candidate_decision: max 4,000 characters
+ * - discussion_summary: max 8,000 characters
+ * - constraints / success_criteria / unresolved_questions: max 30 items each
  */
 export interface BrainstormTopicReadyInput {
 	/** The category of the brainstorm topic. */
-	topicKind: BrainstormTopicKind;
+	topic_kind: BrainstormTopicKind;
 	/**
 	 * Short, descriptive title, max 200 chars.
 	 * Used as the advisor review title and for display.
@@ -46,7 +43,7 @@ export interface BrainstormTopicReadyInput {
 	 * The main decision the brainstorm has converged on, max 4,000 chars.
 	 * Passed to the advisor as the candidate for review.
 	 */
-	candidateDecision: string;
+	candidate_decision: string;
 	/**
 	 * Constraints that bound the decision, max 30 items, each trimmed.
 	 * E.g. ["只读 Advisor", "用户最终决定"].
@@ -56,76 +53,100 @@ export interface BrainstormTopicReadyInput {
 	 * Success criteria the decision must meet, max 30 items.
 	 * E.g. ["结构化 review", "扩展关闭零副作用"].
 	 */
-	successCriteria: string[];
+	success_criteria: string[];
 	/**
 	 * Open questions still unresolved, max 30 items.
 	 * These are hints to the advisor for further analysis.
 	 */
-	unresolvedQuestions: string[];
+	unresolved_questions?: string[];
 	/**
 	 * Whether codebase context is required for the advisor review.
 	 * "required" — the review MUST include read-only codebase-memory tools.
 	 * "optional" — the review MAY use codebase-memory tools if available.
 	 * "none" — no codebase context needed.
 	 */
-	codebaseRelevance: "required" | "optional" | "none";
+	codebase_relevance: "required" | "optional" | "none";
 	/**
 	 * Discussion summary, max 8,000 chars.
 	 * Free-text context the main agent has already discussed with the user.
 	 */
-	discussionSummary: string;
+	discussion_summary: string;
 }
 
 // ─── Topic Packet (Advisor Context) ──────────────────────────────────
 
 /**
- * Context packet sent to the advisor for a brainstorm review.
+ * Context packet sent to the advisor for a brainstorm review (TRD §5.2).
  *
- * Includes the normalized input together with codebase evidence
- * references so the advisor can issue targeted read-only queries.
+ * Flat structure with inlined input fields and codebase context metadata.
+ * The advisor uses this to issue targeted read-only queries.
  */
 export interface BrainstormTopicPacket {
-	/** The normalized, validated topic input. */
-	input: BrainstormTopicReadyInput;
+	/** Schema version for forward compatibility. */
+	schema_version: 1;
+	/** Stable unique identifier for this topic. */
+	topic_id: string;
+	/** SHA-256 fingerprint of the normalized input (sha256:hex). */
+	input_hash: `sha256:${string}`;
+	/** The category of the brainstorm topic. */
+	topic_kind: BrainstormTopicKind;
+	/** Short title, max 200 chars. */
+	title: string;
+	/** The candidate decision under review. */
+	candidate_decision: string;
+	/** Constraints bounding the decision. */
+	constraints: string[];
+	/** Success criteria the decision must meet. */
+	success_criteria: string[];
+	/** Open questions still unresolved. */
+	unresolved_questions: string[];
+	/** Free-text discussion summary, max 8,000 chars. */
+	discussion_summary: string;
 	/**
-	 * Codebase references collected during the discussion.
-	 * Passed as tool-name hints for the advisor's read-only session.
+	 * Codebase context metadata.
+	 * - mode: whether codebase context was needed/available.
+	 * - references: labelled references with their source type.
 	 */
-	codebaseReferences: string[];
-	/**
-	 * The computed fingerprint — used to detect duplicate submissions.
-	 * Format: `sha256:<hex>`.
-	 */
-	inputHash: `sha256:${string}`;
+	codebase_context: {
+		mode: "not_needed" | "available" | "unavailable";
+		references: Array<{ label: string; source: "graph" | "snippet" | "trace" | "text" }>;
+	};
 }
 
 // ─── Review ──────────────────────────────────────────────────────────
 
-/** A single finding within a brainstorm review. */
+/** A single finding within a brainstorm review (TRD §5.3). */
 export interface BrainstormFinding {
-	/** Category of the finding: "risk", "strength", "gap", "suggestion". */
-	category: "risk" | "strength" | "gap" | "suggestion";
+	/**
+	 * Category of the finding:
+	 * "risk" | "assumption" | "scope" | "contract" | "migration" | "feasibility".
+	 */
+	category: "risk" | "assumption" | "scope" | "contract" | "migration" | "feasibility";
 	/** Human-readable statement of the finding. */
 	statement: string;
 	/**
-	 * Impact assessment: "low", "medium", "high", "critical".
-	 * Optional — not all findings (e.g., strengths) carry impact.
+	 * Impact assessment: "high", "medium", "low".
+	 * Required — every finding carries an impact rating.
 	 */
-	impact?: "low" | "medium" | "high" | "critical";
+	impact: "high" | "medium" | "low";
+	/** Optional references to codebase evidence supporting this finding. */
+	evidence_refs?: string[];
 }
 
-/** An alternative the advisor proposes alongside its recommendation. */
+/** An alternative the advisor proposes alongside its recommendation (TRD §5.3). */
 export interface BrainstormAlternative {
-	/** Short title for the alternative approach. */
-	title: string;
+	/** Short name for the alternative approach. */
+	name: string;
 	/** Description of what the alternative entails. */
 	description: string;
 	/** Key trade-offs compared to the candidate decision. */
 	tradeoffs: string[];
+	/** Guidance on when this alternative should be chosen. */
+	when_to_choose: string;
 }
 
 /**
- * A structured review produced by an advisor for one brainstorm topic.
+ * A structured review produced by an advisor for one brainstorm topic (TRD §5.3).
  *
  * The advisor receives the topic packet and produces this structured
  * review. It is NOT a ComplianceVerdict and shares no verdict type
@@ -133,18 +154,18 @@ export interface BrainstormAlternative {
  */
 export interface BrainstormReview {
 	/** Schema version for forward compatibility. */
-	schema_version: number;
+	schema_version: 1;
 	/** Identifies which topic this review belongs to. */
 	topic_id: string;
 	/** The input fingerprint the advisor reviewed. */
 	input_hash: `sha256:${string}`;
 	/**
-	 * Overall review status:
+	 * Overall review status (TRD §5.3):
+	 * - "support" — advisor supports the candidate decision
 	 * - "challenge" — advisor identified issues or risks
-	 * - "endorse" — advisor agrees with the candidate
-	 * - "insufficient" — topic input lacks necessary detail
+	 * - "insufficient_evidence" — topic input lacks necessary detail or evidence
 	 */
-	status: "challenge" | "endorse" | "insufficient";
+	status: "support" | "challenge" | "insufficient_evidence";
 	/** One-paragraph summary of the review. */
 	summary: string;
 	/** Structured findings from the advisor. */
@@ -154,30 +175,31 @@ export interface BrainstormReview {
 	/** The advisor's recommendation. */
 	recommendation: string;
 	/**
-	 * Confidence in the review: "low", "medium", "high", "very_high".
+	 * Confidence in the review: "high", "medium", "low".
 	 */
-	confidence: "low" | "medium" | "high" | "very_high";
+	confidence: "high" | "medium" | "low";
 }
 
 // ─── Decision ────────────────────────────────────────────────────────
 
-/** The user's final decision on a brainstorm topic. */
+/** The user's final decision on a brainstorm topic (TRD §5.4). */
 export interface BrainstormDecision {
+	/** The topic this decision applies to. */
+	topic_id: string;
 	/**
-	 * Decision outcome:
-	 * - "adopt" — accept the candidate decision as-is
-	 * - "adopt_with_changes" — accept with modifications
-	 * - "reject" — reject and keep brainstorming
-	 * - "defer" — postpone to a later session
+	 * Decision outcome (TRD §5.4):
+	 * - "accept_candidate" — accept the candidate decision as-is
+	 * - "accept_alternative" — accept an alternative approach instead
+	 * - "reopen" — reopen the topic for further discussion
+	 * - "park" — set aside for later
 	 */
-	outcome: "adopt" | "adopt_with_changes" | "reject" | "defer";
-	/** Free-text notes from the user explaining the decision. */
-	notes: string;
-	/**
-	 * Optional: if the user provided a modified decision text
-	 * (for adopt_with_changes), it goes here.
-	 */
-	revisedDecision?: string;
+	decision: "accept_candidate" | "accept_alternative" | "reopen" | "park";
+	/** If accepting an alternative, the name of the selected alternative. */
+	selected_alternative?: string;
+	/** Free-text rationale from the user explaining the decision. */
+	rationale?: string;
+	/** ISO-8601 timestamp of when the decision was made. */
+	ts: string;
 }
 
 // ─── Topic Status ────────────────────────────────────────────────────

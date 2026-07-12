@@ -19,18 +19,16 @@ import type { EvidenceSnapshot } from "../../src/signals/types";
  * Use `overrides` to produce edge cases (blank fields, excessive lists, etc.)
  * without repeating the full shape.
  */
-export function validTopicInput(
-	overrides: Partial<BrainstormTopicReadyInput> = {},
-): BrainstormTopicReadyInput {
+export function validTopicInput(overrides: Partial<BrainstormTopicReadyInput> = {}): BrainstormTopicReadyInput {
 	return {
-		topicKind: "architecture",
+		topic_kind: "architecture",
 		title: "Advisor 专题评审接线",
-		candidateDecision: "复用 advisor_before_run 专用审查链路",
+		candidate_decision: "复用 advisor_before_run 专用审查链路",
 		constraints: ["用户最终决定", "Advisor 保持只读"],
-		successCriteria: ["结构化 review", "扩展关闭零副作用"],
-		unresolvedQuestions: [],
-		codebaseRelevance: "required",
-		discussionSummary: "主代理已经完成候选方案和约束收敛。",
+		success_criteria: ["结构化 review", "扩展关闭零副作用"],
+		unresolved_questions: [],
+		codebase_relevance: "required",
+		discussion_summary: "主代理已经完成候选方案和约束收敛。",
 		...overrides,
 	};
 }
@@ -68,10 +66,7 @@ export function fullCodebaseSnapshot(): EvidenceSnapshot {
  * Defaults to a "challenge" review with one risk finding. Use
  * `overrides` to produce other review statuses or edge cases.
  */
-export function validReview(
-	topic: BrainstormTopicState,
-	overrides: Partial<BrainstormReview> = {},
-): BrainstormReview {
+export function validReview(topic: BrainstormTopicState, overrides: Partial<BrainstormReview> = {}): BrainstormReview {
 	return {
 		schema_version: 1,
 		topic_id: topic.topicId,

@@ -2,14 +2,14 @@ import { describe, expect, it } from "bun:test";
 import { computeTopicFingerprint, normalizeTopicInput } from "../../src/brainstorm/topic-fingerprint";
 
 const input = {
-	topicKind: "architecture" as const,
+	topic_kind: "architecture" as const,
 	title: "专题评审传输",
-	candidateDecision: "复用 advisor_before_run",
+	candidate_decision: "复用 advisor_before_run",
 	constraints: ["用户最终决定", "只读 Advisor"],
-	successCriteria: ["结构化 review", "扩展关闭零副作用"],
-	unresolvedQuestions: [],
-	codebaseRelevance: "required" as const,
-	discussionSummary: "已经完成方案 A/B/C 对比。",
+	success_criteria: ["结构化 review", "扩展关闭零副作用"],
+	unresolved_questions: [],
+	codebase_relevance: "required" as const,
+	discussion_summary: "已经完成方案 A/B/C 对比。",
 };
 
 describe("topic fingerprint", () => {
@@ -28,6 +28,6 @@ describe("topic fingerprint", () => {
 	});
 
 	it("rejects non-substantive topic input", () => {
-		expect(() => normalizeTopicInput({ ...input, candidateDecision: " " })).toThrow("candidateDecision");
+		expect(() => normalizeTopicInput({ ...input, candidate_decision: " " })).toThrow("candidate_decision");
 	});
 });

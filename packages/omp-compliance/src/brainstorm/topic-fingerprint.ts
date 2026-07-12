@@ -18,11 +18,11 @@ import type { BrainstormTopicKind, BrainstormTopicReadyInput } from "./types";
 
 /** Maximum length for the title field. */
 const MAX_TITLE = 200;
-/** Maximum length for the candidate decision field. */
+/** Maximum length for the candidate_decision field. */
 const MAX_CANDIDATE = 4_000;
-/** Maximum length for the discussion summary field. */
+/** Maximum length for the discussion_summary field. */
 const MAX_SUMMARY = 8_000;
-/** Maximum number of items per list field (constraints, success criteria, etc.). */
+/** Maximum number of items per list field (constraints, success_criteria, etc.). */
 const MAX_LIST_ITEMS = 30;
 
 // ─── Normalization ───────────────────────────────────────────────────
@@ -35,43 +35,43 @@ const MAX_LIST_ITEMS = 30;
  * 2. Trims, deduplicates, and sorts all array fields.
  * 3. Enforces field-specific length limits.
  * 4. Throws on essential fields that are empty or whitespace-only after
- *    trimming (`topicKind`, `title`, `candidateDecision`, `discussionSummary`).
+ *    trimming (`topic_kind`, `title`, `candidate_decision`, `discussion_summary`).
  *
- * @param raw - Partial input; `topicKind` and `codebaseRelevance` must be valid members.
+ * @param raw - Partial input; `topic_kind` and `codebase_relevance` must be valid members.
  * @returns A fully normalized `BrainstormTopicReadyInput`.
  * @throws {Error} When a required non-list field is empty/whitespace-only
  *   after trimming. The error message includes the field name.
  */
 export function normalizeTopicInput(
-	raw: Omit<BrainstormTopicReadyInput, "topicKind" | "codebaseRelevance"> & {
-		topicKind: string;
-		codebaseRelevance: string;
+	raw: Omit<BrainstormTopicReadyInput, "topic_kind" | "codebase_relevance"> & {
+		topic_kind: string;
+		codebase_relevance: string;
 	},
 ): BrainstormTopicReadyInput {
 	// Validate enum-like fields
-	assertValidKind(raw.topicKind);
-	assertValidRelevance(raw.codebaseRelevance);
+	assertValidKind(raw.topic_kind);
+	assertValidRelevance(raw.codebase_relevance);
 
-	const topicKind = raw.topicKind as BrainstormTopicKind;
-	const codebaseRelevance = raw.codebaseRelevance as BrainstormTopicReadyInput["codebaseRelevance"];
+	const topic_kind = raw.topic_kind as BrainstormTopicKind;
+	const codebase_relevance = raw.codebase_relevance as BrainstormTopicReadyInput["codebase_relevance"];
 
 	const title = trimOrThrow(raw.title, "title", MAX_TITLE);
-	const candidateDecision = trimOrThrow(raw.candidateDecision, "candidateDecision", MAX_CANDIDATE);
-	const discussionSummary = trimOrThrow(raw.discussionSummary, "discussionSummary", MAX_SUMMARY);
+	const candidate_decision = trimOrThrow(raw.candidate_decision, "candidate_decision", MAX_CANDIDATE);
+	const discussion_summary = trimOrThrow(raw.discussion_summary, "discussion_summary", MAX_SUMMARY);
 
 	const constraints = normalizeList(raw.constraints, MAX_LIST_ITEMS);
-	const successCriteria = normalizeList(raw.successCriteria, MAX_LIST_ITEMS);
-	const unresolvedQuestions = normalizeList(raw.unresolvedQuestions, MAX_LIST_ITEMS);
+	const success_criteria = normalizeList(raw.success_criteria, MAX_LIST_ITEMS);
+	const unresolved_questions = normalizeList(raw.unresolved_questions ?? [], MAX_LIST_ITEMS);
 
 	return {
-		topicKind,
+		topic_kind,
 		title,
-		candidateDecision,
+		candidate_decision,
 		constraints,
-		successCriteria,
-		unresolvedQuestions,
-		codebaseRelevance,
-		discussionSummary,
+		success_criteria,
+		unresolved_questions,
+		codebase_relevance,
+		discussion_summary,
 	};
 }
 
@@ -100,15 +100,15 @@ export function computeTopicFingerprint(
 	const hash = createHash("sha256");
 
 	// Hash the input fields in a stable order
-	hash.update(normalized.topicKind);
+	hash.update(normalized.topic_kind);
 	hash.update("\0");
 	hash.update(normalized.title);
 	hash.update("\0");
-	hash.update(normalized.candidateDecision);
+	hash.update(normalized.candidate_decision);
 	hash.update("\0");
-	hash.update(normalized.discussionSummary);
+	hash.update(normalized.discussion_summary);
 	hash.update("\0");
-	hash.update(normalized.codebaseRelevance);
+	hash.update(normalized.codebase_relevance);
 	hash.update("\0");
 
 	// Lists are already normalized (sorted, deduped) by normalizeTopicInput
@@ -117,12 +117,12 @@ export function computeTopicFingerprint(
 		hash.update("\0");
 	}
 	hash.update("\0");
-	for (const item of normalized.successCriteria) {
+	for (const item of normalized.success_criteria) {
 		hash.update(item);
 		hash.update("\0");
 	}
 	hash.update("\0");
-	for (const item of normalized.unresolvedQuestions) {
+	for (const item of normalized.unresolved_questions ?? []) {
 		hash.update(item);
 		hash.update("\0");
 	}
@@ -142,17 +142,17 @@ export function computeTopicFingerprint(
 /** Known valid topic kinds. */
 const VALID_KINDS: readonly string[] = [
 	"architecture",
-	"api_design",
-	"workflow",
-	"tool_selection",
-	"refactoring",
-	"other",
+	"scope",
+	"contract",
+	"migration",
+	"risk",
+	"implementation_route",
 ];
 
 /** Assert that the topic kind is valid. */
 function assertValidKind(kind: string): void {
 	if (!VALID_KINDS.includes(kind)) {
-		throw new Error(`Invalid topicKind: "${kind}"`);
+		throw new Error(`Invalid topic_kind: "${kind}"`);
 	}
 }
 
@@ -162,7 +162,7 @@ const VALID_RELEVANCE: readonly string[] = ["required", "optional", "none"];
 /** Assert that the codebase relevance value is valid. */
 function assertValidRelevance(relevance: string): void {
 	if (!VALID_RELEVANCE.includes(relevance)) {
-		throw new Error(`Invalid codebaseRelevance: "${relevance}"`);
+		throw new Error(`Invalid codebase_relevance: "${relevance}"`);
 	}
 }
 
