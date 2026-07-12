@@ -1,11 +1,14 @@
-import type { ExtensionAPI, ToolCallEventResult } from "./types";
+import type { ExtensionAPI } from "./types";
+import { CollectorRuntime } from "./signals/collector-runtime";
 
 /**
  * Activate the OMP Compliance extension.
- * Registers placeholder compliance command, completion tool,
- * and passive event handlers that do not block built-in behavior.
+ * Registers compliance command, completion tool,
+ * and passive event handlers for tool event collection.
  */
 export default function activate(api: ExtensionAPI): void {
+	const runtime = new CollectorRuntime();
+
 	// Register compliance command
 	api.registerCommand("compliance", {
 		description: "Run compliance checks for Oh My Pi repository",
@@ -25,23 +28,8 @@ export default function activate(api: ExtensionAPI): void {
 	});
 
 	// Passive event handlers — all return undefined (no blocking)
-	api.on("tool_call", () => {
-		// Listen-only: never block tool execution
-		return undefined as unknown as ToolCallEventResult;
-	});
-
-	api.on("tool_result", () => {
-		// Listen-only: no action on tool results
-		return undefined;
-	});
-
-	api.on("turn_end", () => {
-		// Listen-only: observe turn boundaries
-		return undefined;
-	});
-
-	api.on("agent_end", () => {
-		// Listen-only: observe agent lifecycle
-		return undefined;
-	});
+	api.on("tool_call", (event) => runtime.recordToolCall(event as Record<string, unknown>));
+	api.on("tool_result", (event) => runtime.recordToolResult(event as Record<string, unknown>));
+	api.on("turn_end", (event) => runtime.recordTurnEnd(event as Record<string, unknown>));
+	api.on("agent_end", () => runtime.refreshPresentation());
 }
