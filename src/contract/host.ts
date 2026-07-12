@@ -6,9 +6,9 @@ import type {
 	RoleBindingSnapshot,
 	StrictStageRequest,
 	StrictStageResult,
-} from "./dto.ts";
-import type { HostResult } from "./errors.ts";
-import { assertCompatibleHostVersion } from "./version.ts";
+} from "./dto";
+import type { HostResult } from "./errors";
+import { assertCompatibleHostVersion } from "./version";
 
 export interface HostConfigSnapshot {
 	readonly schemaVersion: 1;

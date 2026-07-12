@@ -1,7 +1,7 @@
 export const packageName = "@bearmaxdd/omp-custom";
-export * from "./contract/dto.ts";
-export * from "./contract/errors.ts";
-export * from "./contract/host.ts";
-export * from "./contract/version.ts";
-export * from "./extension.ts";
-export * from "./testing/fake-host.ts";
+export * from "./contract/dto";
+export * from "./contract/errors";
+export * from "./contract/host";
+export * from "./contract/version";
+export * from "./extension";
+export * from "./testing/fake-host";

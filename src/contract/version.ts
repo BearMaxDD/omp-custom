@@ -1,4 +1,4 @@
-import { type HostResult, hostError } from "./errors.ts";
+import { type HostResult, hostError } from "./errors";
 
 export const CONTRACT_VERSION = 1 as const;
 

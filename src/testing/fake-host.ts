@@ -4,10 +4,10 @@ import type {
 	CodebaseMemoryResult,
 	StrictStageRequest,
 	StrictStageResult,
-} from "../contract/dto.ts";
-import type { HostResult } from "../contract/errors.ts";
-import type { HostConfigSnapshot, OmpCustomHost } from "../contract/host.ts";
-import { CONTRACT_VERSION } from "../contract/version.ts";
+} from "../contract/dto";
+import type { HostResult } from "../contract/errors";
+import type { HostConfigSnapshot, OmpCustomHost } from "../contract/host";
+import { CONTRACT_VERSION } from "../contract/version";
 
 export type FakeHostCall =
 	| "getConfigSnapshot"
