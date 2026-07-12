@@ -2,6 +2,9 @@ import { describe, expect, it } from "bun:test";
 import { VerdictValidationError, parseVerdict } from "../../src/advisor/verdict-schema";
 import type { ComplianceVerdict, VerdictContext } from "../../src/advisor/verdict-schema";
 import type { SHA256Hash } from "../../src/contract/types";
+import invalidLegacyFixture from "../fixtures/verdict/invalid-legacy.json";
+import passFixture from "../fixtures/verdict/pass.json";
+import remediateFixture from "../fixtures/verdict/remediate.json";
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
@@ -117,6 +120,25 @@ describe("parseVerdict", () => {
 		).toThrow("required_fix");
 	});
 
+it("rejects remediate with whitespace-only required_fix", () => {
+	expect(() =>
+		parseVerdict(
+			validVerdict({
+				status: "remediate",
+				findings: [
+					{
+						id: "f1",
+						reason: "Something wrong",
+						required_fix: "   ",
+					},
+				],
+			}),
+			defaultContext,
+		),
+	).toThrow("required_fix");
+});
+
+
 	it("rejects an invalid schema_version", () => {
 		expect(() => parseVerdict(validVerdict({ schema_version: 2 }), defaultContext)).toThrow("schema_version");
 	});
@@ -168,4 +190,66 @@ describe("parseVerdict", () => {
 	it("throws VerdictValidationError on failure", () => {
 		expect(() => parseVerdict(validVerdict({ task_id: "other" }), defaultContext)).toThrow(VerdictValidationError);
 	});
+
+	// ─── Fixture-based tests ──────────────────────────────────────
+
+	it("canonical fixtures pass and legacy bridge shape fails", () => {
+		const fixtureContext: VerdictContext = {
+			taskId: "task-9",
+			contractHash: "sha256:a00000000000000000000000000000000000000000000000000000000000000" as SHA256Hash,
+			attempt: 1,
+		};
+
+		expect(parseVerdict(passFixture, fixtureContext).status).toBe("pass");
+		expect(parseVerdict(remediateFixture, fixtureContext).findings[0]?.required_fix).toBeTruthy();
+		expect(() => parseVerdict(invalidLegacyFixture, fixtureContext)).toThrow("schema_version");
+	});
+
+	it("remediate verdict with empty findings is rejected", () => {
+		const fixtureContext: VerdictContext = {
+			taskId: "task-9",
+			contractHash: "sha256:a00000000000000000000000000000000000000000000000000000000000000" as SHA256Hash,
+			attempt: 1,
+		};
+		expect(() => parseVerdict({ ...remediateFixture, findings: [] }, fixtureContext)).toThrow("required_fix");
+	});
+
+	it("pass verdict with a required_fix on a finding is rejected", () => {
+		expect(() =>
+			parseVerdict(
+				validVerdict({
+					findings: [{ id: "f1", reason: "bad", required_fix: "fix it" }],
+				}),
+				defaultContext,
+			),
+		).toThrow("required_fix");
+	});
+
+	it("remediate with mixed findings (one without required_fix, one with) passes", () => {
+		expect(() =>
+			parseVerdict(
+				validVerdict({
+					status: "remediate",
+					findings: [
+						{ id: "f1", reason: "Missing fix" },
+						{ id: "f2", reason: "Has fix", required_fix: "fix it" },
+					],
+				}),
+				defaultContext,
+			),
+		).not.toThrow();
+		const result = parseVerdict(
+			validVerdict({
+				status: "remediate",
+				findings: [
+					{ id: "f1", reason: "Missing fix" },
+					{ id: "f2", reason: "Has fix", required_fix: "fix it" },
+				],
+			}),
+			defaultContext,
+		);
+		expect(result.status).toBe("remediate");
+		expect(result.findings).toHaveLength(2);
+	});
+
 });

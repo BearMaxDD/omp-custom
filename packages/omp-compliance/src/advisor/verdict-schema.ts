@@ -203,6 +203,20 @@ export function parseVerdict(raw: Record<string, unknown>, expectedContext: Verd
 				}
 			}
 		}
+
+		// pass verdict must not contain findings with required_fix
+		if (status === "pass") {
+			for (let i = 0; i < findings.length; i++) {
+				const f = findings[i] as Record<string, unknown>;
+				const requiredFix = f.required_fix;
+				if (typeof requiredFix === "string" && requiredFix.length > 0) {
+					errors.push({
+						field: `findings[${i}].required_fix`,
+						message: "pass verdict cannot contain an open required_fix",
+					});
+				}
+			}
+		}
 	}
 
 	if (errors.length > 0) {
