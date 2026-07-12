@@ -107,6 +107,8 @@ export function registerComplianceCompleteTool(api: ExtensionAPI, runtime: Compl
 					success: true,
 					status: result.status,
 					completionSnapshot: result.completionSnapshot,
+					reviewId: result.reviewId,
+					receipt: result.receipt,
 				};
 			} catch (err: unknown) {
 				const message = err instanceof Error ? err.message : String(err);

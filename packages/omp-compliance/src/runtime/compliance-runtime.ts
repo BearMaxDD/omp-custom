@@ -11,21 +11,24 @@
  */
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
+import { buildCompletionContext } from "../advisor/completion-context";
+import { renderCompletionRules } from "../advisor/default-rule-pack";
+import { createEnvelope } from "../advisor/review-envelope";
+import type { ComplianceReviewDependencies, ComplianceReviewEnvelope } from "../advisor/review-envelope";
 import { VerdictValidationError, parseVerdict } from "../advisor/verdict-schema";
-import type { ComplianceFinding } from "../advisor/verdict-schema";
+import type { ComplianceFinding, ComplianceVerdict } from "../advisor/verdict-schema";
 import { acceptVerdict as sinkAcceptVerdict } from "../advisor/verdict-sink";
 import type { VerdictStore } from "../advisor/verdict-sink";
 import { loadComplianceContract } from "../contract/load-contract";
 import type { ComplianceContract } from "../contract/types";
 import type { EvidenceRecord, EvidenceStore } from "../evidence/evidence-store";
-import { computeFingerprint } from "../evidence/fingerprint";
 import { injectRemediation } from "../remediation/inject-required-fix";
 import type { RemediationFinding } from "../remediation/inject-required-fix";
 import type { CollectorRuntime } from "../signals/collector-runtime";
 import type { EvidenceSnapshot } from "../signals/types";
 import { transition } from "../state/task-state-machine";
 import type { TaskState } from "../state/types";
-import type { ExtensionAPI } from "../types";
+import type { AdvisorReviewReceipt, ExtensionAPI } from "../types";
 import type { CompletionSnapshot } from "./completion-gate";
 import { buildCompletionSnapshot } from "./completion-gate";
 
@@ -55,6 +58,7 @@ export class ComplianceRuntime {
 		private readonly collector: CollectorRuntime,
 		private readonly api: ExtensionAPI,
 		private readonly repoRoot: string,
+		private readonly reviewDeps: ComplianceReviewDependencies,
 	) {}
 
 	// ─── Lifecycle: start / stop / resume ──────────────────────────
@@ -207,7 +211,12 @@ export class ComplianceRuntime {
 	async requestCompletion(params: {
 		summary: string;
 		claimedVerification?: string[];
-	}): Promise<{ status: string; completionSnapshot: CompletionSnapshot }> {
+	}): Promise<{
+		status: string;
+		completionSnapshot: CompletionSnapshot;
+		reviewId: string;
+		receipt: AdvisorReviewReceipt;
+	}> {
 		if (!this.taskState) {
 			throw new Error("No active compliance task");
 		}
@@ -234,11 +243,73 @@ export class ComplianceRuntime {
 			},
 		);
 
+		// Build context and rules from the snapshot
+		const sessionId = this.reviewDeps.sessionId();
+		const context = buildCompletionContext(snapshot, activeContract.policy);
+		const rules = renderCompletionRules(activeContract.policy);
+
+		// Create frozen envelope with stable reviewId
+		const envelope = createEnvelope({
+			sessionId,
+			taskId: this.taskState.taskId,
+			contractHash: this.taskState.contractHash,
+			attempt: this.taskState.attempt,
+			context,
+			rules,
+		});
+
+		// Write completion_requested evidence before registry put
 		await this.writeEvidenceRecord("completion_requested", {
 			signalDigest: snapshot.diffFingerprint,
 		});
 
-		return { status: newState.status, completionSnapshot: snapshot };
+		// Register envelope (available for the advisor_before_run hook)
+		this.reviewDeps.registry.put(envelope);
+
+		// Request Advisor review — may throw if harness cannot accommodate
+		let receipt: AdvisorReviewReceipt;
+		try {
+			receipt = await this.reviewDeps.requestAdvisorReview({
+				trigger: "compliance_review",
+				sessionId,
+				taskId: this.taskState.taskId,
+				contractHash: this.taskState.contractHash,
+				attempt: this.taskState.attempt,
+				context,
+				rules,
+				reviewId: envelope.reviewId,
+				metadata: {
+					taskId: this.taskState.taskId,
+					contractHash: this.taskState.contractHash,
+					attempt: this.taskState.attempt,
+				},
+			});
+		} catch (err: unknown) {
+			const reason = err instanceof Error ? err.message : String(err);
+			await this.writeEvidenceRecord("advisor_unavailable", {
+				signalDigest: "advisor-unavailable",
+			});
+			return {
+				status: newState.status,
+				completionSnapshot: snapshot,
+				reviewId: envelope.reviewId,
+				receipt: { reviewId: envelope.reviewId, status: "rejected", reason },
+			};
+		}
+
+		// Write receipt evidence on accepted
+		if (receipt.status === "accepted") {
+			await this.writeEvidenceRecord("advisor_review_accepted", {
+				signalDigest: receipt.reviewId,
+			});
+		}
+
+		return {
+			status: newState.status,
+			completionSnapshot: snapshot,
+			reviewId: envelope.reviewId,
+			receipt,
+		};
 	}
 
 	/**
@@ -267,7 +338,7 @@ export class ComplianceRuntime {
 			contractHash: this.taskState.contractHash,
 			attempt: this.taskState.attempt,
 		};
-		let parsed: import("../advisor/verdict-schema").ComplianceVerdict;
+		let parsed: ComplianceVerdict;
 		try {
 			parsed = parseVerdict(verdict, ctx);
 		} catch (err) {

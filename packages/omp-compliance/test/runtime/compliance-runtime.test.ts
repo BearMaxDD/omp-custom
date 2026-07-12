@@ -2,11 +2,13 @@ import { beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ComplianceReviewRegistry } from "../../src/advisor/review-envelope";
+import type { ComplianceReviewDependencies } from "../../src/advisor/review-envelope";
 import { EvidenceStore } from "../../src/evidence/evidence-store";
 import { buildCompletionSnapshot } from "../../src/runtime/completion-gate";
 import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
-import type { ExtensionAPI } from "../../src/types";
+import type { AdvisorReviewReceipt, AdvisorReviewRequest, ExtensionAPI } from "../../src/types";
 
 // ─── Minimal Fake API for runtime tests ─────────────────────────────
 
@@ -15,7 +17,8 @@ class MinimalAPI implements ExtensionAPI {
 	public entries: Array<{ type: string; data?: unknown }> = [];
 
 	registerTool(): void {}
-	registerCommand(): void {}
+	requestAdvisorReview = (_request: AdvisorReviewRequest): Promise<AdvisorReviewReceipt> =>
+		Promise.resolve({ reviewId: "test-review", status: "accepted" });
 	on(): void {}
 
 	sendMessage(message: unknown, _options?: { triggerTurn?: boolean; deliverAs?: string }): void {
@@ -32,6 +35,9 @@ class MinimalAPI implements ExtensionAPI {
 // ─── Test Setup ─────────────────────────────────────────────────────
 
 let tmpDir: string;
+let reviewDeps: ComplianceReviewDependencies;
+let mockRequestReviewReturn: AdvisorReviewReceipt;
+let mockRequestReviewCalls: AdvisorReviewRequest[];
 let api: MinimalAPI;
 let store: EvidenceStore;
 let collector: CollectorRuntime;
@@ -96,12 +102,20 @@ beforeEach(() => {
 	);
 
 	const evidenceDir = join(tmpDir, ".omp", "evidence");
-	mkdirSync(evidenceDir, { recursive: true });
-
 	api = new MinimalAPI();
 	store = new EvidenceStore(evidenceDir);
 	collector = new CollectorRuntime();
-	runtime = new ComplianceRuntime(store, collector, api, tmpDir);
+	mockRequestReviewReturn = { reviewId: "test-review", status: "accepted" };
+	mockRequestReviewCalls = [];
+	reviewDeps = {
+		sessionId: () => "test-session",
+		registry: new ComplianceReviewRegistry(),
+		requestAdvisorReview: (req: AdvisorReviewRequest) => {
+			mockRequestReviewCalls.push(req);
+			return Promise.resolve(mockRequestReviewReturn);
+		},
+	};
+	runtime = new ComplianceRuntime(store, collector, api, tmpDir, reviewDeps);
 });
 
 // ─── Tests: Start ───────────────────────────────────────────────────
@@ -194,6 +208,63 @@ describe("ComplianceRuntime — requestCompletion", () => {
 
 		expect(result.completionSnapshot.agentClaim.summary).toBe("Completed feature X");
 		expect(result.completionSnapshot.agentClaim.claimedVerification).toEqual(["test passes", "lint clean"]);
+	});
+});
+
+// ─── Tests: Request Completion — Advisor Review Path ─────────────────
+
+describe("ComplianceRuntime — requestCompletion advisor review path", () => {
+	it("应调用 requestAdvisorReview 并正确设置 trigger/metadata", async () => {
+		await runtime.start("tdd.md");
+		runtime.recordVerification({ command: "bun test", exitCode: 0 });
+		const result = await runtime.requestCompletion({ summary: "Done" });
+
+		// One call to requestAdvisorReview
+		expect(mockRequestReviewCalls.length).toBe(1);
+		const req = mockRequestReviewCalls[0];
+		expect(req.trigger).toBe("compliance_review");
+		expect(req.reviewId).toMatch(/^compliance:/);
+
+		// Metadata binds task/hash/attempt
+		expect(req.taskId).toBe(result.completionSnapshot.taskId);
+		expect(req.contractHash).toMatch(/^sha256:/);
+		expect(req.attempt).toBe(1);
+
+		// Return includes reviewId and receipt
+		expect(result.reviewId).toBe(req.reviewId);
+		expect(result.receipt.status).toBe("accepted");
+	});
+
+	it("registry envelope 应包含 Completion Evidence 和 compliance_verdict rules", async () => {
+		await runtime.start("tdd.md");
+		runtime.recordVerification({ command: "bun test", exitCode: 0 });
+		const result = await runtime.requestCompletion({ summary: "Done" });
+
+		const envelope = reviewDeps.registry.get(result.reviewId);
+		expect(envelope).toBeDefined();
+		const env = envelope as NonNullable<typeof envelope>;
+		expect(env.context).toContain("compliance-task");
+		expect(env.context).toContain("completion_claim");
+		expect(env.rules).toContain("compliance_verdict");
+	});
+
+	it("rejected receipt 应写 advisor_unavailable Evidence 并保持 advisor_reviewing", async () => {
+		await runtime.start("tdd.md");
+		runtime.recordVerification({ command: "bun test", exitCode: 0 });
+
+		// Replace requestAdvisorReview to throw
+		const rejectSpy = () => Promise.reject(new Error("Advisor pool exhausted"));
+		reviewDeps.requestAdvisorReview = rejectSpy;
+
+		const result = await runtime.requestCompletion({ summary: "Done" });
+
+		// Status stays advisor_reviewing
+		expect(result.receipt.status).toBe("rejected");
+		expect(result.receipt.reason).toContain("Advisor pool exhausted");
+
+		expect(runtime.currentTaskState).toBeDefined();
+		const state = runtime.currentTaskState as NonNullable<typeof runtime.currentTaskState>;
+		expect(state.status).toBe("advisor_reviewing");
 	});
 });
 

@@ -28,6 +28,8 @@ import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
 import type { ExtensionAPI } from "../../src/types";
 import { FakeAdvisor } from "../support/fake-advisor";
+import { ComplianceReviewRegistry } from "../../src/advisor/review-envelope";
+import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "../../src/types";
 
 // ─── Test Helper Types ──────────────────────────────────────────────
 
@@ -49,6 +51,8 @@ class MinimalTestAPI implements ExtensionAPI {
 		this.sentMessages.push(m);
 	}
 	appendEntry(): void {}
+	requestAdvisorReview = (_request: AdvisorReviewRequest): Promise<AdvisorReviewReceipt> =>
+		Promise.resolve({ reviewId: "test-review", status: "accepted" });
 	logger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
 }
 
@@ -100,7 +104,12 @@ function setupRuntimeFixture(): ProtocolFixture {
 	const api = new MinimalTestAPI();
 	const store = new EvidenceStore(evidenceDir);
 	const collector = new CollectorRuntime();
-	const runtime = new ComplianceRuntime(store, collector, api, tmpDir);
+	const registry = new ComplianceReviewRegistry();
+	const runtime = new ComplianceRuntime(store, collector, api, tmpDir, {
+		sessionId: () => "test-session",
+		registry,
+		requestAdvisorReview: (req) => Promise.resolve({ reviewId: "test-review", status: "accepted" }),
+	});
 	const advisor = new FakeAdvisor();
 
 	return { runtime, api, advisor };

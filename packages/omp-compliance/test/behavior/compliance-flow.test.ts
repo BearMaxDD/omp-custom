@@ -28,6 +28,8 @@ import { EvidenceStore } from "../../src/evidence/evidence-store";
 import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
 import type { ExtensionAPI } from "../../src/types";
+import { ComplianceReviewRegistry } from "../../src/advisor/review-envelope";
+import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "../../src/types";
 import { FakeAdvisor } from "../support/fake-advisor";
 import { FakeCodebaseMemory } from "../support/fake-codebase-memory";
 import { FakeTaskTool } from "../support/fake-task-tool";
@@ -40,6 +42,7 @@ class TestAPI implements ExtensionAPI {
 
 	registerTool(): void {}
 	registerCommand(): void {}
+	requestAdvisorReview = (_request: AdvisorReviewRequest): Promise<AdvisorReviewReceipt> => Promise.resolve({ reviewId: "test-review", status: "accepted" });
 	on(): void {}
 
 	sendMessage(message: unknown, _options?: { triggerTurn?: boolean; deliverAs?: string }): void {
@@ -105,7 +108,12 @@ function setupFixture(tddContent: string = DEFAULT_TDD_MD): FixtureSetup {
 	const api = new TestAPI();
 	const store = new EvidenceStore(evidenceDir);
 	const collector = new CollectorRuntime();
-	const runtime = new ComplianceRuntime(store, collector, api, tmpDir);
+	const registry = new ComplianceReviewRegistry();
+	const runtime = new ComplianceRuntime(store, collector, api, tmpDir, {
+		sessionId: () => "test-session",
+		registry,
+		requestAdvisorReview: (_req: AdvisorReviewRequest) => Promise.resolve<AdvisorReviewReceipt>({ reviewId: "test-review", status: "accepted" }),
+	});
 	const fakeAdvisor = new FakeAdvisor();
 	const fakeTask = new FakeTaskTool(collector.collector);
 	const fakeCbm = new FakeCodebaseMemory(collector.collector);

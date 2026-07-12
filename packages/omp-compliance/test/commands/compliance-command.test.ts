@@ -7,6 +7,9 @@ import { EvidenceStore } from "../../src/evidence/evidence-store";
 import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
 import type { ExtensionAPI } from "../../src/types";
+import { ComplianceReviewRegistry } from "../../src/advisor/review-envelope";
+import type { ComplianceReviewDependencies } from "../../src/advisor/review-envelope";
+import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "../../src/types";
 
 // ─── Fake ExtensionAPI for command testing ──────────────────────────
 
@@ -42,6 +45,8 @@ class FakeCommandAPI implements ExtensionAPI {
 	appendEntry(customType: string, data?: unknown): void {
 		this.entries.push({ type: customType, data });
 	}
+	requestAdvisorReview = (_request: AdvisorReviewRequest): Promise<AdvisorReviewReceipt> =>
+		Promise.resolve({ reviewId: "test-review", status: "accepted" });
 
 	logger = {
 		info: (msg: string) => {
@@ -99,7 +104,14 @@ beforeEach(() => {
 	api = new FakeCommandAPI();
 	store = new EvidenceStore(evidenceDir);
 	collector = new CollectorRuntime();
-	runtime = new ComplianceRuntime(store, collector, api.toAPI(), tmpDir);
+	const registry = new ComplianceReviewRegistry();
+	const reviewDeps: ComplianceReviewDependencies = {
+		sessionId: () => "test-session",
+		registry,
+		requestAdvisorReview: (req: AdvisorReviewRequest) =>
+			Promise.resolve({ reviewId: "test-review", status: "accepted" }),
+	};
+	runtime = new ComplianceRuntime(store, collector, api.toAPI(), tmpDir, reviewDeps);
 
 	registerComplianceCommand(api.toAPI(), runtime);
 });
