@@ -11,19 +11,23 @@
  */
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import type { ExtensionAPI } from "../types";
-import type { EvidenceStore, EvidenceRecord } from "../evidence/evidence-store";
-import { computeFingerprint } from "../evidence/fingerprint";
+import { VerdictValidationError, parseVerdict } from "../advisor/verdict-schema";
+import { acceptVerdict as sinkAcceptVerdict } from "../advisor/verdict-sink";
+import type { ComplianceFinding } from "../advisor/verdict-schema";
+import type { VerdictStore } from "../advisor/verdict-sink";
 import { loadComplianceContract } from "../contract/load-contract";
 import type { ComplianceContract } from "../contract/types";
+import type { EvidenceRecord, EvidenceStore } from "../evidence/evidence-store";
+import { computeFingerprint } from "../evidence/fingerprint";
+import { injectRemediation } from "../remediation/inject-required-fix";
+import type { RemediationFinding } from "../remediation/inject-required-fix";
 import type { CollectorRuntime } from "../signals/collector-runtime";
 import type { EvidenceSnapshot } from "../signals/types";
 import { transition } from "../state/task-state-machine";
-import type { ComplianceVerdict, TaskState } from "../state/types";
+import type { TaskState } from "../state/types";
+import type { ExtensionAPI } from "../types";
 import type { CompletionSnapshot } from "./completion-gate";
 import { buildCompletionSnapshot } from "./completion-gate";
-import { injectRemediation } from "../remediation/inject-required-fix";
-import type { RemediationFinding } from "../remediation/inject-required-fix";
 
 // ─── Transient task state key for evidence store isolation ──────────
 
@@ -44,6 +48,7 @@ export interface VerificationRecord {
 export class ComplianceRuntime {
 	private taskState: TaskState | null = null;
 	private contract: ComplianceContract | null = null;
+	private readonly verdictStore: VerdictStore = { records: [], lastPass: {}, acceptedKeys: new Set() };
 
 	constructor(
 		private readonly store: EvidenceStore,
@@ -68,9 +73,7 @@ export class ComplianceRuntime {
 		if (this.taskState && this.taskState.status !== "stalled") {
 			throw new Error("A compliance task is already active");
 		}
-		const resolvedTddPath = tddPath.startsWith("/")
-			? tddPath
-			: join(this.repoRoot, tddPath);
+		const resolvedTddPath = tddPath.startsWith("/") ? tddPath : join(this.repoRoot, tddPath);
 		const contract = loadComplianceContract(resolvedTddPath, this.repoRoot);
 		const taskId = randomUUID();
 		const now = new Date().toISOString();
@@ -209,9 +212,7 @@ export class ComplianceRuntime {
 			throw new Error("No active compliance task");
 		}
 		if (this.taskState.status !== "active") {
-			throw new Error(
-				`Cannot request completion from status: ${this.taskState.status}`,
-			);
+			throw new Error(`Cannot request completion from status: ${this.taskState.status}`);
 		}
 		const activeContract = this.contract;
 		if (!activeContract) {
@@ -243,92 +244,108 @@ export class ComplianceRuntime {
 	/**
 	 * Accept a verdict from the Advisor and apply it to the task state.
 	 *
+	 * Pipeline: schema validation (parseVerdict) → idempotency / staleness /
+	 * post-pass lock (verdict-sink) → state machine transition.
+	 *
 	 * On "pass": transitions to completed (terminal).
-	 * On "remediation_required": transitions to remediation_required and
-	 *   injects a structured fix message to the main agent.
+	 * On "remediate": transitions to remediation_required and injects
+	 * a structured fix message to the main agent.
 	 *
-	 * Invalid verdicts (empty requiredFixes, schema failure, task mismatch)
-	 * keep the task in advisor_reviewing and do NOT inject any message.
+	 * Schema failures, idempotent duplicates, stale attempts, and post-pass
+	 * remediations keep the task in advisor_reviewing and do NOT inject.
 	 *
-	 * @param verdict — the Advisor's ComplianceVerdict
+	 * @param verdict — raw advisor verdict (schema_version, task_id, ...)
 	 */
-	async acceptVerdict(verdict: ComplianceVerdict): Promise<void> {
+	async acceptVerdict(verdict: Record<string, unknown>): Promise<void> {
 		if (!this.taskState) {
 			return;
 		}
 
-		// Schema invalid → stay in advisor_reviewing, no injection
-		if (!verdict.schemaValid) {
-			this.taskState = transition(this.taskState, {
-				type: "protocol_error",
-				error: "Schema validation failed — verdict rejected",
-			});
+		// Step 1: Schema + context validation via parseVerdict
+		const ctx = {
+			taskId: this.taskState.taskId,
+			contractHash: this.taskState.contractHash,
+			attempt: this.taskState.attempt,
+		};
+		let parsed: import("../advisor/verdict-schema").ComplianceVerdict;
+		try {
+			parsed = parseVerdict(verdict, ctx);
+		} catch (err) {
+			if (err instanceof VerdictValidationError) {
+				// Schema invalid → stay in advisor_reviewing, no injection
+				this.taskState = transition(this.taskState, {
+					type: "protocol_error",
+					error: `Schema validation failed — ${err.message}`,
+				});
+				return;
+			}
+			throw err;
+		}
+
+		// Step 2: Idempotency, staleness, post-pass lock via verdict-sink
+		const sinkResult = sinkAcceptVerdict(verdict, ctx, this.verdictStore, parsed);
+		if (sinkResult.status !== "accepted") {
+			if (sinkResult.protocolError) {
+				this.taskState = transition(this.taskState, {
+					type: "protocol_error",
+					error: sinkResult.reason,
+				});
+			}
+			// Idempotent reject (already processed) → no-op
 			return;
 		}
 
-		if (verdict.status === "pass") {
+		// Step 3: Map parsed verdict to state machine transitions
+		const isPass = parsed.status === "pass";
+		const findings = parsed.findings as ComplianceFinding[];
+
+		if (isPass) {
 			this.taskState = transition(this.taskState, {
 				type: "verdict",
 				status: "pass",
-				summary: verdict.summary,
+				summary: findings.length > 0 ? findings[0].reason : undefined,
 				schemaValid: true,
 			});
 			await this.writeEvidenceRecord("completed", {
 				signalDigest: "advisor-pass",
-				verdictSummary: verdict.summary,
+				verdictSummary: findings.length > 0 ? findings[0].reason : undefined,
 			});
 			return;
 		}
 
-		if (verdict.status === "remediation_required") {
-			const fixes = verdict.requiredFixes;
-			if (!fixes || fixes.length === 0) {
-				// Empty remediation → stay in advisor_reviewing, no injection
-				this.taskState = transition(this.taskState, {
-					type: "protocol_error",
-					error: "Remediation verdict requires at least one requiredFix",
-				});
-				return;
-			}
+		// Status is "remediate" — extract required fixes from findings
+		const fixes = findings
+			.filter((f): f is ComplianceFinding & { required_fix: string } => !!f.required_fix)
+			.map((f) => f.required_fix);
 
-			this.taskState = transition(this.taskState, {
-				type: "verdict",
-				status: "remediation_required",
-				summary: verdict.summary,
-				requiredFixes: fixes,
-				schemaValid: true,
-			});
-
-			await this.writeEvidenceRecord("remediation_required", {
-				signalDigest: "advisor-remediate",
-				verdictSummary: verdict.summary,
-			});
-
-			// Only inject if not stalled
-			if (this.taskState.status !== "stalled") {
-				const findings: RemediationFinding[] = fixes.map((fix, i) => ({
-					id: `finding-${i + 1}`,
-					reason: verdict.summary ?? "Advisor identified issues requiring remediation",
-					requiredFix: fix,
-					evidenceRefs: [
-						`evidence://${this.taskState!.taskId}`,
-					],
-				}));
-
-				injectRemediation(this.api, {
-					taskId: this.taskState.taskId,
-					contractHash: this.taskState.contractHash,
-					findings,
-				});
-			}
-			return;
-		}
-
-		// Unknown verdict status → protocol error, no injection
 		this.taskState = transition(this.taskState, {
-			type: "protocol_error",
-			error: `Unknown verdict status: ${verdict.status}`,
+			type: "verdict",
+			status: "remediation_required",
+			summary: findings.length > 0 ? findings[0].reason : undefined,
+			requiredFixes: fixes,
+			schemaValid: true,
 		});
+
+		await this.writeEvidenceRecord("remediation_required", {
+			signalDigest: "advisor-remediate",
+			verdictSummary: findings.length > 0 ? findings[0].reason : undefined,
+		});
+
+		// Only inject if not stalled
+		if (this.taskState.status !== "stalled") {
+			const remediationFindings: RemediationFinding[] = fixes.map((fix, i) => ({
+				id: `finding-${i + 1}`,
+				reason: findings[i]?.reason ?? "Advisor identified issues requiring remediation",
+				requiredFix: fix,
+				evidenceRefs: [`evidence://${this.taskState!.taskId}`],
+			}));
+
+			injectRemediation(this.api, {
+				taskId: this.taskState.taskId,
+				contractHash: this.taskState.contractHash,
+				findings: remediationFindings,
+			});
+		}
 	}
 
 	/**
@@ -342,9 +359,7 @@ export class ComplianceRuntime {
 			throw new Error("No active compliance task");
 		}
 		if (this.taskState.status !== "remediation_required") {
-			throw new Error(
-				`Cannot resume from status: ${this.taskState.status}`,
-			);
+			throw new Error(`Cannot resume from status: ${this.taskState.status}`);
 		}
 
 		const newFingerprint = `remediated-${Date.now()}`;
@@ -374,12 +389,19 @@ export class ComplianceRuntime {
 		return this.contract;
 	}
 
+	/** Get the current evidence snapshot from the collector. */
+	get currentEvidenceSnapshot(): EvidenceSnapshot {
+		return this.collector.collector.snapshot();
+	}
+
+	/** Get the underlying evidence store (for read operations). */
+	get evidenceStore(): EvidenceStore {
+		return this.store;
+	}
+
 	// ─── Private helpers ───────────────────────────────────────────
 
-	private async writeEvidenceRecord(
-		event: string,
-		extra: Partial<EvidenceRecord>,
-	): Promise<void> {
+	private async writeEvidenceRecord(event: string, extra: Partial<EvidenceRecord>): Promise<void> {
 		if (!this.taskState || !this.contract) {
 			return;
 		}

@@ -1,11 +1,11 @@
-import { describe, expect, it, beforeEach } from "bun:test";
+import { beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { EvidenceStore } from "../../src/evidence/evidence-store";
-import { CollectorRuntime } from "../../src/signals/collector-runtime";
-import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
+import { join } from "node:path";
 import { registerComplianceCommand } from "../../src/commands/compliance-command";
+import { EvidenceStore } from "../../src/evidence/evidence-store";
+import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
+import { CollectorRuntime } from "../../src/signals/collector-runtime";
 import type { ExtensionAPI } from "../../src/types";
 
 // ─── Fake ExtensionAPI for command testing ──────────────────────────
@@ -35,10 +35,7 @@ class FakeCommandAPI implements ExtensionAPI {
 		// no-op
 	}
 
-	sendMessage(
-		message: unknown,
-		_options?: { triggerTurn?: boolean; deliverAs?: string },
-	): void {
+	sendMessage(message: unknown, _options?: { triggerTurn?: boolean; deliverAs?: string }): void {
 		this.sentMessages.push(message);
 	}
 
@@ -47,7 +44,9 @@ class FakeCommandAPI implements ExtensionAPI {
 	}
 
 	logger = {
-		info: (msg: string) => { this.logs.push(msg); },
+		info: (msg: string) => {
+			this.logs.push(msg);
+		},
 		warn: () => {},
 		error: () => {},
 		debug: () => {},
@@ -172,5 +171,60 @@ describe("ComplianceCommand — /compliance resume", () => {
 		const taskId = runtime.currentTaskState!.taskId;
 		// Can't resume an active task
 		expect(cmd.handler(["resume", taskId])).rejects.toThrow("not stalled");
+	});
+});
+
+// ─── Tests: Status ──────────────────────────────────────────────────
+
+describe("ComplianceCommand — /compliance status", () => {
+	it("shows status for active task", async () => {
+		const cmd = api.registeredCommands.find((c) => c.name === "compliance")!;
+		await cmd.handler(["start", "tdd.md"]);
+
+		await cmd.handler(["status"]);
+
+		expect(api.logs.some((l) => l.includes("Status: active"))).toBe(true);
+		expect(api.logs.some((l) => l.includes("TDD path"))).toBe(true);
+		expect(api.logs.some((l) => l.includes("Contract hash"))).toBe(true);
+		expect(api.logs.some((l) => l.includes("Attempt"))).toBe(true);
+		expect(api.logs.some((l) => l.includes("Advisor available"))).toBe(true);
+	});
+
+	it("reports no task when no task is active", async () => {
+		const cmd = api.registeredCommands.find((c) => c.name === "compliance")!;
+		await cmd.handler(["status"]);
+
+		expect(api.logs.some((l) => l.includes("No active compliance task"))).toBe(true);
+	});
+
+	it("does not mutate task state", async () => {
+		const cmd = api.registeredCommands.find((c) => c.name === "compliance")!;
+		await cmd.handler(["start", "tdd.md"]);
+
+		const stateBefore = runtime.currentTaskState;
+		await cmd.handler(["status"]);
+		const stateAfter = runtime.currentTaskState;
+
+		expect(stateAfter).toEqual(stateBefore);
+	});
+});
+
+// ─── Tests: History ─────────────────────────────────────────────────
+
+describe("ComplianceCommand — /compliance history", () => {
+	it("shows history for active task", async () => {
+		const cmd = api.registeredCommands.find((c) => c.name === "compliance")!;
+		await cmd.handler(["start", "tdd.md"]);
+
+		await cmd.handler(["history"]);
+
+		expect(api.logs.some((l) => l.includes("active"))).toBe(true);
+	});
+
+	it("reports no history when no task is active", async () => {
+		const cmd = api.registeredCommands.find((c) => c.name === "compliance")!;
+		await cmd.handler(["history"]);
+
+		expect(api.logs.some((l) => l.includes("No active compliance task"))).toBe(true);
 	});
 });
