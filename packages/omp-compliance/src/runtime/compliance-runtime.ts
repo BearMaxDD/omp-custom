@@ -12,8 +12,8 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { VerdictValidationError, parseVerdict } from "../advisor/verdict-schema";
-import { acceptVerdict as sinkAcceptVerdict } from "../advisor/verdict-sink";
 import type { ComplianceFinding } from "../advisor/verdict-schema";
+import { acceptVerdict as sinkAcceptVerdict } from "../advisor/verdict-sink";
 import type { VerdictStore } from "../advisor/verdict-sink";
 import { loadComplianceContract } from "../contract/load-contract";
 import type { ComplianceContract } from "../contract/types";

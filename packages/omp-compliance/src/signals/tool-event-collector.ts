@@ -14,9 +14,9 @@
  *   producing the snapshot. Orphan results are stored but flagged.
  */
 
-import type { EvidenceSnapshot, ToolCallRecord, ToolResultRecord } from "./types";
 import { normalizeCodebaseMemory } from "./codebase-memory";
 import { normalizeTaskDelegation } from "./task-delegation";
+import type { EvidenceSnapshot, ToolCallRecord, ToolResultRecord } from "./types";
 import { collectVerifications } from "./verification";
 
 export class ToolEventCollector {
@@ -110,9 +110,7 @@ export class ToolEventCollector {
 	 * Array values are counted. Object values are flattened to their key
 	 * count. Primitives pass through unchanged.
 	 */
-	private truncateParams(
-		params: Record<string, unknown>,
-	): Record<string, unknown> {
+	private truncateParams(params: Record<string, unknown>): Record<string, unknown> {
 		const result: Record<string, unknown> = {};
 		for (const [key, value] of Object.entries(params)) {
 			result[key] = this.truncateValue(value);
@@ -143,14 +141,10 @@ export class ToolEventCollector {
 	private extractResultRef(event: Record<string, unknown>): string {
 		if (typeof event.resultRef === "string") return event.resultRef;
 		if (typeof event.content === "string") {
-			return event.content.length > 200
-				? `${event.content.slice(0, 200)}…`
-				: event.content;
+			return event.content.length > 200 ? `${event.content.slice(0, 200)}…` : event.content;
 		}
 		if (typeof event.output === "string") {
-			return event.output.length > 200
-				? `${event.output.slice(0, 200)}…`
-				: event.output;
+			return event.output.length > 200 ? `${event.output.slice(0, 200)}…` : event.output;
 		}
 		try {
 			const json = JSON.stringify(event.result ?? event);

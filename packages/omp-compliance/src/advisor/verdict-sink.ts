@@ -48,6 +48,11 @@ export interface VerdictStore {
 	records: VerdictRecord[];
 	/** The last pass verdict attempt per (taskId, contractHash). */
 	lastPass: Record<string, number>; // key = `${taskId}:${contractHash}` => attempt
+	/**
+	 * Set of accepted verdict keys for O(1) idempotency checking.
+	 * Each key is `${taskId}:${contractHash}:${attempt}`.
+	 */
+	acceptedKeys: Set<string>;
 }
 
 // ─── Sink ────────────────────────────────────────────────────────────
@@ -59,6 +64,7 @@ export interface VerdictStore {
 export const defaultStore: VerdictStore = {
 	records: [],
 	lastPass: {},
+	acceptedKeys: new Set(),
 };
 
 /**
@@ -76,42 +82,34 @@ export const defaultStore: VerdictStore = {
  * @param verdict      — raw verdict object from the Advisor
  * @param context      — expected task context (taskId, contractHash, attempt)
  * @param store        — verdict store (defaultStore if omitted)
+ * @param parsed       — optional pre-validated verdict (avoids duplicate parseVerdict)
  * @returns Accepted or rejected result
  */
 export function acceptVerdict(
 	verdict: Record<string, unknown>,
 	context: VerdictContext,
 	store: VerdictStore = defaultStore,
+	parsed?: ComplianceVerdict,
 ): VerdictAcceptResult {
-	// Step 1: Schema + context validation
-	let parsed: ComplianceVerdict;
-	try {
-		parsed = parseVerdict(verdict, context);
-	} catch (err) {
-		if (err instanceof VerdictValidationError) {
-			return {
-				status: "rejected",
-				reason: err.message,
-				protocolError: true,
-			};
+	// Step 1: Schema + context validation (skip if pre-parsed provided)
+	if (!parsed) {
+		try {
+			parsed = parseVerdict(verdict, context);
+		} catch (err) {
+			if (err instanceof VerdictValidationError) {
+				return {
+					status: "rejected",
+					reason: err.message,
+					protocolError: true,
+				};
+			}
+			throw err;
 		}
-		throw err;
 	}
 
 	const { task_id, contract_hash, attempt, status, findings } = parsed;
 
-	// Step 2: Idempotency — check if this exact verdict was already accepted
-	const alreadyAccepted = store.records.some(
-		(r) => r.taskId === task_id && r.contractHash === contract_hash && r.attempt === attempt,
-	);
-	if (alreadyAccepted) {
-		return {
-			status: "rejected",
-			reason: `Verdict for (${task_id}, ${contract_hash}, attempt=${attempt}) already processed`,
-		};
-	}
-
-	// Step 3: Stale attempt check
+	// Step 2: Stale attempt check — older attempt after a newer pass is a protocol error
 	const passKey = `${task_id}:${contract_hash}`;
 	const lastPassAttempt = store.lastPass[passKey];
 	if (lastPassAttempt !== undefined && attempt < lastPassAttempt) {
@@ -122,12 +120,21 @@ export function acceptVerdict(
 		};
 	}
 
-	// Step 4: Post-pass lock — "remediate" after "pass" is rejected
+	// Step 3: Post-pass lock — "remediate" after a "pass" at the same or later attempt
 	if (status === "remediate" && lastPassAttempt !== undefined && attempt >= lastPassAttempt) {
 		return {
 			status: "rejected",
 			reason: `Cannot remediate after pass (last pass at attempt ${lastPassAttempt})`,
 			protocolError: true,
+		};
+	}
+
+	// Step 4: Idempotency — O(1) check via Set
+	const verdictKey = `${task_id}:${contract_hash}:${attempt}`;
+	if (store.acceptedKeys.has(verdictKey)) {
+		return {
+			status: "rejected",
+			reason: `Verdict for (${task_id}, ${contract_hash}, attempt=${attempt}) already processed`,
 		};
 	}
 
@@ -142,6 +149,7 @@ export function acceptVerdict(
 	};
 
 	store.records.push(record);
+	store.acceptedKeys.add(verdictKey);
 
 	if (status === "pass") {
 		store.lastPass[passKey] = attempt;

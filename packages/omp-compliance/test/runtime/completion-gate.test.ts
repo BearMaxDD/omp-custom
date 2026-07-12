@@ -1,8 +1,13 @@
 import { describe, expect, it } from "bun:test";
-import { buildCompletionSnapshot } from "../../src/runtime/completion-gate";
-import type { CompletionSnapshot, EvidenceFacts, AgentClaim } from "../../src/runtime/completion-gate";
 import type { ComplianceContract, ContractSummary, SHA256Hash } from "../../src/contract/types";
-import type { EvidenceSnapshot, CodebaseMemoryEvidence, VerificationEvidence, TaskDelegationEvidence } from "../../src/signals/types";
+import { buildCompletionSnapshot } from "../../src/runtime/completion-gate";
+import type { AgentClaim, CompletionSnapshot, EvidenceFacts } from "../../src/runtime/completion-gate";
+import type {
+	CodebaseMemoryEvidence,
+	EvidenceSnapshot,
+	TaskDelegationEvidence,
+	VerificationEvidence,
+} from "../../src/signals/types";
 import type { ComplianceVerdict, TaskState } from "../../src/state/types";
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -98,13 +103,9 @@ function remediationTaskState(overrides: Partial<TaskState> = {}): TaskState {
 
 describe("CompletionGate — buildCompletionSnapshot", () => {
 	it("should include all required fields in the snapshot", () => {
-		const snapshot = buildCompletionSnapshot(
-			activeTaskState(),
-			sampleContract(),
-			sampleSignals(),
-			"fp-test-001",
-			{ summary: "Done" },
-		);
+		const snapshot = buildCompletionSnapshot(activeTaskState(), sampleContract(), sampleSignals(), "fp-test-001", {
+			summary: "Done",
+		});
 
 		expect(snapshot).toBeDefined();
 		expect(snapshot.taskId).toBe("task-1");
@@ -127,32 +128,19 @@ describe("CompletionGate — buildCompletionSnapshot", () => {
 	});
 
 	it("should include agent claim with optional claimed_verification", () => {
-		const snapshot = buildCompletionSnapshot(
-			activeTaskState(),
-			sampleContract(),
-			sampleSignals(),
-			"fp-002",
-			{
-				summary: "Implemented feature",
-				claimedVerification: ["bun test passes", "biome check clean"],
-			},
-		);
+		const snapshot = buildCompletionSnapshot(activeTaskState(), sampleContract(), sampleSignals(), "fp-002", {
+			summary: "Implemented feature",
+			claimedVerification: ["bun test passes", "biome check clean"],
+		});
 
 		expect(snapshot.agentClaim.summary).toBe("Implemented feature");
-		expect(snapshot.agentClaim.claimedVerification).toEqual([
-			"bun test passes",
-			"biome check clean",
-		]);
+		expect(snapshot.agentClaim.claimedVerification).toEqual(["bun test passes", "biome check clean"]);
 	});
 
 	it("should compute evidenceFacts correctly when all evidence present", () => {
-		const snapshot = buildCompletionSnapshot(
-			activeTaskState(),
-			sampleContract(),
-			sampleSignals(),
-			"fp-003",
-			{ summary: "Done" },
-		);
+		const snapshot = buildCompletionSnapshot(activeTaskState(), sampleContract(), sampleSignals(), "fp-003", {
+			summary: "Done",
+		});
 
 		expect(snapshot.evidenceFacts.codebaseMemoryUsed).toBe("present");
 		expect(snapshot.evidenceFacts.taskDelegationUsed).toBe("present");
@@ -166,13 +154,9 @@ describe("CompletionGate — buildCompletionSnapshot", () => {
 			verifications: [],
 		});
 
-		const snapshot = buildCompletionSnapshot(
-			activeTaskState(),
-			sampleContract(),
-			emptySignals,
-			"fp-004",
-			{ summary: "Done" },
-		);
+		const snapshot = buildCompletionSnapshot(activeTaskState(), sampleContract(), emptySignals, "fp-004", {
+			summary: "Done",
+		});
 
 		expect(snapshot.evidenceFacts.codebaseMemoryUsed).toBe("missing");
 		expect(snapshot.evidenceFacts.taskDelegationUsed).toBe("missing");
@@ -187,25 +171,17 @@ describe("CompletionGate — buildCompletionSnapshot", () => {
 			],
 		});
 
-		const snapshot = buildCompletionSnapshot(
-			activeTaskState(),
-			sampleContract(),
-			failedSignals,
-			"fp-005",
-			{ summary: "Done" },
-		);
+		const snapshot = buildCompletionSnapshot(activeTaskState(), sampleContract(), failedSignals, "fp-005", {
+			summary: "Done",
+		});
 
 		expect(snapshot.evidenceFacts.verificationRun).toBe("partial");
 	});
 
 	it("should include open remediation when task is remediation_required", () => {
-		const snapshot = buildCompletionSnapshot(
-			remediationTaskState(),
-			sampleContract(),
-			sampleSignals(),
-			"fp-006",
-			{ summary: "Fixed issues" },
-		);
+		const snapshot = buildCompletionSnapshot(remediationTaskState(), sampleContract(), sampleSignals(), "fp-006", {
+			summary: "Fixed issues",
+		});
 
 		expect(snapshot.remediation.open).toHaveLength(2);
 		expect(snapshot.remediation.open[0].requiredFix).toBe("add tests for edge cases");
@@ -213,25 +189,17 @@ describe("CompletionGate — buildCompletionSnapshot", () => {
 	});
 
 	it("should have empty open remediation when task is not remediation_required", () => {
-		const snapshot = buildCompletionSnapshot(
-			activeTaskState(),
-			sampleContract(),
-			sampleSignals(),
-			"fp-007",
-			{ summary: "Done" },
-		);
+		const snapshot = buildCompletionSnapshot(activeTaskState(), sampleContract(), sampleSignals(), "fp-007", {
+			summary: "Done",
+		});
 
 		expect(snapshot.remediation.open).toHaveLength(0);
 	});
 
 	it("should NEVER produce pass or remediate in the snapshot", () => {
-		const snapshot = buildCompletionSnapshot(
-			activeTaskState(),
-			sampleContract(),
-			sampleSignals(),
-			"fp-008",
-			{ summary: "Done" },
-		);
+		const snapshot = buildCompletionSnapshot(activeTaskState(), sampleContract(), sampleSignals(), "fp-008", {
+			summary: "Done",
+		});
 
 		// The snapshot object should not have verdict-like fields
 		const keys = Object.keys(snapshot);
@@ -251,21 +219,22 @@ describe("CompletionGate — buildCompletionSnapshot", () => {
 				queries: ["search_graph", "trace_path"],
 				references: ["src/core.ts", "src/utils.ts"],
 			},
-			verifications: [
-				{ command: "bun test", exitCode: 0, changedPaths: [], passed: true },
-			],
+			verifications: [{ command: "bun test", exitCode: 0, changedPaths: [], passed: true }],
 			subagentDelegations: [
-				{ agentId: "sub-alpha", taskSummary: "write tests", exitCode: 0, aborted: false, durationMs: 500, outputRefs: [], codebaseReferences: [], status: "completed" },
+				{
+					agentId: "sub-alpha",
+					taskSummary: "write tests",
+					exitCode: 0,
+					aborted: false,
+					durationMs: 500,
+					outputRefs: [],
+					codebaseReferences: [],
+					status: "completed",
+				},
 			],
 		});
 
-		const snapshot = buildCompletionSnapshot(
-			activeTaskState(),
-			sampleContract(),
-			sigs,
-			"fp-009",
-			{ summary: "Done" },
-		);
+		const snapshot = buildCompletionSnapshot(activeTaskState(), sampleContract(), sigs, "fp-009", { summary: "Done" });
 
 		expect(snapshot.codebaseMemory.queries).toContain("search_graph");
 		expect(snapshot.codebaseMemory.references).toContain("src/core.ts");

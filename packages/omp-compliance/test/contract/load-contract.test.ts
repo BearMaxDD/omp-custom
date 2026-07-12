@@ -113,6 +113,31 @@ describe("loadComplianceContract", () => {
 			}
 		}
 	});
+
+	it("rejects a file when realpathSync fails (broken symlink)", () => {
+		const brokenLinkPath = fixturePath("broken-link.md");
+		try {
+			try {
+				if (existsSync(brokenLinkPath)) unlinkSync(brokenLinkPath);
+			} catch {
+				// ignore
+			}
+			// Create a symlink pointing to a non-existent target.
+			// existsSync returns true (the symlink node exists),
+			// but realpathSync throws ENOENT.
+			Bun.spawnSync(["ln", "-s", "/tmp/omp-nonexistent-target.md", brokenLinkPath]);
+
+			expect(() => {
+				loadComplianceContract(brokenLinkPath, repoRoot);
+			}).toThrow(ContractLoadError);
+		} finally {
+			try {
+				if (existsSync(brokenLinkPath)) unlinkSync(brokenLinkPath);
+			} catch {
+				// ignore
+			}
+		}
+	});
 });
 
 describe("compareContractRevision", () => {

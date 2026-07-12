@@ -20,9 +20,9 @@ const REDACT_RULES: RedactRule[] = [
 		pattern: /(-----BEGIN\s+(?:RSA\s+)?PRIVATE\s+KEY-----)[\s\S]*?(-----END\s+(?:RSA\s+)?PRIVATE\s+KEY-----)/g,
 		replacement: "$1\n[REDACTED]\n$2",
 	},
-	// Authorization header value
+	// Authorization header value — capture rest of line
 	{
-		pattern: /(Authorization:\s*)\S+/gi,
+		pattern: /(Authorization:\s*)[^\n]+/gi,
 		replacement: "$1[REDACTED]",
 	},
 	// Bearer token

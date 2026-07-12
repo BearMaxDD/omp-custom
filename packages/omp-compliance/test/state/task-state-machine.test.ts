@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { transition } from "../../src/state/task-state-machine";
-import type { TaskState, TaskEvent } from "../../src/state/types";
+import type { TaskEvent, TaskState } from "../../src/state/types";
 
 /** Create an ACTIVE task state for testing. */
 function activeTask(): TaskState {

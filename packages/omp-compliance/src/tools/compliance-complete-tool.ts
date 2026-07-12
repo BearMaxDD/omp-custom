@@ -11,8 +11,8 @@
  *   claimed_verification: string[], max 30 items, each max 500 chars, optional
  */
 
-import type { ExtensionAPI } from "../types";
 import type { ComplianceRuntime } from "../runtime/compliance-runtime";
+import type { ExtensionAPI } from "../types";
 
 // ─── Parameter validation ───────────────────────────────────────────
 
@@ -31,9 +31,7 @@ export interface ValidationError {
  *
  * Returns an array of ValidationError. Empty array = valid.
  */
-export function validateCompletionParams(
-	raw: Record<string, unknown>,
-): ValidationError[] {
+export function validateCompletionParams(raw: Record<string, unknown>): ValidationError[] {
 	const errors: ValidationError[] = [];
 
 	if (raw.summary === undefined || raw.summary === null) {
@@ -81,10 +79,7 @@ export function validateCompletionParams(
  *     transition to advisor_reviewing
  *  3. Returns { status: "advisor_reviewing", completionSnapshot }
  */
-export function registerComplianceCompleteTool(
-	api: ExtensionAPI,
-	runtime: ComplianceRuntime,
-): void {
+export function registerComplianceCompleteTool(api: ExtensionAPI, runtime: ComplianceRuntime): void {
 	api.registerTool({
 		name: "compliance_complete",
 		description:

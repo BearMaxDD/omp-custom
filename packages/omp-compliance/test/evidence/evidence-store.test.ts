@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { EvidenceStore, type EvidenceRecord } from "../../src/evidence/evidence-store";
+import { type EvidenceRecord, EvidenceStore } from "../../src/evidence/evidence-store";
 
 const TMP_DIR = join(import.meta.dirname, "..", ".tmp", "evidence-test");
 

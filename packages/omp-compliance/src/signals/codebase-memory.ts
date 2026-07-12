@@ -36,9 +36,7 @@ const EXPECTED_SERVER = "codebase-memory";
  * Returns a flat list of CodebaseMemoryEvidence for each recognized
  * tool call that was successfully matched.
  */
-export function normalizeCodebaseMemory(
-	paired: ReadonlyArray<{ call: ToolCallRecord; result?: ToolResultRecord }>,
-): {
+export function normalizeCodebaseMemory(paired: ReadonlyArray<{ call: ToolCallRecord; result?: ToolResultRecord }>): {
 	indexReady: boolean;
 	queries: string[];
 	references: string[];
@@ -53,7 +51,7 @@ export function normalizeCodebaseMemory(
 		const serverName = call.serverName ?? "";
 
 		// Only consider codebase-memory server tools
-		if (serverName !== EXPECTED_SERVER && toolName.indexOf(".") < 0 && toolName.indexOf("_") < 0) {
+		if (!serverName && toolName.indexOf(".") < 0 && toolName.indexOf("_") >= 0) {
 			// When serverName is absent but the tool name contains underscores
 			// typical of MCP tools, we still check the RECOGNIZED_TOOLS set.
 			// This handles harness variants that don't set serverName explicitly.

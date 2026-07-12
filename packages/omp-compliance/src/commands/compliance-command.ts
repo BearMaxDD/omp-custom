@@ -7,9 +7,9 @@
  * Status and history are READ-ONLY projections — no side effects.
  */
 
+import type { ComplianceRuntime } from "../runtime/compliance-runtime";
 import { readHistory } from "../status/history-reader";
 import { toStatusViewModel } from "../status/status-view-model";
-import type { ComplianceRuntime } from "../runtime/compliance-runtime";
 import type { ExtensionAPI } from "../types";
 
 // ─── Command Registration ───────────────────────────────────────────
@@ -27,14 +27,11 @@ import type { ExtensionAPI } from "../types";
 export function registerComplianceCommand(api: ExtensionAPI, runtime: ComplianceRuntime): void {
 	api.registerCommand("compliance", {
 		description:
-			"Manage compliance tasks. " +
-			"Usage: /compliance start <tdd.md> | stop | resume <task_id> | status | history",
+			"Manage compliance tasks. " + "Usage: /compliance start <tdd.md> | stop | resume <task_id> | status | history",
 		getArgumentCompletions: () => ["start", "stop", "resume", "status", "history"],
 		handler: async (args: string[]) => {
 			if (args.length === 0) {
-				throw new Error(
-					"Usage: /compliance start <tdd.md> | stop | resume <task_id> | status | history",
-				);
+				throw new Error("Usage: /compliance start <tdd.md> | stop | resume <task_id> | status | history");
 			}
 
 			const subcommand = args[0].toLowerCase();

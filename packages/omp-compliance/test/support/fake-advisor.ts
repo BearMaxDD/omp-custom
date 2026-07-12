@@ -54,10 +54,7 @@ export class FakeAdvisor {
 	 * Each finding MUST include required_fix — parseVerdict enforces this.
 	 * category, severity, and evidenceRefs are optional enrichments.
 	 */
-	remediateVerdict(
-		context: VerdictContext,
-		findings: FakeFinding[],
-	): Record<string, unknown> {
+	remediateVerdict(context: VerdictContext, findings: FakeFinding[]): Record<string, unknown> {
 		return {
 			schema_version: 1,
 			task_id: context.taskId,
@@ -81,19 +78,14 @@ export class FakeAdvisor {
 	 * When summary is provided, a single finding with that reason is
 	 * included. Empty findings array is also valid for "pass".
 	 */
-	passVerdict(
-		context: VerdictContext,
-		summary?: string,
-	): Record<string, unknown> {
+	passVerdict(context: VerdictContext, summary?: string): Record<string, unknown> {
 		return {
 			schema_version: 1,
 			task_id: context.taskId,
 			contract_hash: context.contractHash,
 			attempt: context.attempt,
 			status: "pass",
-			findings: summary
-				? [{ id: "pass", reason: summary, required_fix: "" }]
-				: [],
+			findings: summary ? [{ id: "pass", reason: summary, required_fix: "" }] : [],
 		};
 	}
 

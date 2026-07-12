@@ -90,6 +90,12 @@ export class EvidenceStore {
 	 * Append an evidence record to the JSONL file for a task.
 	 * Uses atomic write (temp file + rename) for crash safety.
 	 * Falls back to pending buffer on disk failure.
+	 *
+	 * PERFORMANCE NOTE: This method reads the entire file on every append
+	 * (readFileSync + writeFileSync), giving it O(n²) insertion cost.
+	 * This is acceptable for compliance logs which typically contain only
+	 * a few hundred records per task. For high-throughput scenarios,
+	 * a streaming log writer would be more appropriate.
 	 */
 	async append(record: EvidenceRecord): Promise<void> {
 		const line = JSON.stringify(record) + "\n";
@@ -158,6 +164,16 @@ export class EvidenceStore {
 		return records;
 	}
 
+	/**
+	 * Read file content, returning empty string on any error.
+	 *
+	 * Silently handles all file-system errors (ENOENT, EACCES, EISDIR, etc.):
+	 * - If the file does not exist, returns "" so callers treat it as empty.
+	 * - If the file is unreadable (permissions, locked), returns "" and the
+	 *   write operation will later attempt creation of a fresh file.
+	 * This is intentional: evidence storage must never throw, as that would
+	 * interrupt the compliance reporting pipeline.
+	 */
 	private readFileSafe(filePath: string): string {
 		try {
 			return readFileSync(filePath, "utf-8");

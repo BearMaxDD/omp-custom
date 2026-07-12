@@ -1,0 +1,3 @@
+{"schemaVersion":1,"timestamp":"2025-01-01T00:00:00.000Z","taskId":"task-1","contractPath":"tasks/task-1.md","contractHash":"sha256:abc123","attempt":1,"event":"completion_requested","signalDigest":"digest123"}
+{"schemaVersion":1,"timestamp":"2025-01-01T00:00:00.000Z","taskId":"task-1","contractPath":"tasks/task-1.md","contractHash":"sha256:abc123","attempt":1,"event":"completion_requested","signalDigest":"digest123"}
+{"schemaVersion":1,"timestamp":"2025-01-01T00:00:00.000Z","taskId":"task-1","contractPath":"tasks/task-1.md","contractHash":"sha256:abc123","attempt":1,"event":"completed","signalDigest":"digest123"}

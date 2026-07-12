@@ -32,19 +32,17 @@ describe("Extension not activated — no completion gate side effects", () => {
 	});
 
 	it("importing the extension does not pollute global state", () => {
-		// This test verifies that importing the extension module
-		// has no observable side effects on the process.
-
-		// Before import, log a snapshot
-		const beforeTools = typeof (globalThis as Record<string, unknown>).__complianceTools;
-		const beforeCommands = typeof (globalThis as Record<string, unknown>).__complianceCommands;
-
-		// Dynamic import
+		// Dynamic import — the module is loaded but not activated.
+		// The extension module does not write to globalThis at import time.
+		// All side effects (tool registration, command registration, event handlers)
+		// happen inside the activate() function, which requires an ExtensionAPI.
 		require("../../src/extension");
 
-		// After import: no global state was set by the module itself
-		expect(typeof (globalThis as Record<string, unknown>).__complianceTools).toBe(beforeTools);
-		expect(typeof (globalThis as Record<string, unknown>).__complianceCommands).toBe(beforeCommands);
+		// Verify no compliance-related global properties were created at import.
+		// If a future refactor adds top-level global state, this test catches it.
+		const g = globalThis as Record<string, unknown>;
+		const complianceProps = Object.getOwnPropertyNames(g).filter((k) => k.toLowerCase().includes("compliance"));
+		expect(complianceProps).toEqual([]);
 	});
 
 	it("no compliance_tool event handlers fire without activation", () => {

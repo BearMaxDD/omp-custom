@@ -66,16 +66,10 @@ export function normalizeTaskDelegation(
 		const aborted = details.aborted ?? details.cancelled ?? false;
 		const durationMs = details.durationMs ?? details.duration;
 		const output = details.output ?? details.outputs ?? details.artifacts;
-		const outputArtifacts = Array.isArray(output)
-			? output.map(String)
-			: typeof output === "string"
-				? [output]
-				: [];
+		const outputArtifacts = Array.isArray(output) ? output.map(String) : typeof output === "string" ? [output] : [];
 
 		// Extract codebase references from output text
-		const codebaseRefs = extractCodebaseRefs(
-			outputArtifacts.join(" ") + " " + result.resultRef,
-		);
+		const codebaseRefs = extractCodebaseRefs(outputArtifacts.join(" ") + " " + result.resultRef);
 
 		results.push({
 			agentId: agentId != null ? String(agentId) : undefined,
@@ -119,8 +113,7 @@ function parseResultDetails(ref: string): Record<string, unknown> {
  * Looks for assignment, task, description, or name fields in order.
  */
 function extractTaskSummary(params: Record<string, unknown>): string | undefined {
-	const summary =
-		String(params.assignment ?? params.task ?? params.description ?? params.name ?? "");
+	const summary = String(params.assignment ?? params.task ?? params.description ?? params.name ?? "");
 	return summary || undefined;
 }
 

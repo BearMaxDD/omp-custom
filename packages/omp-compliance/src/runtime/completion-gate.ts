@@ -108,10 +108,7 @@ export function buildCompletionSnapshot(
 	const evidenceFacts = computeEvidenceFacts(signals);
 
 	const openRemediation: RemediationItem[] = [];
-	if (
-		taskState.status === "remediation_required" &&
-		taskState.lastVerdict?.requiredFixes
-	) {
+	if (taskState.status === "remediation_required" && taskState.lastVerdict?.requiredFixes) {
 		taskState.lastVerdict.requiredFixes.forEach((fix, i) => {
 			openRemediation.push({ id: `fix-${i + 1}`, requiredFix: fix });
 		});
@@ -168,11 +165,9 @@ export function buildCompletionSnapshot(
  *                     "missing" if none attempted
  */
 function computeEvidenceFacts(signals: EvidenceSnapshot): EvidenceFacts {
-	const codebaseMemoryUsed: EvidenceFact =
-		signals.codebaseMemory.queries.length > 0 ? "present" : "missing";
+	const codebaseMemoryUsed: EvidenceFact = signals.codebaseMemory.queries.length > 0 ? "present" : "missing";
 
-	const taskDelegationUsed: EvidenceFact =
-		signals.subagentDelegations.length > 0 ? "present" : "missing";
+	const taskDelegationUsed: EvidenceFact = signals.subagentDelegations.length > 0 ? "present" : "missing";
 
 	let verificationRun: EvidenceFact = "missing";
 	if (signals.verifications.length > 0) {

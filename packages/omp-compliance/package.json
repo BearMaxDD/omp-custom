@@ -14,7 +14,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "check": "biome check src test",
+    "check": "cd ../.. && biome check packages/omp-compliance/src packages/omp-compliance/test",
     "test": "bun test --preload ./test/setup.ts"
   },
   "peerDependencies": {

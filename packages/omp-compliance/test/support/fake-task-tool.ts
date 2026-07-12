@@ -12,7 +12,7 @@
  * NEVER calls collector internals directly — only the public API.
  */
 
-import { ToolEventCollector } from "../../src/signals/tool-event-collector";
+import type { ToolEventCollector } from "../../src/signals/tool-event-collector";
 
 /** Parameters for recording a single task delegation. */
 export interface FakeDelegationParams {

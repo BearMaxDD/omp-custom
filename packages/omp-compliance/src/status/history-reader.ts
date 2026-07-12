@@ -34,10 +34,7 @@ export interface HistoryEvent {
  * (signalDigest, outputTruncated, commandTruncated) beyond the event
  * metadata are omitted from the summary to avoid flooding the display.
  */
-export async function readHistory(
-	store: EvidenceStore,
-	taskId: string,
-): Promise<HistoryEvent[]> {
+export async function readHistory(store: EvidenceStore, taskId: string): Promise<HistoryEvent[]> {
 	const records = await store.readAll(taskId);
 
 	const events: HistoryEvent[] = [];

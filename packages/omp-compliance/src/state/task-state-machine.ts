@@ -75,6 +75,16 @@ function transitionActive(state: TaskState, event: TaskEvent): TaskState {
 	}
 }
 
+/**
+ * Handle events while in completion_requested state.
+ *
+ * A verdict event passes through advisor_reviewing status before
+ * being processed by processVerdict, ensuring the state machine
+ * correctly captures the review transition in the state history.
+ * The status update to advisor_reviewing happens first, then
+ * processVerdict determines the final status (completed or
+ * remediation_required).
+ */
 function transitionCompletionRequested(state: TaskState, event: TaskEvent): TaskState {
 	if (event.type === "advisor_silent") {
 		return update(state, { status: "advisor_reviewing" });

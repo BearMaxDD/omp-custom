@@ -1,13 +1,12 @@
-import { describe, expect, it, beforeEach } from "bun:test";
+import { beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { EvidenceStore } from "../../src/evidence/evidence-store";
-import { CollectorRuntime } from "../../src/signals/collector-runtime";
-import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
 import { buildCompletionSnapshot } from "../../src/runtime/completion-gate";
+import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
+import { CollectorRuntime } from "../../src/signals/collector-runtime";
 import type { ExtensionAPI } from "../../src/types";
-import type { ComplianceVerdict } from "../../src/state/types";
 
 // ─── Minimal Fake API for runtime tests ─────────────────────────────
 
@@ -19,10 +18,7 @@ class MinimalAPI implements ExtensionAPI {
 	registerCommand(): void {}
 	on(): void {}
 
-	sendMessage(
-		message: unknown,
-		_options?: { triggerTurn?: boolean; deliverAs?: string },
-	): void {
+	sendMessage(message: unknown, _options?: { triggerTurn?: boolean; deliverAs?: string }): void {
 		this.sentMessages.push(message);
 	}
 
@@ -41,21 +37,33 @@ let store: EvidenceStore;
 let collector: CollectorRuntime;
 let runtime: ComplianceRuntime;
 
-function validVerdict(opts: {
-	status: "pass" | "remediation_required";
-	summary?: string;
-	requiredFixes?: string[];
-}): ComplianceVerdict {
+function advisorVerdict(
+	runtime: ComplianceRuntime,
+	opts: {
+		status: "pass" | "remediate";
+		findings?: Array<{ id: string; reason: string; required_fix?: string }>;
+	},
+): Record<string, unknown> {
+	const state = runtime.currentTaskState;
+	if (!state) throw new Error("No active task — verdict helper called at wrong time");
 	return {
+		schema_version: 1,
+		task_id: state.taskId,
+		contract_hash: state.contractHash,
+		attempt: state.attempt,
 		status: opts.status,
-		summary: opts.summary,
-		requiredFixes: opts.requiredFixes,
-		schemaValid: true,
+		findings: opts.findings ?? [],
 	};
 }
 
-function finding(requiredFix: string): string {
-	return requiredFix;
+function finding(
+	id: string,
+	reason: string,
+	requiredFix?: string,
+): { id: string; reason: string; required_fix?: string } {
+	const f: { id: string; reason: string; required_fix?: string } = { id, reason };
+	if (requiredFix !== undefined) f.required_fix = requiredFix;
+	return f;
 }
 
 beforeEach(() => {
@@ -168,17 +176,13 @@ describe("ComplianceRuntime — requestCompletion", () => {
 	});
 
 	it("should throw when no task is active", async () => {
-		expect(
-			runtime.requestCompletion({ summary: "Done" }),
-		).rejects.toThrow("No active compliance task");
+		expect(runtime.requestCompletion({ summary: "Done" })).rejects.toThrow("No active compliance task");
 	});
 
 	it("should throw when task is not in active status", async () => {
 		await runtime.start("tdd.md");
 		await runtime.requestCompletion({ summary: "Done" });
-		expect(
-			runtime.requestCompletion({ summary: "Again" }),
-		).rejects.toThrow("Cannot request completion");
+		expect(runtime.requestCompletion({ summary: "Again" })).rejects.toThrow("Cannot request completion");
 	});
 
 	it("should include agent claim params in the snapshot", async () => {
@@ -189,10 +193,7 @@ describe("ComplianceRuntime — requestCompletion", () => {
 		});
 
 		expect(result.completionSnapshot.agentClaim.summary).toBe("Completed feature X");
-		expect(result.completionSnapshot.agentClaim.claimedVerification).toEqual([
-			"test passes",
-			"lint clean",
-		]);
+		expect(result.completionSnapshot.agentClaim.claimedVerification).toEqual(["test passes", "lint clean"]);
 	});
 });
 
@@ -202,7 +203,7 @@ describe("ComplianceRuntime — acceptVerdict (pass)", () => {
 	it("should transition to completed on pass verdict", async () => {
 		await runtime.start("tdd.md");
 		await runtime.requestCompletion({ summary: "Done" });
-		await runtime.acceptVerdict(validVerdict({ status: "pass", summary: "All good" }));
+		await runtime.acceptVerdict(advisorVerdict(runtime, { status: "pass" }));
 
 		expect(runtime.currentTaskState?.status).toBe("completed");
 	});
@@ -210,7 +211,7 @@ describe("ComplianceRuntime — acceptVerdict (pass)", () => {
 	it("should write completed evidence record", async () => {
 		const { taskId } = await runtime.start("tdd.md");
 		await runtime.requestCompletion({ summary: "Done" });
-		await runtime.acceptVerdict(validVerdict({ status: "pass", summary: "OK" }));
+		await runtime.acceptVerdict(advisorVerdict(runtime, { status: "pass" }));
 
 		const evidence = await store.readAll(taskId);
 		expect(evidence.some((e) => e.event === "completed")).toBe(true);
@@ -221,7 +222,7 @@ describe("ComplianceRuntime — acceptVerdict (pass)", () => {
 		await runtime.requestCompletion({ summary: "Done" });
 
 		const beforeCount = api.sentMessages.length;
-		await runtime.acceptVerdict(validVerdict({ status: "pass", summary: "OK" }));
+		await runtime.acceptVerdict(advisorVerdict(runtime, { status: "pass" }));
 
 		// No new messages should be sent for pass verdict
 		expect(api.sentMessages.length).toBe(beforeCount);
@@ -236,10 +237,9 @@ describe("ComplianceRuntime — acceptVerdict (remediation)", () => {
 		await runtime.requestCompletion({ summary: "第一次" });
 
 		await runtime.acceptVerdict(
-			validVerdict({
-				status: "remediation_required",
-				summary: "Needs more testing",
-				requiredFixes: [finding("补测试")],
+			advisorVerdict(runtime, {
+				status: "remediate",
+				findings: [finding("f1", "Needs more testing", "补测试")],
 			}),
 		);
 
@@ -250,10 +250,12 @@ describe("ComplianceRuntime — acceptVerdict (remediation)", () => {
 		const hasFixMessage = api.sentMessages.some((m) => {
 			if (m && typeof m === "object" && "data" in m) {
 				const data = (m as Record<string, unknown>).data as Record<string, unknown>;
-				return Array.isArray(data?.findings) &&
+				return (
+					Array.isArray(data?.findings) &&
 					(data.findings as Array<{ requiredFix: string }>).some(
 						(f: { requiredFix: string }) => f.requiredFix === "补测试",
-					);
+					)
+				);
 			}
 			return false;
 		});
@@ -269,11 +271,18 @@ describe("ComplianceRuntime — acceptVerdict (remediation)", () => {
 		await runtime.requestCompletion({ summary: "Done" });
 
 		const beforeCount = api.sentMessages.length;
+
+		// remediate verdict with empty findings → parseVerdict rejects it (schema requires
+		// at least one finding with required_fix for remediate status) → stays in
+		// advisor_reviewing, no injection
 		await runtime.acceptVerdict(
-			validVerdict({ status: "remediation_required", requiredFixes: [] }),
+			advisorVerdict(runtime, {
+				status: "remediate",
+				findings: [],
+			}),
 		);
 
-		// No new messages for empty fixes
+		// No new messages for schema-rejected verdict
 		expect(api.sentMessages.length).toBe(beforeCount);
 	});
 
@@ -282,11 +291,17 @@ describe("ComplianceRuntime — acceptVerdict (remediation)", () => {
 		await runtime.requestCompletion({ summary: "Done" });
 
 		const beforeCount = api.sentMessages.length;
+
+		// Build a verdict with mismatched contract_hash → parseVerdict rejects context binding
+		const state = runtime.currentTaskState!;
 		await runtime.acceptVerdict({
-			status: "remediation_required",
-			summary: "Fix needed",
-			requiredFixes: ["do something"],
-			schemaValid: false,
+			schema_version: 1,
+			task_id: state.taskId,
+			// Wrong hash — doesn't match the runtime's contractHash
+			contract_hash: "sha256:mismatched-hash",
+			attempt: state.attempt,
+			status: "pass",
+			findings: [],
 		});
 
 		// No injection for invalid schema — stays in advisor_reviewing
@@ -299,10 +314,9 @@ describe("ComplianceRuntime — acceptVerdict (remediation)", () => {
 		await runtime.requestCompletion({ summary: "Done" });
 
 		await runtime.acceptVerdict(
-			validVerdict({
-				status: "remediation_required",
-				summary: "Fix issues",
-				requiredFixes: ["fix foo", "fix bar"],
+			advisorVerdict(runtime, {
+				status: "remediate",
+				findings: [finding("f1", "Fix issues", "fix foo"), finding("f2", "Fix more", "fix bar")],
 			}),
 		);
 
@@ -314,11 +328,13 @@ describe("ComplianceRuntime — acceptVerdict (remediation)", () => {
 		await runtime.start("tdd.md");
 		await runtime.requestCompletion({ summary: "Done" });
 
-		await runtime.acceptVerdict({
-			// @ts-expect-error testing invalid status
-			status: "invalid_status",
-			schemaValid: true,
-		});
+		// Build a schema-valid verdict shape but with unknown status
+		await runtime.acceptVerdict(
+			advisorVerdict(runtime, {
+				// @ts-expect-error testing invalid status
+				status: "unknown_status",
+			}),
+		);
 
 		expect(runtime.currentTaskState?.status).toBe("advisor_reviewing");
 	});
@@ -340,9 +356,9 @@ describe("ComplianceRuntime — resumeAfterRemediation", () => {
 		await runtime.start("tdd.md");
 		await runtime.requestCompletion({ summary: "Done" });
 		await runtime.acceptVerdict(
-			validVerdict({
-				status: "remediation_required",
-				requiredFixes: ["fix it"],
+			advisorVerdict(runtime, {
+				status: "remediate",
+				findings: [finding("f1", "Fix it", "fix it")],
 			}),
 		);
 

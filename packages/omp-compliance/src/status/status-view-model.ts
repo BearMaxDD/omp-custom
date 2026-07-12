@@ -5,8 +5,8 @@
  * NEVER mutates task state or triggers side effects.
  */
 
-import type { ComplianceVerdict, TaskState, TaskStatus } from "../state/types";
 import type { EvidenceSnapshot } from "../signals/types";
+import type { ComplianceVerdict, TaskState, TaskStatus } from "../state/types";
 
 // ─── Types ─────────────────────────────────────────────────────────
 
@@ -40,13 +40,8 @@ export interface StatusViewModel {
  * @param state  — current task state (required; null = no task started)
  * @param snapshot — optional evidence snapshot for gap detection
  */
-export function toStatusViewModel(
-	state: TaskState,
-	snapshot?: EvidenceSnapshot,
-): StatusViewModel {
-	const hashShort = state.contractHash.length >= 8
-		? state.contractHash.slice(0, 8)
-		: state.contractHash;
+export function toStatusViewModel(state: TaskState, snapshot?: EvidenceSnapshot): StatusViewModel {
+	const hashShort = state.contractHash.length >= 8 ? state.contractHash.slice(0, 8) : state.contractHash;
 
 	const advisorAvailable = state.status !== "completed";
 

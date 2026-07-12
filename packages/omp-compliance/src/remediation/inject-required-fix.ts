@@ -14,8 +14,8 @@
  *  - When the task is stalled, automatic injection stops.
  */
 
-import type { ExtensionAPI, CustomMessagePayload } from "../types";
 import type { SHA256Hash } from "../contract/types";
+import type { CustomMessagePayload, ExtensionAPI } from "../types";
 
 // ─── Remediation Parameters ─────────────────────────────────────────
 
@@ -47,10 +47,7 @@ export interface RemediationPayload {
  * @param payload — remediation data (taskId, contractHash, findings)
  * @returns true if the message was sent, false if conditions not met
  */
-export function injectRemediation(
-	api: ExtensionAPI,
-	payload: RemediationPayload,
-): boolean {
+export function injectRemediation(api: ExtensionAPI, payload: RemediationPayload): boolean {
 	// Guard: no findings → nothing to inject
 	if (!payload.findings || payload.findings.length === 0) {
 		return false;

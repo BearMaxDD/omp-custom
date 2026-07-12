@@ -18,16 +18,16 @@ import { beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { VerdictValidationError, parseVerdict } from "../../src/advisor/verdict-schema";
+import type { VerdictContext } from "../../src/advisor/verdict-schema";
 import { acceptVerdict, hasPassed } from "../../src/advisor/verdict-sink";
 import type { VerdictStore } from "../../src/advisor/verdict-sink";
-import { parseVerdict, VerdictValidationError } from "../../src/advisor/verdict-schema";
-import type { VerdictContext } from "../../src/advisor/verdict-schema";
+import type { SHA256Hash } from "../../src/contract/types";
 import { EvidenceStore } from "../../src/evidence/evidence-store";
 import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
-import { FakeAdvisor } from "../support/fake-advisor";
 import type { ExtensionAPI } from "../../src/types";
-import type { SHA256Hash } from "../../src/contract/types";
+import { FakeAdvisor } from "../support/fake-advisor";
 
 // ─── Test Helper Types ──────────────────────────────────────────────
 
@@ -286,9 +286,7 @@ describe("Verdict sink — acceptVerdict protocol rules", () => {
 			contract_hash: DEFAULT_HASH,
 			attempt: 1,
 			status: "remediate",
-			findings: [
-				{ id: "f1", reason: "Fix it", required_fix: "Do the fix" },
-			],
+			findings: [{ id: "f1", reason: "Fix it", required_fix: "Do the fix" }],
 		};
 
 		const result = acceptVerdict(verdict, defaultContext, store);
@@ -356,11 +354,7 @@ describe("Verdict sink — acceptVerdict protocol rules", () => {
 			findings: [],
 		};
 
-		const result = acceptVerdict(
-			staleVerdict,
-			{ ...defaultContext, attempt: 1 },
-			store,
-		);
+		const result = acceptVerdict(staleVerdict, { ...defaultContext, attempt: 1 }, store);
 
 		expect(result.status).toBe("rejected");
 		expect(result.protocolError).toBe(true);
@@ -388,9 +382,7 @@ describe("Verdict sink — acceptVerdict protocol rules", () => {
 			contract_hash: DEFAULT_HASH,
 			attempt: 1,
 			status: "remediate",
-			findings: [
-				{ id: "f1", reason: "Fix", required_fix: "The fix" },
-			],
+			findings: [{ id: "f1", reason: "Fix", required_fix: "The fix" }],
 		};
 
 		const result = acceptVerdict(remediateVerdict, defaultContext, store);
@@ -408,9 +400,7 @@ describe("Verdict sink — acceptVerdict protocol rules", () => {
 			contract_hash: DEFAULT_HASH,
 			attempt: 1,
 			status: "remediate",
-			findings: [
-				{ id: "f1", reason: "Fix 1", required_fix: "Do fix 1" },
-			],
+			findings: [{ id: "f1", reason: "Fix 1", required_fix: "Do fix 1" }],
 		};
 
 		acceptVerdict(r1, defaultContext, store);
@@ -423,9 +413,7 @@ describe("Verdict sink — acceptVerdict protocol rules", () => {
 			contract_hash: DEFAULT_HASH,
 			attempt: 2,
 			status: "remediate",
-			findings: [
-				{ id: "f2", reason: "Fix 2", required_fix: "Do fix 2" },
-			],
+			findings: [{ id: "f2", reason: "Fix 2", required_fix: "Do fix 2" }],
 		};
 
 		const result = acceptVerdict(r2, { ...defaultContext, attempt: 2 }, store);
@@ -465,9 +453,7 @@ describe("hasPassed — pass state tracking", () => {
 			contract_hash: DEFAULT_HASH,
 			attempt: 1,
 			status: "remediate",
-			findings: [
-				{ id: "f1", reason: "Fix", required_fix: "The fix" },
-			],
+			findings: [{ id: "f1", reason: "Fix", required_fix: "The fix" }],
 		};
 
 		acceptVerdict(verdict, defaultContext, store);
@@ -521,22 +507,21 @@ describe("Verdict protocol through ComplianceRuntime", () => {
 		const { runtime, advisor } = setupRuntimeFixture();
 
 		await runtime.start("tdd.md");
+		await runtime.requestCompletion({ summary: "Done" });
 		const state = runtime.currentTaskState!;
 
-		// Build verdict with wrong attempt (attempt=99, but runtime uses attempt=1)
+		// Build verdict with wrong attempt (attempt=0, but runtime uses attempt=1)
 		await runtime.acceptVerdict({
 			schema_version: 1,
 			task_id: state.taskId,
 			contract_hash: state.contractHash,
-			attempt: 99, // mismatched
+			attempt: 0, // mismatched — actual attempt is 1
 			status: "pass",
 			findings: [],
 		});
 
-		// After protocol error, stays in advisor_reviewing (or the state before completion request)
-		// Actually we called acceptVerdict without requestCompletion first — the runtime
-		// silently ignores (no state is neither completion_requested nor advisor_reviewing)
-		// Let's redo properly:
+		// After protocol error, stay in advisor_reviewing — verdict not accepted
+		expect(runtime.currentTaskState?.status).toBe("advisor_reviewing");
 	});
 
 	it("valid pass verdict transitions to completed", async () => {
@@ -585,9 +570,7 @@ describe("Verdict protocol through ComplianceRuntime", () => {
 		const parsed = parseVerdict(passV, context);
 		expect(parsed.status).toBe("pass");
 
-		const remediateV = advisor.remediateVerdict(context, [
-			{ id: "f1", reason: "Issue", requiredFix: "Fix it" },
-		]);
+		const remediateV = advisor.remediateVerdict(context, [{ id: "f1", reason: "Issue", requiredFix: "Fix it" }]);
 		const parsedR = parseVerdict(remediateV, context);
 		expect(parsedR.status).toBe("remediate");
 		expect(parsedR.findings[0].required_fix).toBe("Fix it");
@@ -602,9 +585,7 @@ describe("Verdict protocol through ComplianceRuntime", () => {
 		// Remediate
 		const ctx1 = FakeAdvisor.contextFromRuntime(runtime);
 		await runtime.acceptVerdict(
-			advisor.remediateVerdict(ctx1, [
-				{ id: "f1", reason: "Fix needed", requiredFix: "Apply fix" },
-			]),
+			advisor.remediateVerdict(ctx1, [{ id: "f1", reason: "Fix needed", requiredFix: "Apply fix" }]),
 		);
 
 		expect(runtime.currentTaskState?.status).toBe("remediation_required");

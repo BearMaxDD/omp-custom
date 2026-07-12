@@ -21,16 +21,16 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
  */
 
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readFileSync } from "node:fs";
 import { EvidenceStore } from "../../src/evidence/evidence-store";
 import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
-import { FakeAdvisor } from "../support/fake-advisor";
-import { FakeTaskTool } from "../support/fake-task-tool";
-import { FakeCodebaseMemory } from "../support/fake-codebase-memory";
 import type { ExtensionAPI } from "../../src/types";
+import { FakeAdvisor } from "../support/fake-advisor";
+import { FakeCodebaseMemory } from "../support/fake-codebase-memory";
+import { FakeTaskTool } from "../support/fake-task-tool";
 
 // ─── Minimal API for runtime tests ───────────────────────────────────
 
@@ -137,12 +137,6 @@ function expectRemediationInjection(sentMessages: unknown[], fixText: string): v
 }
 
 // ─── Cleanup ────────────────────────────────────────────────────────
-
-afterEach(() => {
-	// Cleanup temp dirs created in setupFixture
-	// Each test creates its own unique tmpDir, so no shared state issue
-});
-
 // ─── Tests ──────────────────────────────────────────────────────────
 
 describe("End-to-end compliance flow — remediate scenarios", () => {
@@ -179,7 +173,8 @@ describe("End-to-end compliance flow — remediate scenarios", () => {
 				reason: "Production code was modified but no test was added or updated",
 				category: "test",
 				severity: "error",
-				requiredFix: "Write unit tests for the modified production code paths — refer to the TDD contract for required test cases",
+				requiredFix:
+					"Write unit tests for the modified production code paths — refer to the TDD contract for required test cases",
 			},
 		]);
 
@@ -199,8 +194,7 @@ describe("End-to-end compliance flow — remediate scenarios", () => {
 			return (
 				Array.isArray(findings) &&
 				(findings as Array<Record<string, unknown>>).some(
-					(f: Record<string, unknown>) =>
-						typeof f.requiredFix === "string" && f.requiredFix.includes("test"),
+					(f: Record<string, unknown>) => typeof f.requiredFix === "string" && f.requiredFix.includes("test"),
 				)
 			);
 		});
@@ -209,7 +203,6 @@ describe("End-to-end compliance flow — remediate scenarios", () => {
 		// Assert: not completed
 		expect(runtime.currentTaskState?.status).not.toBe("completed");
 	});
-
 
 	it("测试失败仍 complete → remediate + Evidence 有失败退出码", async () => {
 		const { runtime, api, fakeAdvisor } = setupFixture();
@@ -245,9 +238,7 @@ describe("End-to-end compliance flow — remediate scenarios", () => {
 
 		// Evidence of the failed exit code should exist
 		const evidenceSnapshot = runtime.currentEvidenceSnapshot;
-		const failedVerification = evidenceSnapshot.verifications.find(
-			(v) => v.command.includes("bun test"),
-		);
+		const failedVerification = evidenceSnapshot.verifications.find((v) => v.command.includes("bun test"));
 		expect(failedVerification).toBeDefined();
 		expect(failedVerification?.exitCode).toBe(1);
 		expect(failedVerification?.passed).toBe(false);
@@ -269,10 +260,12 @@ describe("End-to-end compliance flow — remediate scenarios", () => {
 		const verdict = fakeAdvisor.remediateVerdict(ctx, [
 			{
 				id: "scope-violation",
-				reason: "Changed paths fall outside the contract-defined scope — the contract limits changes to specific files listed in the scope section",
+				reason:
+					"Changed paths fall outside the contract-defined scope — the contract limits changes to specific files listed in the scope section",
 				category: "process",
 				severity: "error",
-				requiredFix: "Revert changes outside the defined scope and limit modifications to files listed in the TDD scope section",
+				requiredFix:
+					"Revert changes outside the defined scope and limit modifications to files listed in the TDD scope section",
 				evidenceRefs: ["contract://scope-section", "diff://worktree"],
 			},
 		]);
@@ -291,8 +284,7 @@ describe("End-to-end compliance flow — remediate scenarios", () => {
 			const findings = (data as Record<string, unknown>).findings as Array<Record<string, unknown>> | undefined;
 			if (!Array.isArray(findings)) return false;
 			return findings.some(
-				(f: Record<string, unknown>) =>
-					typeof f.requiredFix === "string" && f.requiredFix.includes("scope"),
+				(f: Record<string, unknown>) => typeof f.requiredFix === "string" && f.requiredFix.includes("scope"),
 			);
 		});
 		expect(hasScopeRef).toBe(true);
@@ -317,7 +309,8 @@ describe("End-to-end compliance flow — remediate scenarios", () => {
 		const verdict = fakeAdvisor.remediateVerdict(ctx, [
 			{
 				id: "missing-codebase-evidence",
-				reason: "No codebase-memory tool was invoked — the contract requires using index, search, and source analysis tools to produce traceable evidence",
+				reason:
+					"No codebase-memory tool was invoked — the contract requires using index, search, and source analysis tools to produce traceable evidence",
 				category: "process",
 				severity: "error",
 				requiredFix:
@@ -354,7 +347,8 @@ describe("End-to-end compliance flow — remediate scenarios", () => {
 		const verdict = fakeAdvisor.remediateVerdict(ctx, [
 			{
 				id: "missing-delegation-evidence",
-				reason: "No subagent task delegation was recorded — the contract policy requires using the official 'task' tool for subagent work",
+				reason:
+					"No subagent task delegation was recorded — the contract policy requires using the official 'task' tool for subagent work",
 				category: "process",
 				severity: "error",
 				requiredFix:
@@ -396,7 +390,8 @@ describe("End-to-end compliance flow — remediate scenarios", () => {
 		const verdict = fakeAdvisor.remediateVerdict(ctx, [
 			{
 				id: "missing-subagent-codebase-refs",
-				reason: "Subagent delegation completed but produced no traceable codebase symbol or call-chain references — evidence must include file paths, symbol names, or call chain artifacts",
+				reason:
+					"Subagent delegation completed but produced no traceable codebase symbol or call-chain references — evidence must include file paths, symbol names, or call chain artifacts",
 				category: "process",
 				severity: "warning",
 				requiredFix:
@@ -517,11 +512,7 @@ describe("End-to-end compliance flow — pass scenarios", () => {
 		expect(runtime.currentTaskState?.attempt).toBe(attempt2 + 1);
 
 		// --- Round 3: pass ---
-		fakeCbm.recordFullSet(
-			["coverage report"],
-			["src/routes/register.ts"],
-			["calculateCoverage"],
-		);
+		fakeCbm.recordFullSet(["coverage report"], ["src/routes/register.ts"], ["calculateCoverage"]);
 		fakeTask.recordDelegation({
 			agentId: "sub-verify",
 			taskSummary: "verify coverage",
@@ -656,9 +647,7 @@ describe("End-to-end compliance flow — stalled scenario", () => {
 			contract_hash: "sha256:dup-hash",
 			attempt: 1,
 			status: "remediate",
-			findings: [
-				{ id: "f1", reason: "Fix needed", required_fix: "Apply fix" },
-			],
+			findings: [{ id: "f1", reason: "Fix needed", required_fix: "Apply fix" }],
 		};
 
 		const context = {

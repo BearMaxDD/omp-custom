@@ -25,6 +25,7 @@ export function computeFingerprint(
 	verificationResultHash: string,
 	contractHash: string,
 ): string {
-	const combined = worktreeDiffHash + normalizedFindings + verificationResultHash + contractHash;
+	const safeJoin = (parts: string[]): string => parts.map((p) => `${p.length}:${p}`).join("|");
+	const combined = safeJoin([worktreeDiffHash, normalizedFindings, verificationResultHash, contractHash]);
 	return createHash("sha256").update(combined, "utf-8").digest("hex");
 }

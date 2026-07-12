@@ -1,13 +1,11 @@
 import { describe, expect, it } from "bun:test";
+import rawPkg from "../package.json" with { type: "json" };
 import { FakeExtensionAPI } from "./support/fake-extension-api";
+
+const pkg = rawPkg as { name: string; omp?: { extensions?: string[] } };
 
 describe("omp-compliance extension packaging", () => {
 	it("declares a unique entry discoverable by OMP extensions", () => {
-		const pkg = require("../package.json") as {
-			name: string;
-			omp?: { extensions?: string[] };
-		};
-
 		expect(pkg.name).toBe("@bearmaxdd/omp-compliance");
 		expect(pkg.omp?.extensions).toBeDefined();
 		expect(Array.isArray(pkg.omp?.extensions)).toBe(true);
@@ -18,6 +16,7 @@ describe("omp-compliance extension packaging", () => {
 	it("registers only compliance command and completion tool, without blocking built-in tools", async () => {
 		const api = new FakeExtensionAPI();
 
+		// Dynamic import: test exercises the module loading boundary for extension activation
 		const activate = (await import("../src/extension")).default;
 		activate(api.toAPI());
 

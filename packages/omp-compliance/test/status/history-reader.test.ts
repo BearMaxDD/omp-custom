@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { EvidenceStore, type EvidenceRecord } from "../../src/evidence/evidence-store";
+import { type EvidenceRecord, EvidenceStore } from "../../src/evidence/evidence-store";
 import { readHistory } from "../../src/status/history-reader";
 
 // ─── Test Fixtures ─────────────────────────────────────────────────

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
-import { toStatusViewModel, type EvidenceGaps } from "../../src/status/status-view-model";
-import type { TaskState } from "../../src/state/types";
 import type { EvidenceSnapshot } from "../../src/signals/types";
+import type { TaskState } from "../../src/state/types";
+import { type EvidenceGaps, toStatusViewModel } from "../../src/status/status-view-model";
 
 // ─── Fixture builders ──────────────────────────────────────────────
 
@@ -171,9 +171,7 @@ describe("toStatusViewModel", () => {
 	it("classifies aborted delegation as partial", () => {
 		const snap: EvidenceSnapshot = {
 			...fullSnapshot(),
-			subagentDelegations: [
-				{ status: "aborted", outputArtifacts: [], codebaseRefs: [] },
-			],
+			subagentDelegations: [{ status: "aborted", outputArtifacts: [], codebaseRefs: [] }],
 		};
 		const view = toStatusViewModel(activeTask(), snap);
 		expect(view.evidence.taskDelegation).toBe("partial");

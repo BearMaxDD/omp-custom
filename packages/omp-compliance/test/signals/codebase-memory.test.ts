@@ -3,11 +3,7 @@ import { ToolEventCollector } from "../../src/signals/tool-event-collector";
 import type { ToolCallRecord, ToolResultRecord } from "../../src/signals/types";
 
 /** Build a tool_call event for the codebase-memory MCP server. */
-function mcpCall(
-	toolName: string,
-	params: Record<string, unknown> = {},
-	toolCallId?: string,
-): Record<string, unknown> {
+function mcpCall(toolName: string, params: Record<string, unknown> = {}, toolCallId?: string): Record<string, unknown> {
 	return {
 		toolName,
 		toolCallId: toolCallId ?? `cb-${Date.now()}`,
@@ -17,15 +13,8 @@ function mcpCall(
 }
 
 /** Build a tool_result event. */
-function mcpResult(
-	toolCallId: string,
-	resultOrContent: unknown,
-	isError?: boolean,
-): Record<string, unknown> {
-	const content =
-		typeof resultOrContent === "string"
-			? resultOrContent
-			: JSON.stringify(resultOrContent);
+function mcpResult(toolCallId: string, resultOrContent: unknown, isError?: boolean): Record<string, unknown> {
+	const content = typeof resultOrContent === "string" ? resultOrContent : JSON.stringify(resultOrContent);
 	return {
 		toolCallId,
 		content,
@@ -62,21 +51,15 @@ describe("codebase-memory 证据采集 — 仅工具名匹配，不基于自然�
 
 	it("仅在 index、搜索、源码或调用链证据连续存在时标记 codebase evidence complete", () => {
 		const collector = new ToolEventCollector();
-		collector.recordCall(
-			mcpCall("index_status", {}, "idx-1"),
-		);
+		collector.recordCall(mcpCall("index_status", {}, "idx-1"));
 		collector.recordResult(mcpResult("idx-1", { ready: true }));
-		collector.recordCall(
-			mcpCall("search_graph", { query: "TaskTool" }, "sg-1"),
-		);
+		collector.recordCall(mcpCall("search_graph", { query: "TaskTool" }, "sg-1"));
 		collector.recordResult(
 			mcpResult("sg-1", {
 				references: ["src/task/index.ts:TaskTool"],
 			}),
 		);
-		collector.recordCall(
-			mcpCall("get_code_snippet", { qualified_name: "TaskTool.execute" }, "gcs-1"),
-		);
+		collector.recordCall(mcpCall("get_code_snippet", { qualified_name: "TaskTool.execute" }, "gcs-1"));
 		collector.recordResult(mcpResult("gcs-1", { code: "function execute()" }));
 		const snap = collector.snapshot();
 		expect(snap.codebaseMemory).toMatchObject({
@@ -88,9 +71,7 @@ describe("codebase-memory 证据采集 — 仅工具名匹配，不基于自然�
 
 	it("search_code 也被识别为查询证据", () => {
 		const collector = new ToolEventCollector();
-		collector.recordCall(
-			mcpCall("search_code", { query: "find" }, "sc-1"),
-		);
+		collector.recordCall(mcpCall("search_code", { query: "find" }, "sc-1"));
 		collector.recordResult(mcpResult("sc-1", { matches: [] }));
 		const snap = collector.snapshot();
 		expect(snap.codebaseMemory.queries).toContain("search_code");
@@ -98,12 +79,8 @@ describe("codebase-memory 证据采集 — 仅工具名匹配，不基于自然�
 
 	it("trace_path 也被识别为调用链证据", () => {
 		const collector = new ToolEventCollector();
-		collector.recordCall(
-			mcpCall("trace_path", { symbol: "main" }, "tp-1"),
-		);
-		collector.recordResult(
-			mcpResult("tp-1", { trace: ["src/main.ts:main -> src/util.ts:helper"] }),
-		);
+		collector.recordCall(mcpCall("trace_path", { symbol: "main" }, "tp-1"));
+		collector.recordResult(mcpResult("tp-1", { trace: ["src/main.ts:main -> src/util.ts:helper"] }));
 		const snap = collector.snapshot();
 		expect(snap.codebaseMemory.queries).toContain("trace_path");
 		expect(snap.codebaseMemory.references.length).toBeGreaterThanOrEqual(1);
@@ -111,9 +88,7 @@ describe("codebase-memory 证据采集 — 仅工具名匹配，不基于自然�
 
 	it("不识别未知工具名", () => {
 		const collector = new ToolEventCollector();
-		collector.recordCall(
-			mcpCall("unknown_tool", {}, "ut-1"),
-		);
+		collector.recordCall(mcpCall("unknown_tool", {}, "ut-1"));
 		collector.recordResult(mcpResult("ut-1", { ok: true }));
 		const snap = collector.snapshot();
 		expect(snap.codebaseMemory.queries).toHaveLength(0);
@@ -139,22 +114,18 @@ describe("codebase-memory 证据采集 — 仅工具名匹配，不基于自然�
 		collector.recordCall({
 			toolName: "completion",
 			toolCallId: "nlp",
-			params: { prompt: 'I searched the graph using search_graph and found results' },
+			params: { prompt: "I searched the graph using search_graph and found results" },
 		});
-		collector.recordResult(mcpResult("nlp", { text: 'I used search_graph to find' }));
+		collector.recordResult(mcpResult("nlp", { text: "I used search_graph to find" }));
 		const snap = collector.snapshot();
 		expect(snap.codebaseMemory.queries).toHaveLength(0);
 	});
 
 	it("相同查询名去重", () => {
 		const collector = new ToolEventCollector();
-		collector.recordCall(
-			mcpCall("search_graph", { query: "a" }, "sg-a"),
-		);
+		collector.recordCall(mcpCall("search_graph", { query: "a" }, "sg-a"));
 		collector.recordResult(mcpResult("sg-a", { references: [] }));
-		collector.recordCall(
-			mcpCall("search_graph", { query: "b" }, "sg-b"),
-		);
+		collector.recordCall(mcpCall("search_graph", { query: "b" }, "sg-b"));
 		collector.recordResult(mcpResult("sg-b", { references: [] }));
 		const snap = collector.snapshot();
 		expect(snap.codebaseMemory.queries).toEqual(["search_graph"]);

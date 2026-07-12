@@ -1,11 +1,11 @@
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import type { ExtensionAPI } from "./types";
-import { CollectorRuntime } from "./signals/collector-runtime";
+import { registerComplianceCommand } from "./commands/compliance-command";
 import { EvidenceStore } from "./evidence/evidence-store";
 import { ComplianceRuntime } from "./runtime/compliance-runtime";
-import { registerComplianceCommand } from "./commands/compliance-command";
+import { CollectorRuntime } from "./signals/collector-runtime";
 import { registerComplianceCompleteTool } from "./tools/compliance-complete-tool";
+import type { ExtensionAPI } from "./types";
 
 /** Default evidence store directory within the repo. */
 const DEFAULT_EVIDENCE_DIR = ".omp/evidence";

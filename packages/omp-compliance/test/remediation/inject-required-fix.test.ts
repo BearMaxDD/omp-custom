@@ -1,7 +1,7 @@
-import { describe, expect, it, beforeEach } from "bun:test";
-import { injectRemediation } from "../../src/remediation/inject-required-fix";
-import type { ExtensionAPI, CustomMessagePayload } from "../../src/types";
+import { beforeEach, describe, expect, it } from "bun:test";
 import type { SHA256Hash } from "../../src/contract/types";
+import { injectRemediation } from "../../src/remediation/inject-required-fix";
+import type { CustomMessagePayload, ExtensionAPI } from "../../src/types";
 
 // ─── Fake API that captures sent messages ───────────────────────────
 
@@ -13,10 +13,7 @@ class FakeRemediationAPI implements ExtensionAPI {
 	on(): void {}
 	appendEntry(): void {}
 
-	sendMessage(
-		message: unknown,
-		options?: { triggerTurn?: boolean; deliverAs?: string },
-	): void {
+	sendMessage(message: unknown, options?: { triggerTurn?: boolean; deliverAs?: string }): void {
 		this.sent.push({ message, options });
 	}
 

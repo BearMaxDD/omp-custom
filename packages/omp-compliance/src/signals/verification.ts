@@ -72,11 +72,11 @@ export function collectVerifications(
 
 // ─── Helpers ────────────────────────────────────────────────────
 
-function extractCommand(params: Record<string, unknown>): string | undefined {
+export function extractCommand(params: Record<string, unknown>): string | undefined {
 	return String(params.command ?? params.cmd ?? params.script ?? "");
 }
 
-function extractExitCode(result?: ToolResultRecord): number {
+export function extractExitCode(result?: ToolResultRecord): number {
 	if (!result) return -1;
 	if (!result.success) return 1;
 
@@ -92,7 +92,7 @@ function extractExitCode(result?: ToolResultRecord): number {
 	return 0;
 }
 
-function extractChangedPaths(text: string): string[] {
+export function extractChangedPaths(text: string): string[] {
 	if (!text) return [];
 	const paths: string[] = [];
 	const pathPattern = /[\w./-]+\.[a-z]+(?::\w[\w.]*)?/gi;
