@@ -27,15 +27,6 @@ function runCall(command: string, toolCallId = "call-1"): ToolCallRecord {
 	};
 }
 
-function execCall(command: string, toolCallId = "call-1"): ToolCallRecord {
-	return {
-		toolName: "exec",
-		toolCallId,
-		params: { command },
-		timestamp: "2025-01-01T00:00:00.000Z",
-	};
-}
-
 function nonToolCall(toolName: string): ToolCallRecord {
 	return {
 		toolName,

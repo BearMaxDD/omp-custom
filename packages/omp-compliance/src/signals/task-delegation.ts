@@ -33,7 +33,7 @@ export function normalizeTaskDelegation(
 
 	for (const { call, result } of paired) {
 		// Only match the official "task" tool
-		const shortName = call.toolName.includes(".") ? call.toolName.split(".").pop()! : call.toolName;
+		const shortName = call.toolName.includes(".") ? (call.toolName.split(".").pop() ?? call.toolName) : call.toolName;
 		if (shortName !== TASK_TOOL_NAME) continue;
 
 		if (!result) {
@@ -69,7 +69,7 @@ export function normalizeTaskDelegation(
 		const outputArtifacts = Array.isArray(output) ? output.map(String) : typeof output === "string" ? [output] : [];
 
 		// Extract codebase references from output text
-		const codebaseRefs = extractCodebaseRefs(outputArtifacts.join(" ") + " " + result.resultRef);
+		const codebaseRefs = extractCodebaseRefs(`${outputArtifacts.join(" ")} ${result.resultRef}`);
 
 		results.push({
 			agentId: agentId != null ? String(agentId) : undefined,

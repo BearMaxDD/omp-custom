@@ -364,7 +364,7 @@ describe("ComplianceRuntime — acceptVerdict (remediation)", () => {
 		const beforeCount = api.sentMessages.length;
 
 		// Build a verdict with mismatched contract_hash → parseVerdict rejects context binding
-		const state = runtime.currentTaskState!;
+		const state = runtime.currentTaskState as NonNullable<typeof runtime.currentTaskState>;
 		await runtime.acceptVerdict({
 			schema_version: 1,
 			task_id: state.taskId,
@@ -433,8 +433,8 @@ describe("ComplianceRuntime — resumeAfterRemediation", () => {
 			}),
 		);
 
-		const attemptBefore = runtime.currentTaskState!.attempt;
+		const attemptBefore = runtime.currentTaskState?.attempt;
 		runtime.resumeAfterRemediation();
-		expect(runtime.currentTaskState!.attempt).toBe(attemptBefore + 1);
+		expect(runtime.currentTaskState?.attempt).toBe(attemptBefore + 1);
 	});
 });

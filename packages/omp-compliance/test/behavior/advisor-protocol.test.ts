@@ -18,6 +18,7 @@ import { beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ComplianceReviewRegistry } from "../../src/advisor/review-envelope";
 import { VerdictValidationError, parseVerdict } from "../../src/advisor/verdict-schema";
 import type { VerdictContext } from "../../src/advisor/verdict-schema";
 import { acceptVerdict, hasPassed } from "../../src/advisor/verdict-sink";
@@ -27,9 +28,8 @@ import { EvidenceStore } from "../../src/evidence/evidence-store";
 import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
 import type { ExtensionAPI } from "../../src/types";
-import { FakeAdvisor } from "../support/fake-advisor";
-import { ComplianceReviewRegistry } from "../../src/advisor/review-envelope";
 import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "../../src/types";
+import { FakeAdvisor } from "../support/fake-advisor";
 
 // ─── Test Helper Types ──────────────────────────────────────────────
 
@@ -108,7 +108,7 @@ function setupRuntimeFixture(): ProtocolFixture {
 	const runtime = new ComplianceRuntime(() => store, collector, api, tmpDir, {
 		sessionId: () => "test-session",
 		registry,
-		requestAdvisorReview: (req) => Promise.resolve({ reviewId: "test-review", status: "accepted" }),
+		requestAdvisorReview: (_req) => Promise.resolve({ reviewId: "test-review", status: "accepted" }),
 	});
 	const advisor = new FakeAdvisor();
 
@@ -497,7 +497,7 @@ describe("hasPassed — pass state tracking", () => {
 
 describe("Verdict protocol through ComplianceRuntime", () => {
 	it("schema-invalid verdict transitions to protocol_error state", async () => {
-		const { runtime, advisor } = setupRuntimeFixture();
+		const { runtime } = setupRuntimeFixture();
 
 		await runtime.start("tdd.md");
 		await runtime.requestCompletion({ summary: "Done" });
@@ -513,11 +513,11 @@ describe("Verdict protocol through ComplianceRuntime", () => {
 	});
 
 	it("mismatched attempt in verdict transitions to protocol_error", async () => {
-		const { runtime, advisor } = setupRuntimeFixture();
+		const { runtime } = setupRuntimeFixture();
 
 		await runtime.start("tdd.md");
 		await runtime.requestCompletion({ summary: "Done" });
-		const state = runtime.currentTaskState!;
+		const state = runtime.currentTaskState as NonNullable<typeof runtime.currentTaskState>;
 
 		// Build verdict with wrong attempt (attempt=0, but runtime uses attempt=1)
 		await runtime.acceptVerdict({

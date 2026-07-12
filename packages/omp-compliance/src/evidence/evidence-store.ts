@@ -98,13 +98,13 @@ export class EvidenceStore {
 	 * a streaming log writer would be more appropriate.
 	 */
 	async append(record: EvidenceRecord): Promise<void> {
-		const line = JSON.stringify(record) + "\n";
+		const line = `${JSON.stringify(record)}\n`;
 		const filePath = join(this.basePath, `${record.taskId}.jsonl`);
 
 		try {
 			mkdirSync(dirname(filePath), { recursive: true });
 			const existing = this.readFileSafe(filePath);
-			const tmpPath = filePath + ".tmp";
+			const tmpPath = `${filePath}.tmp`;
 			writeFileSync(tmpPath, existing + line, "utf-8");
 			renameSync(tmpPath, filePath);
 		} catch {
@@ -124,9 +124,9 @@ export class EvidenceStore {
 				mkdirSync(dirname(filePath), { recursive: true });
 				let content = this.readFileSafe(filePath);
 				for (const record of records) {
-					content += JSON.stringify(record) + "\n";
+					content += `${JSON.stringify(record)}\n`;
 				}
-				const tmpPath = filePath + ".tmp";
+				const tmpPath = `${filePath}.tmp`;
 				writeFileSync(tmpPath, content, "utf-8");
 				renameSync(tmpPath, filePath);
 				this.pending.delete(taskId);

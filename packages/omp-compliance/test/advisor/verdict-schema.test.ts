@@ -120,24 +120,23 @@ describe("parseVerdict", () => {
 		).toThrow("required_fix");
 	});
 
-it("rejects remediate with whitespace-only required_fix", () => {
-	expect(() =>
-		parseVerdict(
-			validVerdict({
-				status: "remediate",
-				findings: [
-					{
-						id: "f1",
-						reason: "Something wrong",
-						required_fix: "   ",
-					},
-				],
-			}),
-			defaultContext,
-		),
-	).toThrow("required_fix");
-});
-
+	it("rejects remediate with whitespace-only required_fix", () => {
+		expect(() =>
+			parseVerdict(
+				validVerdict({
+					status: "remediate",
+					findings: [
+						{
+							id: "f1",
+							reason: "Something wrong",
+							required_fix: "   ",
+						},
+					],
+				}),
+				defaultContext,
+			),
+		).toThrow("required_fix");
+	});
 
 	it("rejects an invalid schema_version", () => {
 		expect(() => parseVerdict(validVerdict({ schema_version: 2 }), defaultContext)).toThrow("schema_version");
@@ -251,5 +250,4 @@ it("rejects remediate with whitespace-only required_fix", () => {
 		expect(result.status).toBe("remediate");
 		expect(result.findings).toHaveLength(2);
 	});
-
 });

@@ -185,30 +185,22 @@ export function parseVerdict(raw: Record<string, unknown>, expectedContext: Verd
 
 		// status-specific rules
 		if (status === "remediate") {
-			if (findings.length === 0) {
+			const hasValidFix = (findings as Record<string, unknown>[]).some((f) => {
+				const requiredFix = typeof f.required_fix === "string" ? f.required_fix.trim() : f.required_fix;
+				return typeof requiredFix === "string" && requiredFix.length > 0;
+			});
+			if (!hasValidFix) {
 				errors.push({
 					field: "findings",
-					message: "remediate verdict must include at least one finding with required_fix",
+					message: "remediate verdict requires at least one finding with non-empty required_fix",
 				});
-			} else {
-				for (let i = 0; i < findings.length; i++) {
-					const f = findings[i] as Record<string, unknown>;
-					const requiredFix = f.required_fix;
-					if (typeof requiredFix !== "string" || requiredFix.length === 0) {
-						errors.push({
-							field: `findings[${i}].required_fix`,
-							message: "required_fix must be a non-empty string for remediate verdict",
-						});
-					}
-				}
 			}
 		}
-
 		// pass verdict must not contain findings with required_fix
 		if (status === "pass") {
 			for (let i = 0; i < findings.length; i++) {
 				const f = findings[i] as Record<string, unknown>;
-				const requiredFix = f.required_fix;
+				const requiredFix = typeof f.required_fix === "string" ? f.required_fix.trim() : f.required_fix;
 				if (typeof requiredFix === "string" && requiredFix.length > 0) {
 					errors.push({
 						field: `findings[${i}].required_fix`,

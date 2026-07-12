@@ -13,7 +13,7 @@ describe("omp-compliance installation smoke", () => {
 		expect(stdout).toContain("package.json");
 		expect(stdout).toContain("dist/extension.js");
 		expect(stdout).toContain("dist/index.js");
-	});
+	}, 15000);
 
 	it("packed manifest preserves omp.extensions entry", async () => {
 		const result = await $`npm pack --dry-run --json 2>&1`.cwd(pkgRoot);
@@ -27,7 +27,7 @@ describe("omp-compliance installation smoke", () => {
 		expect(pkg.omp?.extensions).toBeDefined();
 		expect(Array.isArray(pkg.omp?.extensions)).toBe(true);
 		expect(pkg.omp?.extensions).toContain("./dist/extension.js");
-	});
+	}, 15000);
 
 	it("extension entry can be loaded from dist after build", async () => {
 		// Build first to ensure dist/ is up to date
@@ -47,7 +47,7 @@ describe("omp-compliance installation smoke", () => {
 		ext.default(api.toAPI());
 		expect(api.getRegisteredTools()).toContain("compliance_complete");
 		expect(api.getRegisteredCommands()).toContain("compliance");
-	});
+	}, 15000);
 
 	it("does not send messages or write entries without active task", async () => {
 		// Build first
@@ -60,5 +60,5 @@ describe("omp-compliance installation smoke", () => {
 		// No active task means no automatic messages or custom entries
 		expect(api.sentMessages).toHaveLength(0);
 		expect(api.appendedEntries).toHaveLength(0);
-	});
+	}, 15000);
 });

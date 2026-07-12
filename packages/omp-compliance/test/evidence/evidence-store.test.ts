@@ -98,7 +98,7 @@ describe("EvidenceStore — 损坏末尾行容错读取", () => {
 		const jsonlPath = join(TMP_DIR, "task-1.jsonl");
 
 		// Manually write valid lines + truncated last line
-		const validLine = JSON.stringify(makeRecord({ event: "active" })) + "\n";
+		const validLine = `${JSON.stringify(makeRecord({ event: "active" }))}\n`;
 		const truncatedLine = '{"schemaVersion":1,"taskId":"task-1","event":"in';
 		writeFileSync(jsonlPath, validLine + truncatedLine, "utf-8");
 

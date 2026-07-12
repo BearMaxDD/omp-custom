@@ -2,13 +2,13 @@ import { beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ComplianceReviewRegistry } from "../../src/advisor/review-envelope";
+import type { ComplianceReviewDependencies } from "../../src/advisor/review-envelope";
 import { registerComplianceCommand } from "../../src/commands/compliance-command";
 import { EvidenceStore } from "../../src/evidence/evidence-store";
 import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
 import type { ExtensionAPI } from "../../src/types";
-import { ComplianceReviewRegistry } from "../../src/advisor/review-envelope";
-import type { ComplianceReviewDependencies } from "../../src/advisor/review-envelope";
 import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "../../src/types";
 
 // ─── Fake ExtensionAPI for command testing ──────────────────────────
@@ -108,7 +108,7 @@ beforeEach(() => {
 	const reviewDeps: ComplianceReviewDependencies = {
 		sessionId: () => "test-session",
 		registry,
-		requestAdvisorReview: (req: AdvisorReviewRequest) =>
+		requestAdvisorReview: (_req: AdvisorReviewRequest) =>
 			Promise.resolve({ reviewId: "test-review", status: "accepted" }),
 	};
 	runtime = new ComplianceRuntime(() => store, collector, api.toAPI(), tmpDir, reviewDeps);
@@ -116,21 +116,29 @@ beforeEach(() => {
 	registerComplianceCommand(api.toAPI(), runtime);
 });
 
+// ─── Test Helper ────────────────────────────────────────────────────
+
+function getCmd(): { name: string; handler: (args: string[]) => Promise<void> } {
+	const cmd = api.registeredCommands.find((c) => c.name === "compliance");
+	if (!cmd) throw new Error("compliance command not found");
+	return cmd;
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────
 
 describe("ComplianceCommand — /compliance start", () => {
 	it("should start a new compliance task with active status", async () => {
-		const cmd = api.registeredCommands.find((c) => c.name === "compliance")!;
+		const cmd = getCmd();
 		await cmd.handler(["start", "tdd.md"]);
 
 		// Check runtime state
 		const taskState = runtime.currentTaskState;
 		expect(taskState).not.toBeNull();
-		expect(taskState!.status).toBe("active");
-		expect(taskState!.taskId.length).toBeGreaterThan(0);
+		expect(taskState?.status).toBe("active");
+		expect(taskState?.taskId.length).toBeGreaterThan(0);
 
 		// Verify evidence was written
-		const evidence = await store.readAll(taskState!.taskId);
+		const evidence = await store.readAll(taskState?.taskId);
 		expect(evidence.length).toBeGreaterThan(0);
 		expect(evidence.some((e) => e.event === "active")).toBe(true);
 
@@ -139,19 +147,19 @@ describe("ComplianceCommand — /compliance start", () => {
 	});
 
 	it("should throw when no tdd path provided", async () => {
-		const cmd = api.registeredCommands.find((c) => c.name === "compliance")!;
+		const cmd = getCmd();
 		expect(cmd.handler(["start"])).rejects.toThrow("tdd.md");
 	});
 
 	it("should throw error for unknown subcommand", async () => {
-		const cmd = api.registeredCommands.find((c) => c.name === "compliance")!;
+		const cmd = getCmd();
 		expect(cmd.handler(["unknown"])).rejects.toThrow("Unknown subcommand");
 	});
 });
 
 describe("ComplianceCommand — /compliance stop", () => {
 	it("should stop an active compliance task", async () => {
-		const cmd = api.registeredCommands.find((c) => c.name === "compliance")!;
+		const cmd = getCmd();
 		await cmd.handler(["start", "tdd.md"]);
 
 		await cmd.handler(["stop"]);
@@ -162,7 +170,7 @@ describe("ComplianceCommand — /compliance stop", () => {
 	});
 
 	it("should handle stop when no task is active", async () => {
-		const cmd = api.registeredCommands.find((c) => c.name === "compliance")!;
+		const cmd = getCmd();
 		await cmd.handler(["stop"]);
 
 		expect(runtime.currentTaskState).toBeNull();
@@ -172,15 +180,15 @@ describe("ComplianceCommand — /compliance stop", () => {
 
 describe("ComplianceCommand — /compliance resume", () => {
 	it("should throw for resume without task id", async () => {
-		const cmd = api.registeredCommands.find((c) => c.name === "compliance")!;
+		const cmd = getCmd();
 		expect(cmd.handler(["resume"])).rejects.toThrow("Usage");
 	});
 
 	it("should throw resume for non-stalled task", async () => {
-		const cmd = api.registeredCommands.find((c) => c.name === "compliance")!;
+		const cmd = getCmd();
 		await cmd.handler(["start", "tdd.md"]);
 
-		const taskId = runtime.currentTaskState!.taskId;
+		const taskId = runtime.currentTaskState?.taskId;
 		// Can't resume an active task
 		expect(cmd.handler(["resume", taskId])).rejects.toThrow("not stalled");
 	});
@@ -190,7 +198,7 @@ describe("ComplianceCommand — /compliance resume", () => {
 
 describe("ComplianceCommand — /compliance status", () => {
 	it("shows status for active task", async () => {
-		const cmd = api.registeredCommands.find((c) => c.name === "compliance")!;
+		const cmd = getCmd();
 		await cmd.handler(["start", "tdd.md"]);
 
 		await cmd.handler(["status"]);
@@ -203,14 +211,14 @@ describe("ComplianceCommand — /compliance status", () => {
 	});
 
 	it("reports no task when no task is active", async () => {
-		const cmd = api.registeredCommands.find((c) => c.name === "compliance")!;
+		const cmd = getCmd();
 		await cmd.handler(["status"]);
 
 		expect(api.logs.some((l) => l.includes("No active compliance task"))).toBe(true);
 	});
 
 	it("does not mutate task state", async () => {
-		const cmd = api.registeredCommands.find((c) => c.name === "compliance")!;
+		const cmd = getCmd();
 		await cmd.handler(["start", "tdd.md"]);
 
 		const stateBefore = runtime.currentTaskState;
@@ -225,7 +233,7 @@ describe("ComplianceCommand — /compliance status", () => {
 
 describe("ComplianceCommand — /compliance history", () => {
 	it("shows history for active task", async () => {
-		const cmd = api.registeredCommands.find((c) => c.name === "compliance")!;
+		const cmd = getCmd();
 		await cmd.handler(["start", "tdd.md"]);
 
 		await cmd.handler(["history"]);
@@ -234,7 +242,7 @@ describe("ComplianceCommand — /compliance history", () => {
 	});
 
 	it("reports no history when no task is active", async () => {
-		const cmd = api.registeredCommands.find((c) => c.name === "compliance")!;
+		const cmd = getCmd();
 		await cmd.handler(["history"]);
 
 		expect(api.logs.some((l) => l.includes("No active compliance task"))).toBe(true);

@@ -127,8 +127,7 @@ export function registerComplianceCommand(api: ExtensionAPI, runtime: Compliance
 
 				default:
 					throw new Error(
-						`Unknown subcommand: ${subcommand}. ` +
-							"Usage: /compliance start <tdd.md> | stop | resume <task_id> | status | history",
+						`Unknown subcommand: ${subcommand}. Usage: /compliance start <tdd.md> | stop | resume <task_id> | status | history`,
 					);
 			}
 		},

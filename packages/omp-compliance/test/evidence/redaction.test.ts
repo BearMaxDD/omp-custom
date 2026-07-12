@@ -3,7 +3,7 @@ import { redact } from "../../src/evidence/redaction";
 
 describe("redact — private key block", () => {
 	it("redacts RSA private key block", () => {
-		const input = `-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----`;
+		const input = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----";
 		const result = redact(input);
 		expect(result).toContain("-----BEGIN RSA PRIVATE KEY-----");
 		expect(result).toContain("-----END RSA PRIVATE KEY-----");
@@ -12,7 +12,7 @@ describe("redact — private key block", () => {
 	});
 
 	it("redacts plain PRIVATE KEY block", () => {
-		const input = `-----BEGIN PRIVATE KEY-----\nMEQx\n-----END PRIVATE KEY-----`;
+		const input = "-----BEGIN PRIVATE KEY-----\nMEQx\n-----END PRIVATE KEY-----";
 		const result = redact(input);
 		expect(result).toContain("[REDACTED]");
 		expect(result).not.toContain("MEQx");

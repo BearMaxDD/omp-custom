@@ -34,7 +34,7 @@ import { buildCompletionSnapshot } from "./completion-gate";
 
 // ─── Transient task state key for evidence store isolation ──────────
 
-const TASK_STATE_KEY = "_runtime_task_state";
+const _TASK_STATE_KEY = "_runtime_task_state";
 
 /** Convenience verification record (for test use). */
 export interface VerificationRecord {
@@ -409,7 +409,7 @@ export class ComplianceRuntime {
 				id: `finding-${i + 1}`,
 				reason: findings[i]?.reason ?? "Advisor identified issues requiring remediation",
 				requiredFix: fix,
-				evidenceRefs: [`evidence://${this.taskState!.taskId}`],
+				evidenceRefs: [`evidence://${this.taskState?.taskId}`],
 			}));
 
 			injectRemediation(this.api, {

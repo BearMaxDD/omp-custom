@@ -77,9 +77,7 @@ function parseStatusFromRef(resultRef: string): string | undefined {
  *
  * Returns index readiness flag, query names, and file references.
  */
-export function normalizeCodebaseMemory(
-	paired: PairedInput | SingleInput,
-): {
+export function normalizeCodebaseMemory(paired: PairedInput | SingleInput): {
 	indexReady: boolean;
 	queries: string[];
 	references: string[];
@@ -116,7 +114,7 @@ export function normalizeCodebaseMemory(
 		}
 
 		// Extract the short tool name (strip server prefix if FQN)
-		const shortName = toolName.includes(".") ? toolName.split(".").pop()! : toolName;
+		const shortName = toolName.includes(".") ? (toolName.split(".").pop() ?? toolName) : toolName;
 		if (!RECOGNIZED_TOOLS.has(shortName)) continue;
 
 		const success = result?.success ?? false;
@@ -168,12 +166,12 @@ export function normalizeCodebaseMemory(
 function extractReferences(text: string): string[] {
 	const refs: string[] = [];
 	const fileRefPattern = /\bfile:(?:[a-zA-Z]:[\\/])?([^\s,;)]+)/g;
-	let match;
-	while ((match = fileRefPattern.exec(text)) !== null) {
+	for (const match of text.matchAll(fileRefPattern)) {
 		refs.push(match[1].replace(/^[\\/]+|\.$/, ""));
 	}
-	const pathPattern = /(?:^|[\s,;])((?:src|app|lib|packages|test)[^\s,;)]+\.(?:ts|tsx|js|jsx|py|rs|go|rb|css|scss|json|md|toml|yaml|yml))/g;
-	while ((match = pathPattern.exec(text)) !== null) {
+	const pathPattern =
+		/(?:^|[\s,;])((?:src|app|lib|packages|test)[^\s,;)]+\.(?:ts|tsx|js|jsx|py|rs|go|rb|css|scss|json|md|toml|yaml|yml))/g;
+	for (const match of text.matchAll(pathPattern)) {
 		refs.push(match[1]);
 	}
 	return refs;

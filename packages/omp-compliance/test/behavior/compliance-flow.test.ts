@@ -24,11 +24,11 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ComplianceReviewRegistry } from "../../src/advisor/review-envelope";
 import { EvidenceStore } from "../../src/evidence/evidence-store";
 import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
 import type { ExtensionAPI } from "../../src/types";
-import { ComplianceReviewRegistry } from "../../src/advisor/review-envelope";
 import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "../../src/types";
 import { FakeAdvisor } from "../support/fake-advisor";
 import { FakeCodebaseMemory } from "../support/fake-codebase-memory";
@@ -42,7 +42,8 @@ class TestAPI implements ExtensionAPI {
 
 	registerTool(): void {}
 	registerCommand(): void {}
-	requestAdvisorReview = (_request: AdvisorReviewRequest): Promise<AdvisorReviewReceipt> => Promise.resolve({ reviewId: "test-review", status: "accepted" });
+	requestAdvisorReview = (_request: AdvisorReviewRequest): Promise<AdvisorReviewReceipt> =>
+		Promise.resolve({ reviewId: "test-review", status: "accepted" });
 	on(): void {}
 
 	sendMessage(message: unknown, _options?: { triggerTurn?: boolean; deliverAs?: string }): void {
@@ -112,7 +113,8 @@ function setupFixture(tddContent: string = DEFAULT_TDD_MD): FixtureSetup {
 	const runtime = new ComplianceRuntime(() => store, collector, api, tmpDir, {
 		sessionId: () => "test-session",
 		registry,
-		requestAdvisorReview: (_req: AdvisorReviewRequest) => Promise.resolve<AdvisorReviewReceipt>({ reviewId: "test-review", status: "accepted" }),
+		requestAdvisorReview: (_req: AdvisorReviewRequest) =>
+			Promise.resolve<AdvisorReviewReceipt>({ reviewId: "test-review", status: "accepted" }),
 	});
 	const fakeAdvisor = new FakeAdvisor();
 	const fakeTask = new FakeTaskTool(collector.collector);
@@ -461,7 +463,7 @@ describe("End-to-end compliance flow — pass scenarios", () => {
 	});
 
 	it("连续 remediation 后通过 → attempt 递增且历史完整", async () => {
-		const { runtime, api, fakeAdvisor, fakeTask, fakeCbm } = setupFixture();
+		const { runtime, fakeAdvisor, fakeTask, fakeCbm } = setupFixture();
 
 		await runtime.start("tdd.md");
 
@@ -481,7 +483,7 @@ describe("End-to-end compliance flow — pass scenarios", () => {
 		await runtime.acceptVerdict(r1Verdict);
 		expect(runtime.currentTaskState?.status).toBe("remediation_required");
 
-		const attempt1 = runtime.currentTaskState!.attempt;
+		const attempt1 = runtime.currentTaskState?.attempt;
 
 		// Resume after remediation
 		runtime.resumeAfterRemediation();
@@ -512,7 +514,7 @@ describe("End-to-end compliance flow — pass scenarios", () => {
 		await runtime.acceptVerdict(r2Verdict);
 		expect(runtime.currentTaskState?.status).toBe("remediation_required");
 
-		const attempt2 = runtime.currentTaskState!.attempt;
+		const attempt2 = runtime.currentTaskState?.attempt;
 
 		// Resume again
 		runtime.resumeAfterRemediation();

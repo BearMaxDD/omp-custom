@@ -92,9 +92,12 @@ export function acceptVerdict(
 	parsed?: ComplianceVerdict,
 ): VerdictAcceptResult {
 	// Step 1: Schema + context validation (skip if pre-parsed provided)
-	if (!parsed) {
+	let resolved: ComplianceVerdict;
+	if (parsed) {
+		resolved = parsed;
+	} else {
 		try {
-			parsed = parseVerdict(verdict, context);
+			resolved = parseVerdict(verdict, context);
 		} catch (err) {
 			if (err instanceof VerdictValidationError) {
 				return {
@@ -107,7 +110,7 @@ export function acceptVerdict(
 		}
 	}
 
-	const { task_id, contract_hash, attempt, status, findings } = parsed;
+	const { task_id, contract_hash, attempt, status, findings } = resolved;
 
 	// Step 2: Stale attempt check — older attempt after a newer pass is a protocol error
 	const passKey = `${task_id}:${contract_hash}`;
@@ -157,7 +160,7 @@ export function acceptVerdict(
 
 	return {
 		status: "accepted",
-		verdict: parsed,
+		verdict: resolved,
 	};
 }
 
