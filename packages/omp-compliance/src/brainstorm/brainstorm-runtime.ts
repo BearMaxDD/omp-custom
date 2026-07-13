@@ -124,15 +124,10 @@ export class BrainstormRuntime {
 			createdAt: new Date().toISOString(),
 		};
 
-		// 4. Transition state and register envelope (inside try for atomicity)
-		try {
-			await coordinator.markReviewRequested(topic.topicId, reviewId);
-			registry.put(envelope);
-		} catch {
-			registry.consume(reviewId);
-			await coordinator.markReviewUnavailable(topic.topicId, "Failed to initiate review");
-			return { reviewId, topic, status: "review_unavailable" };
-		}
+		// 4a. Transition state before envelope registration
+		await coordinator.markReviewRequested(topic.topicId, reviewId);
+		// 4b. Register envelope (state is now advisor_reviewing)
+		registry.put(envelope);
 		// 5. Request advisor review
 		try {
 			const receipt = await this.config.requestAdvisorReview({
