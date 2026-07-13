@@ -136,12 +136,6 @@ export interface AdvisorBeforeRunResult {
 export interface AdvisorReviewRequest {
 	readonly reviewId: string;
 	readonly trigger?: AdvisorRunTrigger;
-	readonly sessionId?: string;
-	readonly taskId?: string;
-	readonly contractHash?: `sha256:${string}`;
-	readonly attempt?: number;
-	readonly context?: string;
-	readonly rules?: string;
 	readonly metadata?: Record<string, unknown>;
 }
 
