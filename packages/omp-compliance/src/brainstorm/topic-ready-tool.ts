@@ -181,11 +181,17 @@ export function createTopicReadyTool(deps: TopicReadyToolDependencies): ToolDefi
 			if (errors.length > 0) {
 				return { ok: false, errors };
 			}
-
-			const input = params as unknown as BrainstormTopicReadyInput;
-			const result = await deps.runtime.submitTopic(input);
-
-			return { ok: true, result };
+ 
+			try {
+				const input = params as unknown as BrainstormTopicReadyInput;
+				const result = await deps.runtime.submitTopic(input);
+				return { ok: true, result };
+			} catch (err) {
+				return {
+					ok: false,
+					errors: [{ field: "_handler", message: `submitTopic failed: ${(err as Error).message}` }],
+				};
+			}
 		},
 	};
 }
