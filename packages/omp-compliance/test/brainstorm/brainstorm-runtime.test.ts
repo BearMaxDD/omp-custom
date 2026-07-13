@@ -175,4 +175,32 @@ describe("BrainstormRuntime", () => {
 		expect(envelope!.context).toContain("<brainstorm-topic>");
 		expect(envelope!.createdAt).toBeTruthy();
 	});
+
+	it("rejects topic on mark failure with empty registry", async () => {
+		const dir = tempDir();
+		const store = new TopicStore(dir);
+		const origSave = store.saveState;
+		let n = 0;
+		store.saveState = async (topic: unknown) => {
+			n += 1;
+			if (n === 2) throw new Error("mark failed");
+			await origSave.call(store, topic);
+		};
+		const coordinator = new TopicCoordinator(store);
+		const registry = new BrainstormReviewRegistry();
+		let putCount = 0;
+		const wrapPut = (env: unknown) => { putCount++; registry.put(env as never); };
+		const collector = new CollectorRuntime();
+		const runtime = new BrainstormRuntime({
+			api: { requestAdvisorReview: async () => ({ reviewId: "r", status: "accepted" }) },
+			collector,
+			coordinator,
+			registry: { put: wrapPut, get: (id: string) => registry.get(id), consume: (id: string) => registry.consume(id) } as never,
+			requestAdvisorReview: async () => ({ reviewId: "r", status: "accepted" }),
+			getAllTools: () => [],
+			sessionId: () => "s1",
+		});
+		await expect(runtime.submitTopic(validTopicInput())).rejects.toThrow("mark failed");
+		expect(putCount).toBe(0);
+	});
 });
