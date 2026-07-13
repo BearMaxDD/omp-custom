@@ -40,18 +40,18 @@ turn_end 触发 → AdvisorRuntime 收集待处理轮次
 
 | 维度 | OMP 原生 | @bearmaxdd/omp-compliance |
 |------|----------|---------------------------|
-| **触发方式** | 仅 `turn_end` 自动触发 | 新增 `compliance_review` 按需触发。两个子系统共用同一个上游传输通道——上游 `agent-session.ts:16259` 强制所有扩展评审都用 `compliance_review` trigger |
+| **触发方式** | 仅 `turn_end` 自动触发 | 新增 `compliance_review` 按需触发。两个子系统共用同一个上游传输通道——上游 `agent-session.ts:16259` 强制所有扩展评审都用 `compliance_review` 触发类型 |
 | **系统上下文** | `WATCHDOG.yml` + `WATCHDOG.md` 静态文件 | 合规：动态构建 `<compliance-task>` XML（合约摘要、验证结果、证据快照、修复记录）。大脑风暴：构建长度限制的话题包（≤16 KB XML，含候选项、约束、成功标准、代码库证据） |
 | **注入工具** | 默认 `read`, `grep`, `glob`（可配置） | 合规注入 `compliance_verdict`（校验 `task_id` + `contract_hash` + `attempt` 必须匹配信封）。大脑风暴注入 `brainstorm_review` |
 | **接线方式** | 无（扩展 API 接口旁通） | 一个 `advisor_before_run` 回调内先查合规注册表再查大脑风暴注册表，通过 `reviewId` 匹配信封。两个钩子都在 `trigger === "compliance_review"` 时匹配，`turn_end` 不拦截 |
 | **审查结果** | `advise()` 自由文本，`EmissionGuard` 短语去重 | 合规：结构化 `ComplianceVerdict`（`pass` / `remediation_required`，带 `findings` 和 `required_fix`）。大脑风暴：结构化 `BrainstormReview`（`support` / `challenge` / `insufficient_evidence`，带 `findings` + `alternatives` + `recommendation`） |
-| **结果路由** | `AdviseTool` 放入主代理优先队列 | 合规：verdict 通过 `verdict-sink` → 状态机转换 → `remediate` 时 `sendMessage(triggerTurn)` 注入下一轮。大脑风暴：渲染决策卡片 → `sendMessage` 发送 → 用户通过 `brainstorm_decision` 工具决定 |
+| **结果路由** | `AdviseTool` 放入主代理优先队列 | 合规：判决通过 `verdict-sink` → 状态机转换 → `remediate` 时 `sendMessage(triggerTurn)` 注入下一轮。大脑风暴：渲染决策卡片 → `sendMessage` 发送 → 用户通过 `brainstorm_decision` 工具决定 |
 | **工作流状态** | 仅对话 JSONL（`__advisor.jsonl`） | 合规：7 状态（`inactive→active→completion_requested→advisor_reviewing→completed/remediation_required/stalled`），带 `contractHash` + `attempt` + 指纹 + 连续失败计数。大脑风暴：7 状态（`drafting→ready_for_advisor_review→advisor_reviewing→awaiting_user_decision→decided/parked`），输入指纹 SHA-256 去重 |
-| **状态持久化** | — | `TopicStore`（JSONL，`.omp/compliance/brainstorm/`）+ `EvidenceStore`（JSONL，`.omp/compliance/`），均 append-only，支持崩溃恢复 |
+| **状态持久化** | — | `TopicStore`（JSONL，`.omp/compliance/brainstorm/`）+ `EvidenceStore`（JSONL，`.omp/compliance/`），均只追加写入，支持崩溃恢复 |
 | **重试防护** | `EmissionGuard` 每轮一次配额 + 短语去重 | 合规新增**停滞保护**：连续 3 次相同指纹自动停止注入修复消息，通过 `/compliance resume` 恢复。大脑风暴通过指纹去重防重复 |
-| **主代理注入** | `WATCHDOG` 文件 + context files | `before_agent_start` 钩子注入 `brainstorm_topic_ready` / `brainstorm_decision` 使用指引 |
+| **主代理注入** | `WATCHDOG` 文件 + 上下文文件 | `before_agent_start` 钩子注入 `brainstorm_topic_ready` / `brainstorm_decision` 使用指引 |
 | **证据采集** | 无 | `CollectorRuntime` 监听 `tool_call` / `tool_result` / `turn_end` 归一化三类证据：codebase-memory 交互、子代理委托、验证命令退出码 |
-| **合约解析** | 无 | TDD markdown 解析器提取目标、范围、文件、测试、验证、完成条件，计算 SHA-256 哈希，推断执行策略 |
+| **合约解析** | 无 | TDD Markdown 解析器提取目标、范围、文件、测试、验证、完成条件，计算 SHA-256 哈希，推断执行策略 |
 
 ---
 
