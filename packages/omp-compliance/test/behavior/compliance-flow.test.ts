@@ -43,7 +43,7 @@ class TestAPI implements ExtensionAPI {
 	registerTool(): void {}
 	registerCommand(): void {}
 	requestAdvisorReview = (_request: AdvisorReviewRequest): Promise<AdvisorReviewReceipt> =>
-		Promise.resolve({ reviewId: "test-review", accepted: true });
+		Promise.resolve({ status: "accepted" as const, reviewId: "test-review" });
 	on(): void {}
 
 	sendMessage(message: unknown, _options?: { triggerTurn?: boolean; deliverAs?: string }): void {
@@ -114,7 +114,7 @@ function setupFixture(tddContent: string = DEFAULT_TDD_MD): FixtureSetup {
 		sessionId: () => "test-session",
 		registry,
 		requestAdvisorReview: (_req: AdvisorReviewRequest) =>
-			Promise.resolve<AdvisorReviewReceipt>({ reviewId: "test-review", accepted: true }),
+			Promise.resolve<AdvisorReviewReceipt>({ status: "accepted" as const, reviewId: "test-review" }),
 	});
 	const fakeAdvisor = new FakeAdvisor();
 	const fakeTask = new FakeTaskTool(collector.collector);

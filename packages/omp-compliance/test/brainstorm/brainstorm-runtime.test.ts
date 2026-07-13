@@ -5,8 +5,7 @@
  * Uses real TopicStore and TopicCoordinator with temporary directories.
  * Only the external review action (requestAdvisorReview) is replaced.
  */
-
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, jest } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -58,46 +57,40 @@ function createBrainstormRuntimeHarness(overrides: BrainstormRuntimeHarnessOverr
 describe("BrainstormRuntime", () => {
 	// ── Happy path ─────────────────────────────────────────────────────
 
-	it("submits a topic and requests the dedicated advisor trigger", async () => {
+	it("submits a topic and requests advisor review", async () => {
 		const reviewRequests: AdvisorReviewRequest[] = [];
 		const harness = createBrainstormRuntimeHarness({
 			requestAdvisorReview: async (request) => {
 				reviewRequests.push(request);
-				return { accepted: true, reviewId: request.reviewId };
+				return { status: "accepted" as const, reviewId: request.reviewId };
 			},
 		});
 
 		const result = await harness.runtime.submitTopic(validTopicInput());
 
-		expect(reviewRequests).toEqual([
-			expect.objectContaining({
-				trigger: "brainstorm_review",
-				reviewId: result.reviewId,
-				metadata: expect.objectContaining({
-					topicId: result.topic.topicId,
-					inputHash: result.topic.inputHash,
-				}),
-			}),
-		]);
+		expect(reviewRequests).toHaveLength(1);
+		expect(reviewRequests[0]).not.toHaveProperty("trigger");
+		expect(reviewRequests[0].metadata).toMatchObject({
+			topicId: result.topic.topicId,
+			inputHash: result.topic.inputHash,
+		});
 		expect(result.status).toBe("advisor_reviewing");
-		expect(result.reviewId).toBeTruthy();
 		expect(result.reviewId).toMatch(/^br-/);
 	});
 
 	it("transitions topic to advisor_reviewing on successful submission", async () => {
 		const harness = createBrainstormRuntimeHarness({
-			requestAdvisorReview: async (request) => ({ accepted: true, reviewId: request.reviewId }),
+			requestAdvisorReview: async (request) => ({ status: "accepted" as const, reviewId: request.reviewId }),
 		});
 
 		const result = await harness.runtime.submitTopic(validTopicInput());
-
 		expect(result.status).toBe("advisor_reviewing");
 		expect(result.topic.status).toBe("advisor_reviewing");
 	});
 
 	it("registers an envelope in the registry on successful submission", async () => {
 		const harness = createBrainstormRuntimeHarness({
-			requestAdvisorReview: async (request) => ({ accepted: true, reviewId: request.reviewId }),
+			requestAdvisorReview: async (request) => ({ status: "accepted" as const, reviewId: request.reviewId }),
 		});
 
 		const result = await harness.runtime.submitTopic(validTopicInput());
@@ -114,7 +107,7 @@ describe("BrainstormRuntime", () => {
 
 	it("reuses existing topic on duplicate fingerprint", async () => {
 		const harness = createBrainstormRuntimeHarness({
-			requestAdvisorReview: async (request) => ({ accepted: true, reviewId: request.reviewId }),
+			requestAdvisorReview: async (request) => ({ status: "accepted" as const, reviewId: request.reviewId }),
 		});
 
 		const first = await harness.runtime.submitTopic(validTopicInput());
@@ -129,11 +122,10 @@ describe("BrainstormRuntime", () => {
 
 	it("returns conflict when a different topic is mid-review", async () => {
 		const harness = createBrainstormRuntimeHarness({
-			requestAdvisorReview: async (request) => ({ accepted: true, reviewId: request.reviewId }),
+			requestAdvisorReview: async (request) => ({ status: "accepted" as const, reviewId: request.reviewId }),
 		});
 
 		await harness.runtime.submitTopic(validTopicInput({ title: "First topic" }));
-
 		const second = await harness.runtime.submitTopic(validTopicInput({ title: "Different second topic" }));
 		expect(second.status).toBe("conflict");
 	});
@@ -142,7 +134,7 @@ describe("BrainstormRuntime", () => {
 
 	it("transitions to review_unavailable when advisor rejects", async () => {
 		const harness = createBrainstormRuntimeHarness({
-			requestAdvisorReview: async (_request) => ({ accepted: false }),
+			requestAdvisorReview: async (_request) => ({ status: "rejected" as const }),
 		});
 
 		const result = await harness.runtime.submitTopic(validTopicInput());
@@ -164,14 +156,13 @@ describe("BrainstormRuntime", () => {
 
 	it("transitions to review_unavailable and consumes the envelope after timeout", async () => {
 		const harness = createBrainstormRuntimeHarness({
-			requestAdvisorReview: async (request) => ({ accepted: true, reviewId: request.reviewId }),
+			requestAdvisorReview: async (request) => ({ status: "accepted" as const, reviewId: request.reviewId }),
 			reviewTimeoutMs: 10,
 		});
 
 		const result = await harness.runtime.submitTopic(validTopicInput());
 		expect(result.status).toBe("advisor_reviewing");
 		await Bun.sleep(30);
-
 		expect(harness.coordinator.current()?.status).toBe("review_unavailable");
 		expect(harness.registry.get(result.reviewId ?? "")).toBeUndefined();
 	});
@@ -180,23 +171,19 @@ describe("BrainstormRuntime", () => {
 
 	it("includes rules and context in the registered envelope", async () => {
 		const harness = createBrainstormRuntimeHarness({
-			requestAdvisorReview: async (request) => ({ accepted: true, reviewId: request.reviewId }),
+			requestAdvisorReview: async (request) => ({ status: "accepted" as const, reviewId: request.reviewId }),
 		});
 
 		const result = await harness.runtime.submitTopic(validTopicInput());
 		const envelope = harness.registry.get(result.reviewId!);
-
 		expect(envelope).toBeDefined();
 		expect(envelope?.rules).toContain("brainstorm-review-rules");
 		expect(envelope?.context).toContain("<brainstorm-topic>");
 		expect(envelope?.createdAt).toBeTruthy();
 	});
 
-	const _harness = createBrainstormRuntimeHarness({
-		requestAdvisorReview: async (request) => ({ accepted: true, reviewId: request.reviewId }),
-		getAllTools: () => ["mcp__codebase_memory_mcp__search_graph"],
-	});
-	// Override harness config to pass limited getAllTools
+	// ── Error handling ─────────────────────────────────────────────────
+
 	it("rejects topic on mark failure with empty registry", async () => {
 		const dir = tempDir();
 		const store = new TopicStore(dir);
@@ -216,7 +203,7 @@ describe("BrainstormRuntime", () => {
 		};
 		const collector = new CollectorRuntime();
 		const runtime = new BrainstormRuntime({
-			api: { requestAdvisorReview: async () => ({ reviewId: "r", accepted: true }) },
+			api: { requestAdvisorReview: async () => ({ status: "accepted" as const, reviewId: "r" }) },
 			collector,
 			coordinator,
 			registry: {
@@ -224,7 +211,7 @@ describe("BrainstormRuntime", () => {
 				get: (id: string) => registry.get(id),
 				consume: (id: string) => registry.consume(id),
 			} as never,
-			requestAdvisorReview: async () => ({ reviewId: "r", accepted: true }),
+			requestAdvisorReview: async () => ({ status: "accepted" as const, reviewId: "r" }),
 			getAllTools: () => [],
 			sessionId: () => "s1",
 		});
@@ -242,11 +229,11 @@ describe("BrainstormRuntime", () => {
 		const coordinator = new TopicCoordinator(store);
 		const registry = new BrainstormReviewRegistry();
 		const runtime = new BrainstormRuntime({
-			api: { requestAdvisorReview: async () => ({ reviewId: "r", accepted: true }) },
+			api: { requestAdvisorReview: async () => ({ status: "accepted" as const, reviewId: "r" }) },
 			collector,
 			coordinator,
 			registry,
-			requestAdvisorReview: async () => ({ reviewId: "r", accepted: true }),
+			requestAdvisorReview: async () => ({ status: "accepted" as const, reviewId: "r" }),
 			getAllTools: () => ["search_graph"],
 			sessionId: () => "s1",
 		});

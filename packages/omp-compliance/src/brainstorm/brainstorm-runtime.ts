@@ -136,7 +136,6 @@ export class BrainstormRuntime {
 		// 5. Request advisor review
 		try {
 			const receipt = await this.config.requestAdvisorReview({
-				trigger: "brainstorm_review",
 				reviewId,
 				metadata: {
 					sessionId: this.config.sessionId(),
@@ -146,7 +145,7 @@ export class BrainstormRuntime {
 					codebaseRelevance: topic.input.codebase_relevance,
 				},
 			});
-			if (!receipt.accepted) {
+			if (receipt.status !== "accepted") {
 				registry.consume(reviewId);
 				await coordinator.markReviewUnavailable(topic.topicId, "Advisor review not accepted");
 				return { reviewId, topic, status: "review_unavailable" };

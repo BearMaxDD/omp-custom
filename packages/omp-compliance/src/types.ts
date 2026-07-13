@@ -76,7 +76,7 @@ export interface ExtensionAPI {
 /**
  * Advisor run trigger — distinguishes compliance reviews from regular turns.
  */
-export type AdvisorRunTrigger = "turn_end" | "compliance_review" | "brainstorm_review";
+export type AdvisorRunTrigger = "turn_end" | "compliance_review";
 
 /**
  * Minimal AgentTool shape for the Advisor before-run hook.
@@ -130,7 +130,6 @@ export interface AdvisorBeforeRunEvent {
 export interface AdvisorBeforeRunResult {
 	additionalSystemContext?: readonly string[];
 	additionalTools?: readonly AgentTool[];
-	additionalToolNames?: readonly string[];
 	metadata?: Readonly<Record<string, unknown>>;
 }
 
@@ -139,15 +138,18 @@ export interface AdvisorBeforeRunResult {
  */
 export interface AdvisorReviewRequest {
 	readonly reviewId: string;
-	readonly trigger?: AdvisorRunTrigger;
 	readonly metadata?: Record<string, unknown>;
 }
-
 /**
  * Receipt returned by the harness after requesting an Advisor review.
+ *
+ * Matches the upstream OMP v16.4.x shape exactly:
+ *   - status: "accepted" | "rejected"
+ *   - reviewId: string
+ *   - reason?: string
  */
 export interface AdvisorReviewReceipt {
+	readonly status: "accepted" | "rejected";
 	readonly reviewId: string;
-	readonly accepted: boolean;
 	readonly reason?: string;
 }

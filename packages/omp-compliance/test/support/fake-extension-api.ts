@@ -21,7 +21,7 @@ export class FakeExtensionAPI {
 	public readonly appendedEntries: Array<{ type: string; data?: unknown }> = [];
 	public requestAdvisorReview: (request: AdvisorReviewRequest) => Promise<AdvisorReviewReceipt> = async (
 		_request: AdvisorReviewRequest,
-	) => ({ reviewId: _request.reviewId, accepted: true });
+	) => ({ status: "accepted", reviewId: _request.reviewId });
 
 	registerTool<TParams = unknown, TDetails = unknown>(tool: ToolDefinition<TParams, TDetails>): void {
 		this.tools.push(tool.name);

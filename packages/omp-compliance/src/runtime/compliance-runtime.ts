@@ -274,7 +274,6 @@ export class ComplianceRuntime {
 		let receipt: AdvisorReviewReceipt;
 		try {
 			receipt = await this.reviewDeps.requestAdvisorReview({
-				trigger: "compliance_review",
 				reviewId: envelope.reviewId,
 				metadata: {
 					sessionId,
@@ -294,12 +293,11 @@ export class ComplianceRuntime {
 				status: newState.status,
 				completionSnapshot: snapshot,
 				reviewId: envelope.reviewId,
-				receipt: { reviewId: envelope.reviewId, accepted: false, reason },
+				receipt: { reviewId: envelope.reviewId, status: "rejected" as const, reason },
 			};
 		}
 
-		// Write receipt evidence on accepted
-		if (receipt.accepted) {
+		if (receipt.status === "accepted") {
 			await this.writeEvidenceRecord("advisor_review_accepted", {
 				signalDigest: receipt.reviewId,
 			});

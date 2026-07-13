@@ -46,8 +46,7 @@ class FakeCommandAPI implements ExtensionAPI {
 		this.entries.push({ type: customType, data });
 	}
 	requestAdvisorReview = (_request: AdvisorReviewRequest): Promise<AdvisorReviewReceipt> =>
-		Promise.resolve({ reviewId: "test-review", accepted: true });
-
+		Promise.resolve({ status: "accepted" as const, reviewId: "test-review" });
 	logger = {
 		info: (msg: string) => {
 			this.logs.push(msg);
@@ -108,7 +107,8 @@ beforeEach(() => {
 	const reviewDeps: ComplianceReviewDependencies = {
 		sessionId: () => "test-session",
 		registry,
-		requestAdvisorReview: (_req: AdvisorReviewRequest) => Promise.resolve({ reviewId: "test-review", accepted: true }),
+		requestAdvisorReview: (_req: AdvisorReviewRequest) =>
+			Promise.resolve({ status: "accepted" as const, reviewId: "test-review" }),
 	};
 	runtime = new ComplianceRuntime(() => store, collector, api.toAPI(), tmpDir, reviewDeps);
 

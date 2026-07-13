@@ -102,7 +102,7 @@ describe("extension activate — no lazy file side-effects", () => {
 			sessionId: () => "test-session",
 			registry,
 			requestAdvisorReview: (_req: AdvisorReviewRequest) =>
-				Promise.resolve<AdvisorReviewReceipt>({ reviewId: "test-review", accepted: true }),
+				Promise.resolve<AdvisorReviewReceipt>({ status: "accepted" as const, reviewId: "test-review" }),
 		});
 
 		// start task — should create directory

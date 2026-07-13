@@ -119,14 +119,14 @@ export default function activate(api: ExtensionAPI): void {
 		);
 	};
 
-	// ── Single advisor_before_run handler (short-circuit: compliance || brainstorm) ──
+	// ── Single advisor_before_run handler (compliance first, then brainstorm) ──
 	api.on("advisor_before_run", (event: unknown, _context: ExtensionContext) => {
 		const e = event as AdvisorBeforeRunEvent;
 		// Compliance hook first (no lazy init needed)
 		const complianceResult = createComplianceAdvisorHook(registry, runtime)(e);
 		if (complianceResult) return complianceResult;
-		// Brainstorm hook — only init if trigger matches
-		if (e.trigger === "brainstorm_review") {
+		// Brainstorm hook — only init when compliance didn't match
+		if (e.trigger === "compliance_review") {
 			return createBrainstormAdvisorHook(
 				brainstormRegistry,
 				getBrainstormInfra().coordinator,

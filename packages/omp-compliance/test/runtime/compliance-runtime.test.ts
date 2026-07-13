@@ -18,8 +18,7 @@ class MinimalAPI implements ExtensionAPI {
 
 	registerTool(): void {}
 	requestAdvisorReview = (_request: AdvisorReviewRequest): Promise<AdvisorReviewReceipt> =>
-		Promise.resolve({ reviewId: "test-review", accepted: true });
-	on(): void {}
+		Promise.resolve({ status: "accepted" as const, reviewId: "test-review" });
 
 	sendMessage(message: unknown, _options?: { triggerTurn?: boolean; deliverAs?: string }): void {
 		this.sentMessages.push(message);
@@ -105,8 +104,8 @@ beforeEach(() => {
 	api = new MinimalAPI();
 	store = new EvidenceStore(evidenceDir);
 	collector = new CollectorRuntime();
-	mockRequestReviewReturn = { reviewId: "test-review", accepted: true };
 	mockRequestReviewCalls = [];
+	mockRequestReviewReturn = { status: "accepted" as const, reviewId: "test-review" };
 	reviewDeps = {
 		sessionId: () => "test-session",
 		registry: new ComplianceReviewRegistry(),
@@ -222,9 +221,8 @@ describe("ComplianceRuntime — requestCompletion advisor review path", () => {
 		// One call to requestAdvisorReview
 		expect(mockRequestReviewCalls.length).toBe(1);
 		const req = mockRequestReviewCalls[0];
-		expect(req.trigger).toBe("compliance_review");
 		expect(req.reviewId).toMatch(/^compliance:/);
-
+		expect(req).not.toHaveProperty("trigger");
 		// Metadata binds task/hash/attempt
 		expect(req.metadata?.taskId).toBe(result.completionSnapshot.taskId);
 		expect(req.metadata?.contractHash).toMatch(/^sha256:/);
@@ -235,7 +233,7 @@ describe("ComplianceRuntime — requestCompletion advisor review path", () => {
 
 		// Return includes reviewId and receipt
 		expect(result.reviewId).toBe(req.reviewId);
-		expect(result.receipt.accepted).toBe(true);
+		expect(result.receipt.status).toBe("accepted");
 	});
 
 	it("registry envelope 应包含 Completion Evidence 和 compliance_verdict rules", async () => {
@@ -262,7 +260,7 @@ describe("ComplianceRuntime — requestCompletion advisor review path", () => {
 		const result = await runtime.requestCompletion({ summary: "Done" });
 
 		// Status stays advisor_reviewing
-		expect(result.receipt.accepted).toBe(false);
+		expect(result.receipt.status).toBe("rejected");
 		expect(result.receipt.reason).toContain("Advisor pool exhausted");
 
 		expect(runtime.currentTaskState).toBeDefined();

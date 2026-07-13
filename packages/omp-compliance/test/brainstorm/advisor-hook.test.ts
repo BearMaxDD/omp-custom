@@ -90,7 +90,7 @@ function brainstormEvent(overrides: Partial<AdvisorBeforeRunEvent> = {}): Adviso
 		type: "advisor_before_run",
 		sessionId: "session-1",
 		advisorId: "default",
-		trigger: "brainstorm_review",
+		trigger: "compliance_review",
 		messages: [],
 		metadata: { reviewId: "review-bs-1" },
 		...overrides,
@@ -98,38 +98,38 @@ function brainstormEvent(overrides: Partial<AdvisorBeforeRunEvent> = {}): Adviso
 }
 
 describe("createBrainstormAdvisorHook", () => {
-	it("injects topic rules, brainstorm_review tool and read-only tool names only for its trigger", () => {
+	it("injects topic rules and brainstorm_review tool for compliance_review trigger", () => {
 		const registry = new BrainstormReviewRegistry();
 		const coordinator = makeCoordinator();
 		const names = ["mcp__codebase_memory_mcp__search_graph", "mcp__codebase_memory_mcp__get_code_snippet"];
 		const env = makeEnvelope({ requestedToolNames: names });
 		registry.put(env);
 
-		const hook = createBrainstormAdvisorHook(registry, coordinator);
+		const hook = createBrainstormAdvisorHook(registry, coordinator, () => {});
 		const result = hook(brainstormEvent());
 
 		expect(result).toBeDefined();
 		expect(result?.additionalSystemContext).toHaveLength(2);
 		expect(result?.additionalTools?.map((t) => t.name)).toEqual(["brainstorm_review"]);
-		expect(result?.additionalToolNames).toEqual(names);
 	});
 
-	it("returns undefined for compliance_review trigger", () => {
+	it("matches on compliance_review trigger", () => {
 		const registry = new BrainstormReviewRegistry();
 		const coordinator = makeCoordinator();
 		const env = makeEnvelope();
 		registry.put(env);
 
-		const hook = createBrainstormAdvisorHook(registry, coordinator);
+		const hook = createBrainstormAdvisorHook(registry, coordinator, () => {});
 		const result = hook({ ...brainstormEvent(), trigger: "compliance_review" });
-		expect(result).toBeUndefined();
+		// With the fix, hook now accepts compliance_review trigger (upstream only sends this)
+		expect(result).toBeDefined();
 	});
 
 	it("returns undefined when no envelope matches metadata", () => {
 		const registry = new BrainstormReviewRegistry();
 		const coordinator = makeCoordinator();
 
-		const hook = createBrainstormAdvisorHook(registry, coordinator);
+		const hook = createBrainstormAdvisorHook(registry, coordinator, () => {});
 		const result = hook(brainstormEvent({ metadata: { reviewId: "nonexistent" } }));
 		expect(result).toBeUndefined();
 	});

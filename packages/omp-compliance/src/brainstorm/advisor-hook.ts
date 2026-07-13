@@ -40,7 +40,7 @@ export function createBrainstormAdvisorHook(
 	) => void,
 ): (event: AdvisorBeforeRunEvent) => AdvisorBeforeRunResult | undefined {
 	return (event: AdvisorBeforeRunEvent): AdvisorBeforeRunResult | undefined => {
-		if (event.trigger !== "brainstorm_review") {
+		if (event.trigger !== "compliance_review") {
 			return undefined;
 		}
 
@@ -54,7 +54,6 @@ export function createBrainstormAdvisorHook(
 		return {
 			additionalSystemContext: Object.freeze([envelope.rules, envelope.context]),
 			additionalTools: Object.freeze([createBrainstormReviewTool(envelope, coordinator, registry, sendMessage)]),
-			additionalToolNames: Object.freeze([...envelope.requestedToolNames]),
 			metadata: Object.freeze({ brainstormReviewId: envelope.reviewId }),
 		};
 	};
