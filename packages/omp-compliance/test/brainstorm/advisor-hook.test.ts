@@ -219,4 +219,34 @@ describe("brainstorm_review tool — sendMessage", () => {
 		await expect(tool.execute("tool-call-3", badParams)).rejects.toThrow(BrainstormReviewError);
 		expect(messages).toHaveLength(0);
 	});
+
+	it("does NOT call sendMessage on acceptReview rejection and keeps envelope", async () => {
+		const registry = new BrainstormReviewRegistry();
+		const env = makeEnvelope();
+		registry.put(env);
+
+		const messages: Array<[unknown, unknown]> = [];
+		const sendMessage = (msg: unknown, opts?: unknown): void => {
+			messages.push([msg, opts]);
+		};
+
+		const coordinator = {
+			acceptReview: async () => {
+				throw new Error("Cannot accept review: cannot transition from \"decided\"");
+			},
+			current: () => null,
+		} as unknown as TopicCoordinator;
+
+		const hook = createBrainstormAdvisorHook(registry, coordinator, sendMessage);
+		const result = hook(brainstormEvent());
+		expect(result).toBeDefined();
+		const tool = result!.additionalTools![0];
+
+		await expect(tool.execute("tool-call-reject", validReviewParams)).rejects.toThrow(
+			"Cannot accept review: cannot transition from \"decided\"",
+		);
+
+		expect(messages).toHaveLength(0);
+		expect(registry.get(env.reviewId)).toBe(env);
+	});
 });
