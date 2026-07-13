@@ -29,3 +29,10 @@ export interface TriggerProducer {
 export interface ContextInjector {
 	inject(trigger: string): string[];
 }
+
+export interface BackpressureQueue {
+	enqueue(producer: string, event: TriggerEvent): Promise<void>;
+	reserveNext(): Promise<{ id: string; event: TriggerEvent; producer: string } | undefined>;
+	ack(id: string): Promise<void>;
+	nack(id: string, event: TriggerEvent, producer: string): Promise<void>;
+}
