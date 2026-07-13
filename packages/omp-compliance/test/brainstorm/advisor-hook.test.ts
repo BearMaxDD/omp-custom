@@ -154,7 +154,7 @@ describe("brainstorm_review tool — sendMessage", () => {
 		const hook = createBrainstormAdvisorHook(registry, coordinator, sendMessage);
 		const result = hook(brainstormEvent());
 		expect(result).toBeDefined();
-		const tool = result!.additionalTools![0];
+		const tool = result?.additionalTools?.[0];
 
 		await tool.execute("tool-call-1", validReviewParams);
 
@@ -193,7 +193,7 @@ describe("brainstorm_review tool — sendMessage", () => {
 		const hook = createBrainstormAdvisorHook(registry, makeCoordinator(), sendMessage);
 		const result = hook(brainstormEvent());
 		expect(result).toBeDefined();
-		const tool = result!.additionalTools![0];
+		const tool = result?.additionalTools?.[0];
 
 		const badParams = { ...validReviewParams, status: "pass" };
 		await expect(tool.execute("tool-call-2", badParams)).rejects.toThrow(BrainstormReviewError);
@@ -213,7 +213,7 @@ describe("brainstorm_review tool — sendMessage", () => {
 		const hook = createBrainstormAdvisorHook(registry, makeCoordinator(), sendMessage);
 		const result = hook(brainstormEvent());
 		expect(result).toBeDefined();
-		const tool = result!.additionalTools![0];
+		const tool = result?.additionalTools?.[0];
 
 		const badParams = { ...validReviewParams, topic_id: "wrong-topic" };
 		await expect(tool.execute("tool-call-3", badParams)).rejects.toThrow(BrainstormReviewError);
@@ -240,7 +240,7 @@ describe("brainstorm_review tool — sendMessage", () => {
 		const hook = createBrainstormAdvisorHook(registry, coordinator, sendMessage);
 		const result = hook(brainstormEvent());
 		expect(result).toBeDefined();
-		const tool = result!.additionalTools![0];
+		const tool = result?.additionalTools?.[0];
 
 		await expect(tool.execute("tool-call-reject", validReviewParams)).rejects.toThrow(
 			'Cannot accept review: cannot transition from "decided"',

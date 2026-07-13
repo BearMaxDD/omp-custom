@@ -149,7 +149,7 @@ describe("createComplianceAdvisorHook", () => {
 				metadata: { reviewId: env.reviewId, taskId: TASK_ID, contractHash: HASH, attempt: 1 },
 			}),
 		) as AdvisorBeforeRunResult;
-		const tool = result.additionalTools![0];
+		const tool = result.additionalTools?.[0];
 		const toolResult = await tool.execute("call-rejected", {
 			schema_version: 1,
 			task_id: TASK_ID,

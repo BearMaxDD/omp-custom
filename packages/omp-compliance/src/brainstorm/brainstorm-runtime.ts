@@ -34,7 +34,11 @@ export interface BrainstormRuntimeConfig {
 	readonly getAllTools: () => readonly string[];
 	/** Get the current session ID. */
 	readonly sessionId: () => string;
+	/** Maximum time to wait for a structured Advisor review. */
+	readonly reviewTimeoutMs?: number;
 }
+
+const DEFAULT_REVIEW_TIMEOUT_MS = 120_000;
 
 // ─── Submit Topic Result ───────────────────────────────────────────────
 
@@ -147,11 +151,29 @@ export class BrainstormRuntime {
 				await coordinator.markReviewUnavailable(topic.topicId, "Advisor review not accepted");
 				return { reviewId, topic, status: "review_unavailable" };
 			}
+			this.scheduleReviewTimeout(reviewId, topic.topicId);
 			return { reviewId, topic, status: "advisor_reviewing" };
 		} catch {
 			registry.consume(reviewId);
 			await coordinator.markReviewUnavailable(topic.topicId, "Advisor review request failed");
 			return { reviewId, topic, status: "review_unavailable" };
 		}
+	}
+
+	private scheduleReviewTimeout(reviewId: string, topicId: string): void {
+		const timeoutMs = this.config.reviewTimeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
+		const timer = setTimeout(() => {
+			void this.expireReview(reviewId, topicId);
+		}, timeoutMs);
+		timer.unref?.();
+	}
+
+	private async expireReview(reviewId: string, topicId: string): Promise<void> {
+		const envelope = this.config.registry.consume(reviewId);
+		if (!envelope) return;
+
+		const topic = this.config.coordinator.current();
+		if (topic?.topicId !== topicId || topic.status !== "advisor_reviewing") return;
+		await this.config.coordinator.markReviewUnavailable(topicId, "Advisor review timed out");
 	}
 }

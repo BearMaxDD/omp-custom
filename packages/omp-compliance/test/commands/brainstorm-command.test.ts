@@ -90,8 +90,8 @@ describe("registerBrainstormCommand", () => {
 		registerBrainstormCommand(api as never, coordinator);
 		const cmd = commands.find((c) => c.name === "brainstorm");
 		expect(cmd).toBeDefined();
-		expect(cmd!.description).toBeTruthy();
-		expect(cmd!.completions).toEqual(["status", "history", "retry", "park"]);
+		expect(cmd?.description).toBeTruthy();
+		expect(cmd?.completions).toEqual(["status", "history", "retry", "park"]);
 	});
 
 	it("shows status with current topic info", async () => {
@@ -100,7 +100,7 @@ describe("registerBrainstormCommand", () => {
 		let output = "";
 		const origLog = console.log;
 		console.log = (msg: string) => {
-			output += msg + "\n";
+			output += `${msg}\n`;
 		};
 		try {
 			await handler(["status"]);
@@ -116,7 +116,7 @@ describe("registerBrainstormCommand", () => {
 		let output = "";
 		const origLog = console.log;
 		console.log = (msg: string) => {
-			output += msg + "\n";
+			output += `${msg}\n`;
 		};
 		try {
 			await handler(["status"]);
@@ -133,7 +133,7 @@ describe("registerBrainstormCommand", () => {
 		let output = "";
 		const origLog = console.log;
 		console.log = (msg: string) => {
-			output += msg + "\n";
+			output += `${msg}\n`;
 		};
 		try {
 			await handler(["history", current.topicId]);
@@ -157,7 +157,7 @@ describe("registerBrainstormCommand", () => {
 		const current = coordinator.current()!;
 		const handler = await getCommandHandler(coordinator);
 		await handler(["retry", current.topicId]);
-		expect(coordinator.current()!.status).toBe("ready_for_advisor_review");
+		expect(coordinator.current()?.status).toBe("ready_for_advisor_review");
 	});
 
 	it("parks a topic without deleting history", async () => {
@@ -165,9 +165,9 @@ describe("registerBrainstormCommand", () => {
 		const current = coordinator.current()!;
 		const handler = await getCommandHandler(coordinator);
 		await handler(["park", current.topicId]);
-		expect(coordinator.current()!.status).toBe("parked");
-		expect(coordinator.current()!.decision).toBeDefined();
-		expect(coordinator.current()!.decision?.decision).toBe("park");
+		expect(coordinator.current()?.status).toBe("parked");
+		expect(coordinator.current()?.decision).toBeDefined();
+		expect(coordinator.current()?.decision?.decision).toBe("park");
 
 		// History should still be accessible
 		const events = await coordinator.getTopicEvents(current.topicId);

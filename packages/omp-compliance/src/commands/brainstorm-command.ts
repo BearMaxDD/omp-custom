@@ -55,8 +55,7 @@ export function registerBrainstormCommand(api: ExtensionAPI, getCoordinator: Coo
 				}
 				default:
 					throw new Error(
-						`未知子命令: ${subcommand}. ` +
-							"用法: /brainstorm status | history <topic_id> | retry <topic_id> | park <topic_id>",
+						`未知子命令: ${subcommand}. 用法: /brainstorm status | history <topic_id> | retry <topic_id> | park <topic_id>`,
 					);
 			}
 		},

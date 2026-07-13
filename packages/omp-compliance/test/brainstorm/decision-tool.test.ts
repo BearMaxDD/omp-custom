@@ -165,7 +165,7 @@ describe("createDecisionTool", () => {
 
 		// user_confirmed: false should be rejected
 		const rejected = await (tool.handler as (params: Record<string, unknown>) => Promise<unknown>)({
-			topic_id: coordinator.current()!.topicId,
+			topic_id: coordinator.current()?.topicId,
 			decision: "accept_candidate",
 			user_confirmed: false,
 			rationale: "should fail",
@@ -175,7 +175,7 @@ describe("createDecisionTool", () => {
 
 		// user_confirmed: true should succeed
 		const accepted = await (tool.handler as (params: Record<string, unknown>) => Promise<unknown>)({
-			topic_id: coordinator.current()!.topicId,
+			topic_id: coordinator.current()?.topicId,
 			decision: "accept_candidate",
 			user_confirmed: true,
 			rationale: "采用官方 Hook，保持核心改动最小",
@@ -190,7 +190,7 @@ describe("createDecisionTool", () => {
 		const tool = createDecisionTool({ coordinator });
 
 		const result = await (tool.handler as (params: Record<string, unknown>) => Promise<unknown>)({
-			topic_id: coordinator.current()!.topicId,
+			topic_id: coordinator.current()?.topicId,
 			decision: "accept_alternative",
 			selected_alternative: "扁平架构",
 			user_confirmed: true,
@@ -207,7 +207,7 @@ describe("createDecisionTool", () => {
 		const tool = createDecisionTool({ coordinator });
 
 		const result = await (tool.handler as (params: Record<string, unknown>) => Promise<unknown>)({
-			topic_id: coordinator.current()!.topicId,
+			topic_id: coordinator.current()?.topicId,
 			decision: "park",
 			user_confirmed: true,
 			rationale: "依赖项未准备好",

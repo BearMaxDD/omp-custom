@@ -108,8 +108,7 @@ beforeEach(() => {
 	const reviewDeps: ComplianceReviewDependencies = {
 		sessionId: () => "test-session",
 		registry,
-		requestAdvisorReview: (_req: AdvisorReviewRequest) =>
-			Promise.resolve({ reviewId: "test-review", accepted: true }),
+		requestAdvisorReview: (_req: AdvisorReviewRequest) => Promise.resolve({ reviewId: "test-review", accepted: true }),
 	};
 	runtime = new ComplianceRuntime(() => store, collector, api.toAPI(), tmpDir, reviewDeps);
 

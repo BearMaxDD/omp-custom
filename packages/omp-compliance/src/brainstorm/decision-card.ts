@@ -82,7 +82,7 @@ export function renderDecisionCard(topic: BrainstormTopicState): string {
 				lines.push(`  [${alt.name}]`);
 				lines.push(`    描述: ${alt.description}`);
 				if (alt.tradeoffs.length > 0) {
-					lines.push(`    权衡:`);
+					lines.push("    权衡:");
 					for (const t of alt.tradeoffs) {
 						lines.push(`      - ${t}`);
 					}

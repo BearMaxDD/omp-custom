@@ -108,7 +108,7 @@ describe("buildTopicPacket / renderTopicPacket", () => {
 		const rendered = renderTopicPacket(longTitlePacket());
 		const titleLine = rendered.split("\n").find((l) => l.startsWith("  title:"));
 		expect(titleLine).toBeDefined();
-		const titleValue = titleLine!.replace("  title: ", "");
+		const titleValue = titleLine?.replace("  title: ", "");
 		expect(titleValue.length).toBeLessThanOrEqual(200);
 	});
 
@@ -116,7 +116,7 @@ describe("buildTopicPacket / renderTopicPacket", () => {
 		const rendered = renderTopicPacket(longSummaryPacket());
 		const summaryLine = rendered.split("\n").find((l) => l.startsWith("  discussion_summary:"));
 		expect(summaryLine).toBeDefined();
-		const summaryValue = summaryLine!.replace("  discussion_summary: ", "");
+		const summaryValue = summaryLine?.replace("  discussion_summary: ", "");
 		expect(summaryValue.length).toBeLessThanOrEqual(8_000);
 	});
 

@@ -73,6 +73,23 @@ describe("extension activate — no lazy file side-effects", () => {
 		expect(api.getBoundEvents()).toContain("advisor_before_run");
 	});
 
+	it("activate 后 before_agent_start 会注入专题自动评审提示", async () => {
+		const api = new FakeExtensionAPI();
+		const activate = (await import("../src/extension")).default;
+		activate(api.toAPI() as unknown as ExtensionAPI);
+
+		expect(api.getBoundEvents()).toContain("before_agent_start");
+		const handlers = api.eventHandlers.get("before_agent_start") ?? [];
+		const result = (await handlers[0]?.({
+			type: "before_agent_start",
+			prompt: "讨论一个架构方案",
+			systemPrompt: ["base"],
+		})) as { systemPrompt?: string[] } | undefined;
+
+		expect(result?.systemPrompt?.[0]).toBe("base");
+		expect(result?.systemPrompt?.join("\n")).toContain("brainstorm_topic_ready");
+	});
+
 	it("start 后 .omp/compliance 目录和 task state 存在", async () => {
 		// Write fixture into temp dir
 		writeFileSync(join(tmpDir, "tdd.md"), TDD_FIXTURE, "utf-8");
@@ -85,7 +102,7 @@ describe("extension activate — no lazy file side-effects", () => {
 			sessionId: () => "test-session",
 			registry,
 			requestAdvisorReview: (_req: AdvisorReviewRequest) =>
-			Promise.resolve<AdvisorReviewReceipt>({ reviewId: "test-review", accepted: true }),
+				Promise.resolve<AdvisorReviewReceipt>({ reviewId: "test-review", accepted: true }),
 		});
 
 		// start task — should create directory

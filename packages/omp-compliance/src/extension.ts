@@ -5,9 +5,10 @@ import type { ComplianceReviewDependencies } from "./advisor/review-envelope";
 import { createBrainstormAdvisorHook } from "./brainstorm/advisor-hook";
 import { BrainstormRuntime } from "./brainstorm/brainstorm-runtime";
 import { createDecisionTool } from "./brainstorm/decision-tool";
+import { type BeforeAgentStartEvent, appendBrainstormGuidance } from "./brainstorm/main-agent-guidance";
 import { BrainstormReviewRegistry } from "./brainstorm/review-registry";
-import { createTopicReadyTool } from "./brainstorm/topic-ready-tool";
 import { TopicCoordinator } from "./brainstorm/topic-coordinator";
+import { createTopicReadyTool } from "./brainstorm/topic-ready-tool";
 import { TopicStore } from "./brainstorm/topic-store";
 import { registerBrainstormCommand } from "./commands/brainstorm-command";
 import { registerComplianceCommand } from "./commands/compliance-command";
@@ -134,6 +135,8 @@ export default function activate(api: ExtensionAPI): void {
 		}
 		return undefined;
 	});
+
+	api.on("before_agent_start", (event: unknown) => appendBrainstormGuidance(event as BeforeAgentStartEvent));
 
 	// ── Register compliance command and tool ──
 	registerComplianceCommand(api, runtime);

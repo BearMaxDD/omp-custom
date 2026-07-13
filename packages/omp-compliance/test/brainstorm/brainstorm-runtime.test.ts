@@ -18,8 +18,8 @@ import { TopicStore } from "../../src/brainstorm/topic-store";
 import type { BrainstormTopicReadyInput } from "../../src/brainstorm/types";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
 import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "../../src/types";
-import { validTopicInput } from "./fixtures";
 import { FakeCodebaseMemory } from "../support/fake-codebase-memory";
+import { validTopicInput } from "./fixtures";
 
 // ─── Helpers ───────────────────────────────────────────────────────────
 
@@ -32,6 +32,7 @@ function tempDir(): string {
 interface BrainstormRuntimeHarnessOverrides {
 	requestAdvisorReview: (request: AdvisorReviewRequest) => Promise<AdvisorReviewReceipt>;
 	getAllTools?: () => readonly string[];
+	reviewTimeoutMs?: number;
 }
 
 function createBrainstormRuntimeHarness(overrides: BrainstormRuntimeHarnessOverrides) {
@@ -47,6 +48,7 @@ function createBrainstormRuntimeHarness(overrides: BrainstormRuntimeHarnessOverr
 		requestAdvisorReview: overrides.requestAdvisorReview,
 		getAllTools: overrides.getAllTools ?? (() => []),
 		sessionId: () => "session-1",
+		reviewTimeoutMs: overrides.reviewTimeoutMs,
 	});
 	return { runtime, coordinator, registry, collector };
 }
@@ -61,7 +63,7 @@ describe("BrainstormRuntime", () => {
 		const harness = createBrainstormRuntimeHarness({
 			requestAdvisorReview: async (request) => {
 				reviewRequests.push(request);
-			return { accepted: true, reviewId: request.reviewId };
+				return { accepted: true, reviewId: request.reviewId };
 			},
 		});
 
@@ -102,10 +104,10 @@ describe("BrainstormRuntime", () => {
 		const envelope = harness.registry.get(result.reviewId!);
 
 		expect(envelope).toBeDefined();
-		expect(envelope!.topicId).toBe(result.topic.topicId);
-		expect(envelope!.inputHash).toBe(result.topic.inputHash);
-		expect(envelope!.context).toBeTruthy();
-		expect(envelope!.rules).toBeTruthy();
+		expect(envelope?.topicId).toBe(result.topic.topicId);
+		expect(envelope?.inputHash).toBe(result.topic.inputHash);
+		expect(envelope?.context).toBeTruthy();
+		expect(envelope?.rules).toBeTruthy();
 	});
 
 	// ── Reused (dedup via fingerprint) ─────────────────────────────────
@@ -160,6 +162,20 @@ describe("BrainstormRuntime", () => {
 		expect(result.topic.status).toBe("review_unavailable");
 	});
 
+	it("transitions to review_unavailable and consumes the envelope after timeout", async () => {
+		const harness = createBrainstormRuntimeHarness({
+			requestAdvisorReview: async (request) => ({ accepted: true, reviewId: request.reviewId }),
+			reviewTimeoutMs: 10,
+		});
+
+		const result = await harness.runtime.submitTopic(validTopicInput());
+		expect(result.status).toBe("advisor_reviewing");
+		await Bun.sleep(30);
+
+		expect(harness.coordinator.current()?.status).toBe("review_unavailable");
+		expect(harness.registry.get(result.reviewId ?? "")).toBeUndefined();
+	});
+
 	// ── Envelope content ───────────────────────────────────────────────
 
 	it("includes rules and context in the registered envelope", async () => {
@@ -171,17 +187,16 @@ describe("BrainstormRuntime", () => {
 		const envelope = harness.registry.get(result.reviewId!);
 
 		expect(envelope).toBeDefined();
-		expect(envelope!.rules).toContain("brainstorm-review-rules");
-		expect(envelope!.context).toContain("<brainstorm-topic>");
-		expect(envelope!.createdAt).toBeTruthy();
+		expect(envelope?.rules).toContain("brainstorm-review-rules");
+		expect(envelope?.context).toContain("<brainstorm-topic>");
+		expect(envelope?.createdAt).toBeTruthy();
 	});
 
-
-		const harness = createBrainstormRuntimeHarness({
-			requestAdvisorReview: async (request) => ({ accepted: true, reviewId: request.reviewId }),
-			getAllTools: () => ["mcp__codebase_memory_mcp__search_graph"],
-		});
-		// Override harness config to pass limited getAllTools
+	const _harness = createBrainstormRuntimeHarness({
+		requestAdvisorReview: async (request) => ({ accepted: true, reviewId: request.reviewId }),
+		getAllTools: () => ["mcp__codebase_memory_mcp__search_graph"],
+	});
+	// Override harness config to pass limited getAllTools
 	it("rejects topic on mark failure with empty registry", async () => {
 		const dir = tempDir();
 		const store = new TopicStore(dir);
