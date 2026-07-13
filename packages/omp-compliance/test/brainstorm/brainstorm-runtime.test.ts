@@ -30,6 +30,7 @@ function tempDir(): string {
 
 interface BrainstormRuntimeHarnessOverrides {
 	requestAdvisorReview: (request: AdvisorReviewRequest) => Promise<AdvisorReviewReceipt>;
+	getAllTools?: () => readonly string[];
 }
 
 function createBrainstormRuntimeHarness(overrides: BrainstormRuntimeHarnessOverrides) {
@@ -43,7 +44,7 @@ function createBrainstormRuntimeHarness(overrides: BrainstormRuntimeHarnessOverr
 		coordinator,
 		registry,
 		requestAdvisorReview: overrides.requestAdvisorReview,
-		getAllTools: () => [],
+		getAllTools: overrides.getAllTools ?? (() => []),
 		sessionId: () => "session-1",
 	});
 	return { runtime, coordinator, registry, collector };
@@ -174,6 +175,12 @@ describe("BrainstormRuntime", () => {
 		expect(envelope!.createdAt).toBeTruthy();
 	});
 
+
+		const harness = createBrainstormRuntimeHarness({
+			requestAdvisorReview: async (request) => ({ accepted: true, reviewId: request.reviewId }),
+			getAllTools: () => ["mcp__codebase_memory_mcp__search_graph"],
+		});
+		// Override harness config to pass limited getAllTools
 	it("rejects topic on mark failure with empty registry", async () => {
 		const dir = tempDir();
 		const store = new TopicStore(dir);

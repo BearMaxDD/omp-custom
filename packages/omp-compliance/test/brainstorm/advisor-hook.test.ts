@@ -101,7 +101,8 @@ describe("createBrainstormAdvisorHook", () => {
 	it("injects topic rules, brainstorm_review tool and read-only tool names only for its trigger", () => {
 		const registry = new BrainstormReviewRegistry();
 		const coordinator = makeCoordinator();
-		const env = makeEnvelope();
+		const names = ["mcp__codebase_memory_mcp__search_graph", "mcp__codebase_memory_mcp__get_code_snippet"];
+		const env = makeEnvelope({ requestedToolNames: names });
 		registry.put(env);
 
 		const hook = createBrainstormAdvisorHook(registry, coordinator);
@@ -110,7 +111,7 @@ describe("createBrainstormAdvisorHook", () => {
 		expect(result).toBeDefined();
 		expect(result?.additionalSystemContext).toHaveLength(2);
 		expect(result?.additionalTools?.map((t) => t.name)).toEqual(["brainstorm_review"]);
-		expect(result?.additionalToolNames?.every((n) => isCodebaseReadOnlyName(n))).toBe(true);
+		expect(result?.additionalToolNames).toEqual(names);
 	});
 
 	it("returns undefined for compliance_review trigger", () => {
