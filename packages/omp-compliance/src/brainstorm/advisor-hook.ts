@@ -22,6 +22,7 @@ import { BRAINSTORM_READ_ONLY_TOOL_NAMES } from "./advisor-rules";
 import type { BrainstormReviewRegistry } from "./review-registry";
 import type { BrainstormReviewEnvelope } from "./review-registry";
 import { parseBrainstormReview } from "./review-schema";
+import { renderDecisionCard } from "./decision-card";
 import type { TopicCoordinator } from "./topic-coordinator";
 
 // ─── Public API ─────────────────────────────────────────────────────
@@ -32,7 +33,8 @@ import type { TopicCoordinator } from "./topic-coordinator";
  */
 export function createBrainstormAdvisorHook(
 	registry: BrainstormReviewRegistry,
-	coordinator: Pick<TopicCoordinator, "acceptReview">,
+	coordinator: TopicCoordinator,
+	sendMessage: (msg: { customType: string; content: string; display: boolean; attribution: string; details?: unknown }, options?: { deliverAs?: string; triggerTurn?: boolean }) => void,
 ): (event: AdvisorBeforeRunEvent) => AdvisorBeforeRunResult | undefined {
 	return (event: AdvisorBeforeRunEvent): AdvisorBeforeRunResult | undefined => {
 		if (event.trigger !== "brainstorm_review") {
@@ -48,7 +50,7 @@ export function createBrainstormAdvisorHook(
 
 		return {
 			additionalSystemContext: Object.freeze([envelope.rules, envelope.context]),
-			additionalTools: Object.freeze([createBrainstormReviewTool(envelope, coordinator, registry)]),
+			additionalTools: Object.freeze([createBrainstormReviewTool(envelope, coordinator, registry, sendMessage)]),
 			additionalToolNames: Object.freeze([...BRAINSTORM_READ_ONLY_TOOL_NAMES]),
 			metadata: Object.freeze({ brainstormReviewId: envelope.reviewId }),
 		};
@@ -70,8 +72,9 @@ export function createBrainstormAdvisorHook(
  */
 export function createBrainstormReviewTool(
 	envelope: BrainstormReviewEnvelope,
-	coordinator: Pick<TopicCoordinator, "acceptReview">,
+	coordinator: TopicCoordinator,
 	registry: BrainstormReviewRegistry,
+	sendMessage: (msg: { customType: string; content: string; display: boolean; attribution: string; details?: unknown }, options?: { deliverAs?: string; triggerTurn?: boolean }) => void,
 ): AgentTool {
 	return {
 		name: "brainstorm_review",
@@ -137,6 +140,19 @@ export function createBrainstormReviewTool(
 			});
 			await coordinator.acceptReview(review);
 			registry.consume(envelope.reviewId);
+			const topic = coordinator.current();
+			if (topic) {
+				sendMessage(
+					{
+						customType: "brainstorm_review",
+						content: renderDecisionCard(topic),
+						display: true,
+						attribution: "agent",
+						details: { topicId: review.topic_id, review },
+					},
+					{ deliverAs: "nextTurn", triggerTurn: true },
+				);
+			}
 			return {
 				content: [{ type: "text" as const, text: "Brainstorm review accepted." }],
 				details: { topicId: review.topic_id, status: review.status },
