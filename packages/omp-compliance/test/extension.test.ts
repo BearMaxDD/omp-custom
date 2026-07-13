@@ -47,6 +47,32 @@ describe("extension activate — no lazy file side-effects", () => {
 		expect(existsSync(join(tmpDir, ".omp/compliance"))).toBe(false);
 	});
 
+	it("activate 后不创建 .omp/compliance/brainstorm 目录", async () => {
+		const api = new FakeExtensionAPI();
+		const activate = (await import("../src/extension")).default;
+		activate(api.toAPI() as unknown as ExtensionAPI);
+
+		expect(existsSync(join(tmpDir, ".omp/compliance/brainstorm"))).toBe(false);
+	});
+
+	it("activate 后 Brainstorm 工具和命令已注册", async () => {
+		const api = new FakeExtensionAPI();
+		const activate = (await import("../src/extension")).default;
+		activate(api.toAPI() as unknown as ExtensionAPI);
+
+		expect(api.getRegisteredCommands()).toContain("brainstorm");
+		expect(api.getRegisteredTools()).toContain("brainstorm_topic_ready");
+		expect(api.getRegisteredTools()).toContain("brainstorm_decision");
+	});
+
+	it("activate 后 advisor_before_run 已绑定", async () => {
+		const api = new FakeExtensionAPI();
+		const activate = (await import("../src/extension")).default;
+		activate(api.toAPI() as unknown as ExtensionAPI);
+
+		expect(api.getBoundEvents()).toContain("advisor_before_run");
+	});
+
 	it("start 后 .omp/compliance 目录和 task state 存在", async () => {
 		// Write fixture into temp dir
 		writeFileSync(join(tmpDir, "tdd.md"), TDD_FIXTURE, "utf-8");

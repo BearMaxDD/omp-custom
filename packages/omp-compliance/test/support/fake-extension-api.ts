@@ -1,4 +1,4 @@
-import type { CustomMessagePayload, ExtensionAPI, ToolDefinition } from "../../src/types";
+import type { AdvisorBeforeRunEvent, AdvisorBeforeRunResult, AdvisorReviewReceipt, AdvisorReviewRequest, CustomMessagePayload, ExtensionAPI, ToolDefinition } from "../../src/types";
 
 /**
  * A minimal fake implementation of ExtensionAPI for testing.
@@ -10,6 +10,9 @@ export class FakeExtensionAPI {
 	public readonly eventHandlers: Map<string, Array<(event: unknown) => unknown>> = new Map();
 	public readonly sentMessages: CustomMessagePayload[] = [];
 	public readonly appendedEntries: Array<{ type: string; data?: unknown }> = [];
+	public requestAdvisorReview: (request: AdvisorReviewRequest) => Promise<AdvisorReviewReceipt> = async (
+		_request: AdvisorReviewRequest,
+	) => ({ reviewId: _request.reviewId, status: "accepted" });
 
 	registerTool<TParams = unknown, TDetails = unknown>(tool: ToolDefinition<TParams, TDetails>): void {
 		this.tools.push(tool.name);
@@ -61,6 +64,28 @@ export class FakeExtensionAPI {
 		return Array.from(this.eventHandlers.keys());
 	}
 
+	/** Simulate an advisor_before_run event and return collected results. */
+	async fireAdvisorBeforeRun(
+		event: Partial<AdvisorBeforeRunEvent>,
+	): Promise<AdvisorBeforeRunResult | undefined> {
+		const handlers = this.eventHandlers.get("advisor_before_run") ?? [];
+		const fullEvent: AdvisorBeforeRunEvent = {
+			type: "advisor_before_run",
+			sessionId: event.sessionId ?? "test-session",
+			advisorId: event.advisorId ?? "test-advisor",
+			trigger: event.trigger ?? "compliance_review",
+			messages: event.messages ?? [],
+			metadata: event.metadata,
+		};
+		for (const handler of handlers) {
+			const result = await handler(fullEvent, {
+				sessionManager: { getSessionId: () => fullEvent.sessionId },
+			});
+			if (result !== undefined) return result as AdvisorBeforeRunResult;
+		}
+		return undefined;
+	}
+
 	/** Simulate a tool_call event through all bound handlers and return collected results. */
 	async fireToolCall(toolName: string): Promise<{ block: boolean; reasons: string[] }> {
 		const handlers = this.eventHandlers.get("tool_call") ?? [];
@@ -108,6 +133,7 @@ export class FakeExtensionAPI {
 			on: this.on.bind(this),
 			sendMessage: this.sendMessage.bind(this),
 			appendEntry: this.appendEntry.bind(this),
+			requestAdvisorReview: this.requestAdvisorReview.bind(this),
 			logger: {
 				info: () => {},
 				warn: () => {},
