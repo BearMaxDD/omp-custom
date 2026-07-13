@@ -272,17 +272,14 @@ export class ComplianceRuntime {
 		try {
 			receipt = await this.reviewDeps.requestAdvisorReview({
 				trigger: "compliance_review",
-				sessionId,
-				taskId: this.taskState.taskId,
-				contractHash: this.taskState.contractHash,
-				attempt: this.taskState.attempt,
-				context,
-				rules,
 				reviewId: envelope.reviewId,
 				metadata: {
+					sessionId,
 					taskId: this.taskState.taskId,
 					contractHash: this.taskState.contractHash,
 					attempt: this.taskState.attempt,
+					context,
+					rules,
 				},
 			});
 		} catch (err: unknown) {

@@ -226,9 +226,9 @@ describe("ComplianceRuntime — requestCompletion advisor review path", () => {
 		expect(req.reviewId).toMatch(/^compliance:/);
 
 		// Metadata binds task/hash/attempt
-		expect(req.taskId).toBe(result.completionSnapshot.taskId);
-		expect(req.contractHash).toMatch(/^sha256:/);
-		expect(req.attempt).toBe(1);
+		expect(req.metadata?.taskId).toBe(result.completionSnapshot.taskId);
+		expect(req.metadata?.contractHash).toMatch(/^sha256:/);
+		expect(req.metadata?.attempt).toBe(1);
 
 		// Return includes reviewId and receipt
 		expect(result.reviewId).toBe(req.reviewId);

@@ -137,10 +137,10 @@ export class BrainstormRuntime {
 		try {
 			const receipt = await this.config.requestAdvisorReview({
 				trigger: "brainstorm_review",
-				sessionId: this.config.sessionId(),
-				taskId: `brainstorm-${topic.topicId}`,
 				reviewId,
 				metadata: {
+					sessionId: this.config.sessionId(),
+					taskId: `brainstorm-${topic.topicId}`,
 					topicId: topic.topicId,
 					inputHash: topic.inputHash,
 					codebaseRelevance: topic.input.codebase_relevance,
