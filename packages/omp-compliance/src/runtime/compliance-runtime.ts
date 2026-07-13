@@ -108,6 +108,9 @@ export class ComplianceRuntime {
 		this.api.sendMessage(
 			{
 				customType: "compliance_managed",
+				content: "Compliance managed task started",
+				display: false,
+				attribution: "agent" as const,
 				details: {
 					taskId,
 					contractHash: contract.contractHash,

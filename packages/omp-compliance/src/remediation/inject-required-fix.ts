@@ -58,7 +58,12 @@ export function injectRemediation(api: ExtensionAPI, payload: RemediationPayload
 		details: payload,
 	};
 
-	api.sendMessage(message, {
+	api.sendMessage({
+		...message,
+		content: message.content ?? "Compliance fix required",
+		display: true,
+		attribution: "agent" as const,
+	}, {
 		deliverAs: "nextTurn",
 		triggerTurn: true,
 	});

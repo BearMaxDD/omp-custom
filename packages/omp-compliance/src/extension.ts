@@ -108,7 +108,7 @@ export default function activate(api: ExtensionAPI): void {
 				customType: msg.customType,
 				content: msg.content,
 				display: msg.display,
-				attribution: msg.attribution,
+				attribution: msg.attribution as "agent" | "user" | undefined,
 				details: msg.details,
 			},
 			{
