@@ -51,13 +51,28 @@ export interface AdvisorReviewRequest {
 
 ```typescript
 // agent-session.ts
+import { isKnownReviewTrigger, FALLBACK_TRIGGER } from "./trigger-registry";
+
 const { trigger, ...rest } = request;
-const resolvedTrigger = trigger ?? "compliance_review";
-if (trigger !== undefined && !isKnownTrigger(trigger)) {
-  logger.warn(`Unknown trigger "${trigger}", falling back to compliance_review`);
-  writeTriggerEvent("trigger_fallback", { originalTrigger: trigger, resolved: "compliance_review" });
+const resolvedTrigger = trigger !== undefined && isKnownReviewTrigger(trigger)
+  ? trigger
+  : FALLBACK_TRIGGER;
+
+if (trigger !== undefined && !isKnownReviewTrigger(trigger)) {
+  logger.warn(`Unknown trigger "${trigger}", falling back to ${FALLBACK_TRIGGER}`);
 }
-return advisors[0].runtime.requestReview({ trigger: resolvedTrigger, ...rest });
+
+// 透传 fallback 元数据，由扩展自行落盘
+return advisors[0].runtime.requestReview({
+  trigger: resolvedTrigger,
+  ...rest,
+  metadata: {
+    ...rest.metadata,
+    ...(trigger !== undefined && !isKnownReviewTrigger(trigger)
+      ? { originalTrigger: trigger, triggerFallback: true }
+      : {}),
+  },
+});
 ```
 
 ```typescript
@@ -177,6 +192,30 @@ interface BackpressureQueueConfig {
 - 磁盘写入失败 → 丢弃 + 告警（不阻塞 producer）
 - 重启 → 扫描 `storagePath` 重入 Dispatcher
 
+### TODO 完成状态的权威来源
+
+"所有 todo 完成后执行冒烟测试" 的**权威完成标记**来自 writing-plans：
+
+```typescript
+export interface PlanCompletionSignal {
+  planId: string;
+  allTodosCompleted: boolean;
+  completedAt: string;
+  pendingTodoCount: number;
+}
+```
+
+**工作流**：
+
+```
+writing-plans 创建计划 → PlanRun 开始执行
+  → 每个 todo 完成时更新 PlanRun 状态
+    → 最后一个 todo 后 PlanRun 触发 completion_requested
+      → 扩展监听到 → 冒烟测试 → 写证据 → compliance_review
+```
+
+扩展注册 `turn_end` 监听器检查 PlanRun 状态。如果不可用，回退到 `compliance_complete` 的 `claimed_verification`。
+
 ### 文件新增
 
 ```
@@ -207,11 +246,7 @@ requestCompletion()
   ├── Phase 1: Impact Analysis（可跳过）
   │   ├── 能力预检：WATCHDOG tools 是否包含 trace_path/search_graph
   │   │   ├── 否 → impact_unavailable，跳过
-  │   │   └── 是 → 请求 impact_analysis review
-  │   │         └── Advisor 分析改动 → 返回结构化 ImpactPlan
-  │   │               { affectedModules, affectedTests, suggestedCommands }
-  │   └── 执行 suggestedCommands
-  │         └── 结果写入证据
+  │   └── 执行 suggestedCommands（ImpactCommand[]，经安全校验）
   │
   ├── Phase 2: Completion Review
   │   ├── 冒烟测试（预定义命令）
@@ -222,31 +257,41 @@ requestCompletion()
 
 ### ImpactPlan 结构
 
+禁止 Advisor 直接输出字符串命令——模型输出可能导致命令注入。改为结构化命令描述 + schema 校验：
+
 ```typescript
 export interface ImpactPlan {
   schema_version: 1;
   affectedModules: Array<{ path: string; confidence: "high" | "medium" | "low" }>;
   affectedTests: string[];
-  suggestedCommands: string[];    // 需要执行的测试命令
+  suggestedCommands: ImpactCommand[];
+}
+
+export interface ImpactCommand {
+  executable: string;       // 白名单校验：仅允许 "bun" | "npm" | "node" | "bash"
+  args: string[];           // 参数数组，不含可执行文件
+  cwd: string;              // 必须为仓库内相对路径，禁止 ".."
+  timeoutMs?: number;       // 超时上限 60000
 }
 ```
 
-### 冒烟测试
+**执行安全策略**：
 
 ```typescript
-export interface SmokeTestConfig {
-  commands: string[];
-  timeoutMs: number;
-  failOn: "first" | "all";
+const ALLOWED_EXECUTABLES = new Set(["bun", "npm", "node", "bash"]);
+const SAFE_CWD_PATTERN = /^[a-zA-Z0-9_\/-]+$/;
+
+function validateCommand(cmd: ImpactCommand): void {
+  if (!ALLOWED_EXECUTABLES.has(cmd.executable)) {
+    throw new Error(`Unsafe executable: ${cmd.executable}`);
+  }
+  if (!SAFE_CWD_PATTERN.test(cmd.cwd)) {
+    throw new Error(`Unsafe cwd: ${cmd.cwd}`);
+  }
 }
 ```
 
-在 Phase 2 的 snapshot 冻结前执行。结果写入 `EvidenceSnapshot.smokeTestResults`。失败不自动阻断——Advisor 看到结果后发出 remediation。
-
-### 实时巡检（Detector）
-
-```typescript
-export interface SupervisionHook {
+执行环境限制：超时上限 60s、输出截断 1 MB、环境变量清理（仅保留 `PATH`）。
   beforeReview?(input: {
     trigger: AdvisorReviewRequestTrigger;
     reviewKind: string;
@@ -291,6 +336,156 @@ src/supervision/
 └── hooks/
     └── review-augmentor.ts
 ```
+
+---
+
+## 第 4 层：实时状态面板
+
+让开发者在终端中一眼看到 Advisor 的完整运行状态。
+
+### 面板设计
+
+```
+┌─ Advisor Status ───────────────────────────────────────────┐
+│ 运行时: ● Active       当前: compliance review (task-42)    │
+│ 进度:    analyzing evidence (3/5)  耗时: 12s               │
+│ ── 活动通道 ────────────────────────────────────────────── │
+│ 子代理: 2 running  │  MCP 调用: 7次  │ 建议: 1⛔ 3⚠      │
+│ ── 合规任务 ────────────────────────────────────────────── │
+│ task-42 ● active  │  尝试:2  │  最后判决: remediate      │
+│ ── 大脑风暴 ────────────────────────────────────────────── │
+│ 1 topic pending review  (architecture)                    │
+└────────────────────────────────────────────────────────────┘
+```
+
+### 5 个信息维度的数据来源
+
+| 维度 | 数据来源 | 采集方式 |
+|------|----------|----------|
+| **运行时状态** | `AdvisorRuntime`（是否 active、当前 reviewId、trigger 类型） | 监听 `advisor_before_run` + `advisor_after_run` 事件 |
+| **当前进度** | Advisor 转录中的 tool_call 计数 + emission guard 统计 | `CollectorRuntime` 过滤 advisor 会话的事件 |
+| **子代理活动** | Advisor 会话的 `task` tool 调用 | 通过 sessionId 过滤 `tool_call` → `toolName === "task"` |
+| **MCP 调用** | Advisor 会话的所有 tool_call | `CollectorRuntime` 按 sessionId 分发 |
+| **建议摘要** | `EmissionGuard` 统计 + `AdviseTool` 拦截点 | 监听 advise 调用，按 severity 计数 |
+| **合规任务** | `ComplianceRuntime.taskState` | 直接从运行时读取 |
+| **大脑风暴** | `TopicCoordinator.current()` | 直接从协调器读取 |
+
+### StatusCollector
+
+```typescript
+// src/status/status-collector.ts
+export class StatusCollector {
+  // 从多个源聚合快照
+  snapshot(): StatusSnapshot {
+    return {
+      runtime: this.collectRuntimeState(),
+      advisorSession: this.collectAdvisorSession(),
+      subagents: this.collectSubagentActivity(),
+      mcpCalls: this.collectMCPCalls(),
+      advice: this.collectAdviceSummary(),
+      compliance: this.collectComplianceState(),
+      brainstorm: this.collectBrainstormState(),
+    };
+  }
+
+  // 实时增量（用于状态栏的脉冲更新）
+  onToolCall(event): void { /* 更新 MCP 计数 */ }
+  onAdvisorRunStart(event): void { /* 更新运行时状态 */ }
+  onAdvise(severity, message): void { /* 更新建议摘要 */ }
+}
+```
+
+### StatusSnapshot 类型
+
+```typescript
+export interface StatusSnapshot {
+  runtime: {
+    state: "active" | "idle";
+    currentReview?: { reviewId: string; trigger: string; elapsed: number };
+    progress?: { current: number; total: number; phase: string };
+  };
+  advisorSession: {
+    subagentCount: number;
+    subagentIds: string[];
+    mcpCallCount: number;
+    lastToolCalls: Array<{ toolName: string; timestamp: string }>;
+  };
+  advice: {
+    blockers: number;
+    concerns: number;
+    nits: number;
+    lastAdvice?: { severity: string; message: string; timestamp: string };
+  };
+  compliance: {
+    active: boolean;
+    taskId?: string;
+    status?: string;
+    attempt: number;
+    lastVerdict?: string;
+  };
+  brainstorm: {
+    active: boolean;
+    topicId?: string;
+    status?: string;
+    topicKind?: string;
+  };
+}
+```
+
+### 显示方式
+
+两种显示模式：
+
+#### 1. CLI 快照命令
+
+```bash
+# 一次性抓取当前状态
+/advisor status
+# 或 CLI
+omp advisor status
+```
+
+输出终端表格或上述面板格式。
+
+#### 2. 实时状态栏（可选增强）
+
+在 OMP 终端底部显示一个固定状态栏，每秒更新。依赖 OMP 的 TUI 框架（需上游支持）。
+
+### 文件新增
+
+```
+src/status/
+├── status-collector.ts    # 多源聚合器
+├── snapshot.ts            # StatusSnapshot 类型 + 构建
+├── cli-renderer.ts        # 终端输出渲染
+└── tui-renderer.ts        # TUI 状态栏渲染（可选）
+```
+
+### extension.ts 集成
+
+```typescript
+const statusCollector = new StatusCollector();
+
+api.on("advisor_before_run", (e) => statusCollector.onAdvisorRunStart(e));
+api.on("tool_call", (e) => statusCollector.onToolCall(e));
+api.on("turn_end", () => statusCollector.onTurnEnd());
+
+// 注册查询命令
+api.registerCommand("advisor", {
+  handler: async (args) => {
+    const snapshot = statusCollector.snapshot();
+    console.log(renderCLIStatus(snapshot));
+  }
+});
+```
+
+### 测试覆盖
+
+| 测试 | 数 | 内容 |
+|------|----|------|
+| StatusSnapshot 构建 | 3 | 各维度数据正确聚合 |
+| CLI 渲染 | 2 | 文本输出格式、空状态处理 |
+| 事件监听集成 | 4 | onToolCall/onAdvisorRunStart 增量更新正确 |
 
 ---
 
