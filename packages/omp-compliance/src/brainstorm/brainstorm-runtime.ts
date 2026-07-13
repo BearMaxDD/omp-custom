@@ -108,12 +108,12 @@ export class BrainstormRuntime {
 		const codebaseEvidence = buildTopicCodebaseEvidence(topic.input.codebase_relevance, snapshot);
 		const packet = buildTopicPacket(topic, snapshot);
 		const context = renderTopicPacket(packet);
-		const toolNames = codebaseEvidence.requestedToolNames;
+		const available = new Set(this.config.getAllTools());
+		const toolNames = codebaseEvidence.requestedToolNames.filter((name) => available.has(name));
 		const rules =
 			toolNames.length > 0
 				? `${BRAINSTORM_REVIEW_RULES}\n\nAvailable codebase read-only tools: ${toolNames.join(", ")}`
 				: BRAINSTORM_REVIEW_RULES;
-
 		const reviewId = `br-${randomUUID()}`;
 		const envelope = {
 			reviewId,
