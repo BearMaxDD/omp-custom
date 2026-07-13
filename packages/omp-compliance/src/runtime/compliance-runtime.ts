@@ -107,8 +107,8 @@ export class ComplianceRuntime {
 		// Send brief managed prompt to the main agent
 		this.api.sendMessage(
 			{
-				type: "compliance_managed",
-				data: {
+				customType: "compliance_managed",
+				details: {
 					taskId,
 					contractHash: contract.contractHash,
 					goal: contract.summary.goal,
@@ -291,12 +291,12 @@ export class ComplianceRuntime {
 				status: newState.status,
 				completionSnapshot: snapshot,
 				reviewId: envelope.reviewId,
-				receipt: { reviewId: envelope.reviewId, status: "rejected", reason },
+				receipt: { reviewId: envelope.reviewId, accepted: false, reason },
 			};
 		}
 
 		// Write receipt evidence on accepted
-		if (receipt.status === "accepted") {
+		if (receipt.accepted) {
 			await this.writeEvidenceRecord("advisor_review_accepted", {
 				signalDigest: receipt.reviewId,
 			});

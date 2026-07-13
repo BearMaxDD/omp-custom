@@ -18,7 +18,7 @@ class MinimalAPI implements ExtensionAPI {
 
 	registerTool(): void {}
 	requestAdvisorReview = (_request: AdvisorReviewRequest): Promise<AdvisorReviewReceipt> =>
-		Promise.resolve({ reviewId: "test-review", status: "accepted" });
+		Promise.resolve({ reviewId: "test-review", accepted: true });
 	on(): void {}
 
 	sendMessage(message: unknown, _options?: { triggerTurn?: boolean; deliverAs?: string }): void {
@@ -105,7 +105,7 @@ beforeEach(() => {
 	api = new MinimalAPI();
 	store = new EvidenceStore(evidenceDir);
 	collector = new CollectorRuntime();
-	mockRequestReviewReturn = { reviewId: "test-review", status: "accepted" };
+	mockRequestReviewReturn = { reviewId: "test-review", accepted: true };
 	mockRequestReviewCalls = [];
 	reviewDeps = {
 		sessionId: () => "test-session",
@@ -235,7 +235,7 @@ describe("ComplianceRuntime — requestCompletion advisor review path", () => {
 
 		// Return includes reviewId and receipt
 		expect(result.reviewId).toBe(req.reviewId);
-		expect(result.receipt.status).toBe("accepted");
+		expect(result.receipt.accepted).toBe(true);
 	});
 
 	it("registry envelope 应包含 Completion Evidence 和 compliance_verdict rules", async () => {
@@ -262,7 +262,7 @@ describe("ComplianceRuntime — requestCompletion advisor review path", () => {
 		const result = await runtime.requestCompletion({ summary: "Done" });
 
 		// Status stays advisor_reviewing
-		expect(result.receipt.status).toBe("rejected");
+		expect(result.receipt.accepted).toBe(false);
 		expect(result.receipt.reason).toContain("Advisor pool exhausted");
 
 		expect(runtime.currentTaskState).toBeDefined();
@@ -322,8 +322,8 @@ describe("ComplianceRuntime — acceptVerdict (remediation)", () => {
 
 		// The injectRemediation should have sent a message with the required fix
 		const hasFixMessage = api.sentMessages.some((m) => {
-			if (m && typeof m === "object" && "data" in m) {
-				const data = (m as Record<string, unknown>).data as Record<string, unknown>;
+			if (m && typeof m === "object" && "details" in m) {
+				const data = (m as Record<string, unknown>).details as Record<string, unknown>;
 				return (
 					Array.isArray(data?.findings) &&
 					(data.findings as Array<{ requiredFix: string }>).some(

@@ -9,12 +9,12 @@
 
 import { randomUUID } from "node:crypto";
 import type { CollectorRuntime } from "../signals/collector-runtime";
+import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "../types";
+import { BRAINSTORM_REVIEW_RULES } from "./advisor-rules";
 import { buildTopicCodebaseEvidence } from "./codebase-evidence";
-import { buildTopicPacket, renderTopicPacket } from "./topic-packet";
 import type { BrainstormReviewRegistry } from "./review-registry";
 import type { TopicCoordinator } from "./topic-coordinator";
-import { BRAINSTORM_REVIEW_RULES } from "./advisor-rules";
-import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "../types";
+import { buildTopicPacket, renderTopicPacket } from "./topic-packet";
 import type { BrainstormTopicReadyInput, BrainstormTopicState } from "./types";
 
 // ─── Configuration ─────────────────────────────────────────────────────
@@ -141,7 +141,7 @@ export class BrainstormRuntime {
 					codebaseRelevance: topic.input.codebase_relevance,
 				},
 			});
-			if (receipt.status !== "accepted") {
+			if (!receipt.accepted) {
 				registry.consume(reviewId);
 				await coordinator.markReviewUnavailable(topic.topicId, "Advisor review not accepted");
 				return { reviewId, topic, status: "review_unavailable" };

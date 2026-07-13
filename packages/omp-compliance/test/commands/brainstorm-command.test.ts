@@ -12,10 +12,10 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { registerBrainstormCommand } from "../../src/commands/brainstorm-command";
 import { TopicCoordinator } from "../../src/brainstorm/topic-coordinator";
 import { TopicStore } from "../../src/brainstorm/topic-store";
-import { validTopicInput, fullCodebaseSnapshot, validReview } from "../brainstorm/fixtures";
+import { registerBrainstormCommand } from "../../src/commands/brainstorm-command";
+import { fullCodebaseSnapshot, validReview, validTopicInput } from "../brainstorm/fixtures";
 
 // ─── Mock ExtensionAPI ───────────────────────────────────────────────
 
@@ -73,11 +73,9 @@ async function makeCoordinatorReviewUnavailable(): Promise<TopicCoordinator> {
 	return coordinator;
 }
 
-async function getCommandHandler(
-	coordinator: TopicCoordinator,
-): Promise<(args: string[]) => Promise<void>> {
+async function getCommandHandler(coordinator: TopicCoordinator): Promise<(args: string[]) => Promise<void>> {
 	const { api, commands } = createMockApi();
-	registerBrainstormCommand(api as never, coordinator);
+	registerBrainstormCommand(api as never, () => coordinator);
 	const cmd = commands.find((c) => c.name === "brainstorm");
 	if (!cmd) throw new Error("brainstorm command not registered");
 	return cmd.handler;
@@ -101,7 +99,9 @@ describe("registerBrainstormCommand", () => {
 		const handler = await getCommandHandler(coordinator);
 		let output = "";
 		const origLog = console.log;
-		console.log = (msg: string) => { output += msg + "\n"; };
+		console.log = (msg: string) => {
+			output += msg + "\n";
+		};
 		try {
 			await handler(["status"]);
 		} finally {
@@ -115,7 +115,9 @@ describe("registerBrainstormCommand", () => {
 		const handler = await getCommandHandler(coordinator);
 		let output = "";
 		const origLog = console.log;
-		console.log = (msg: string) => { output += msg + "\n"; };
+		console.log = (msg: string) => {
+			output += msg + "\n";
+		};
 		try {
 			await handler(["status"]);
 		} finally {
@@ -130,7 +132,9 @@ describe("registerBrainstormCommand", () => {
 		const handler = await getCommandHandler(coordinator);
 		let output = "";
 		const origLog = console.log;
-		console.log = (msg: string) => { output += msg + "\n"; };
+		console.log = (msg: string) => {
+			output += msg + "\n";
+		};
 		try {
 			await handler(["history", current.topicId]);
 		} finally {
@@ -153,7 +157,7 @@ describe("registerBrainstormCommand", () => {
 		const current = coordinator.current()!;
 		const handler = await getCommandHandler(coordinator);
 		await handler(["retry", current.topicId]);
-		expect(coordinator.current()!.status).toBe("drafting");
+		expect(coordinator.current()!.status).toBe("ready_for_advisor_review");
 	});
 
 	it("parks a topic without deleting history", async () => {

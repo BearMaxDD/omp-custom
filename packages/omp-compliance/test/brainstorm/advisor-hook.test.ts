@@ -1,9 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import { createBrainstormAdvisorHook } from "../../src/brainstorm/advisor-hook";
 import { BRAINSTORM_READ_ONLY_TOOL_NAMES, isCodebaseReadOnlyName } from "../../src/brainstorm/advisor-rules";
+import { renderDecisionCard } from "../../src/brainstorm/decision-card";
 import { BrainstormReviewRegistry } from "../../src/brainstorm/review-registry";
 import type { BrainstormReviewEnvelope } from "../../src/brainstorm/review-registry";
-import { renderDecisionCard } from "../../src/brainstorm/decision-card";
 import { BrainstormReviewError } from "../../src/brainstorm/review-schema";
 import type { TopicCoordinator } from "../../src/brainstorm/topic-coordinator";
 import type { BrainstormTopicState } from "../../src/brainstorm/types";
@@ -40,9 +40,7 @@ const validReviewParams: Record<string, unknown> = Object.freeze({
 	input_hash: "sha256:abc",
 	status: "support",
 	summary: "The proposed architecture is sound and well-reasoned.",
-	findings: [
-		{ category: "risk", statement: "Migration complexity is moderate", impact: "medium" },
-	],
+	findings: [{ category: "risk", statement: "Migration complexity is moderate", impact: "medium" }],
 	alternatives: [
 		{
 			name: "Incremental rollout",
@@ -232,7 +230,7 @@ describe("brainstorm_review tool — sendMessage", () => {
 
 		const coordinator = {
 			acceptReview: async () => {
-				throw new Error("Cannot accept review: cannot transition from \"decided\"");
+				throw new Error('Cannot accept review: cannot transition from "decided"');
 			},
 			current: () => null,
 		} as unknown as TopicCoordinator;
@@ -243,7 +241,7 @@ describe("brainstorm_review tool — sendMessage", () => {
 		const tool = result!.additionalTools![0];
 
 		await expect(tool.execute("tool-call-reject", validReviewParams)).rejects.toThrow(
-			"Cannot accept review: cannot transition from \"decided\"",
+			'Cannot accept review: cannot transition from "decided"',
 		);
 
 		expect(messages).toHaveLength(0);

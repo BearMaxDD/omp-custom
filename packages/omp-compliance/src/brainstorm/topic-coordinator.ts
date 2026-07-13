@@ -41,7 +41,7 @@ const TRANSITIONS: Record<BrainstormTopicStatus, BrainstormTopicStatus[]> = {
 	drafting: ["ready_for_advisor_review"],
 	ready_for_advisor_review: ["advisor_reviewing"],
 	advisor_reviewing: ["awaiting_user_decision", "review_unavailable"],
-	review_unavailable: ["awaiting_user_decision", "drafting"],
+	review_unavailable: ["awaiting_user_decision", "drafting", "ready_for_advisor_review"],
 	awaiting_user_decision: ["decided", "parked", "drafting"],
 	decided: [],
 	parked: [],
@@ -117,12 +117,28 @@ export class TopicCoordinator {
 	}
 
 	/**
-	 * Mark a reopened topic as ready for advisor review again.
-	 * Transitions: drafting -> ready_for_advisor_review
+	 * Mark a topic as ready for advisor review again.
+	 *
+	 * Supports two source states:
+	 *   drafting -> ready_for_advisor_review (reopen)
+	 *   review_unavailable -> ready_for_advisor_review (retry)
+	 *
+	 * When transitioning from review_unavailable, clears review/decision
+	 * and increments the attempt counter.
 	 */
 	async markReady(topicId: string): Promise<void> {
-		await this.transition(topicId, "ready_for_advisor_review");
-		await this.store.appendEvent(topicId, "topic_created", { attempt: this.getCurrentOrThrow().attempt });
+		const topic = this.getCurrentOrThrow();
+		const fromStatus = topic.status;
+		if (fromStatus === "review_unavailable") {
+			topic.review = undefined;
+			topic.decision = undefined;
+			topic.attempt += 1;
+			topic.status = "ready_for_advisor_review";
+			await this.store.saveState(topic);
+		} else {
+			await this.transition(topicId, "ready_for_advisor_review");
+		}
+		await this.store.appendEvent(topicId, "topic_created", { attempt: topic.attempt });
 	}
 
 	/**

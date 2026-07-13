@@ -6,7 +6,7 @@ Custom Oh My Pi extensions monorepo.
 
 | Package | Description |
 |---------|-------------|
-| `@bearmaxdd/omp-compliance` | Advisor Compliance Extension — provides compliance checking, task completion tracking, and repository standard enforcement for OMP v16.4.x projects |
+| `@bearmaxdd/omp-compliance` | Advisor Compliance Extension — provides compliance checking, brainstorm topic review, task completion tracking, and repository standard enforcement for OMP v16.4.x projects |
 
 ## Quick Start
 
@@ -47,6 +47,7 @@ See [docs/install-local.md](docs/install-local.md) for three installation method
 | [docs/advisor-compliance-workflow.md](docs/advisor-compliance-workflow.md) | Daily usage guide with command reference |
 | [docs/evidence-schema.md](docs/evidence-schema.md) | Evidence JSONL schema and redaction strategy |
 | [docs/upstream-upgrade-runbook.md](docs/upstream-upgrade-runbook.md) | Procedure for upgrading to new upstream releases |
+| [docs/advisor-brainstorm-workflow.md](docs/advisor-brainstorm-workflow.md) | Brainstorm Topic Review — daily usage guide with command reference |
 
 ## Quality Gates
 
@@ -71,4 +72,9 @@ omp-custom/
       test/      — test suite (behavior, signals, evidence, runtime, etc.)
       dist/      — compiled output
   docs/          — project documentation
+    install-local.md
+    advisor-compliance-workflow.md
+    advisor-brainstorm-workflow.md
+    evidence-schema.md
+    upstream-upgrade-runbook.md
 ```

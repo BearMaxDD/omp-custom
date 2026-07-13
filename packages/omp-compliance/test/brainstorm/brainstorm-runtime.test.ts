@@ -12,13 +12,13 @@ import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BrainstormRuntime } from "../../src/brainstorm/brainstorm-runtime";
+import { BrainstormReviewRegistry } from "../../src/brainstorm/review-registry";
 import { TopicCoordinator } from "../../src/brainstorm/topic-coordinator";
 import { TopicStore } from "../../src/brainstorm/topic-store";
-import { BrainstormReviewRegistry } from "../../src/brainstorm/review-registry";
-import { CollectorRuntime } from "../../src/signals/collector-runtime";
-import { validTopicInput } from "./fixtures";
-import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "../../src/types";
 import type { BrainstormTopicReadyInput } from "../../src/brainstorm/types";
+import { CollectorRuntime } from "../../src/signals/collector-runtime";
+import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "../../src/types";
+import { validTopicInput } from "./fixtures";
 
 // ─── Helpers ───────────────────────────────────────────────────────────
 
@@ -59,7 +59,7 @@ describe("BrainstormRuntime", () => {
 		const harness = createBrainstormRuntimeHarness({
 			requestAdvisorReview: async (request) => {
 				reviewRequests.push(request);
-				return { status: "accepted", reviewId: request.reviewId };
+			return { accepted: true, reviewId: request.reviewId };
 			},
 		});
 
@@ -82,7 +82,7 @@ describe("BrainstormRuntime", () => {
 
 	it("transitions topic to advisor_reviewing on successful submission", async () => {
 		const harness = createBrainstormRuntimeHarness({
-			requestAdvisorReview: async (request) => ({ status: "accepted", reviewId: request.reviewId }),
+			requestAdvisorReview: async (request) => ({ accepted: true, reviewId: request.reviewId }),
 		});
 
 		const result = await harness.runtime.submitTopic(validTopicInput());
@@ -93,7 +93,7 @@ describe("BrainstormRuntime", () => {
 
 	it("registers an envelope in the registry on successful submission", async () => {
 		const harness = createBrainstormRuntimeHarness({
-			requestAdvisorReview: async (request) => ({ status: "accepted", reviewId: request.reviewId }),
+			requestAdvisorReview: async (request) => ({ accepted: true, reviewId: request.reviewId }),
 		});
 
 		const result = await harness.runtime.submitTopic(validTopicInput());
@@ -110,7 +110,7 @@ describe("BrainstormRuntime", () => {
 
 	it("reuses existing topic on duplicate fingerprint", async () => {
 		const harness = createBrainstormRuntimeHarness({
-			requestAdvisorReview: async (request) => ({ status: "accepted", reviewId: request.reviewId }),
+			requestAdvisorReview: async (request) => ({ accepted: true, reviewId: request.reviewId }),
 		});
 
 		const first = await harness.runtime.submitTopic(validTopicInput());
@@ -125,14 +125,12 @@ describe("BrainstormRuntime", () => {
 
 	it("returns conflict when a different topic is mid-review", async () => {
 		const harness = createBrainstormRuntimeHarness({
-			requestAdvisorReview: async (request) => ({ status: "accepted", reviewId: request.reviewId }),
+			requestAdvisorReview: async (request) => ({ accepted: true, reviewId: request.reviewId }),
 		});
 
 		await harness.runtime.submitTopic(validTopicInput({ title: "First topic" }));
 
-		const second = await harness.runtime.submitTopic(
-			validTopicInput({ title: "Different second topic" }),
-		);
+		const second = await harness.runtime.submitTopic(validTopicInput({ title: "Different second topic" }));
 		expect(second.status).toBe("conflict");
 	});
 
@@ -140,7 +138,7 @@ describe("BrainstormRuntime", () => {
 
 	it("transitions to review_unavailable when advisor rejects", async () => {
 		const harness = createBrainstormRuntimeHarness({
-			requestAdvisorReview: async (_request) => ({ status: "rejected" }),
+			requestAdvisorReview: async (_request) => ({ accepted: false }),
 		});
 
 		const result = await harness.runtime.submitTopic(validTopicInput());
@@ -164,7 +162,7 @@ describe("BrainstormRuntime", () => {
 
 	it("includes rules and context in the registered envelope", async () => {
 		const harness = createBrainstormRuntimeHarness({
-			requestAdvisorReview: async (request) => ({ status: "accepted", reviewId: request.reviewId }),
+			requestAdvisorReview: async (request) => ({ accepted: true, reviewId: request.reviewId }),
 		});
 
 		const result = await harness.runtime.submitTopic(validTopicInput());
@@ -189,14 +187,21 @@ describe("BrainstormRuntime", () => {
 		const coordinator = new TopicCoordinator(store);
 		const registry = new BrainstormReviewRegistry();
 		let putCount = 0;
-		const wrapPut = (env: unknown) => { putCount++; registry.put(env as never); };
+		const wrapPut = (env: unknown) => {
+			putCount++;
+			registry.put(env as never);
+		};
 		const collector = new CollectorRuntime();
 		const runtime = new BrainstormRuntime({
-			api: { requestAdvisorReview: async () => ({ reviewId: "r", status: "accepted" }) },
+			api: { requestAdvisorReview: async () => ({ reviewId: "r", accepted: true }) },
 			collector,
 			coordinator,
-			registry: { put: wrapPut, get: (id: string) => registry.get(id), consume: (id: string) => registry.consume(id) } as never,
-			requestAdvisorReview: async () => ({ reviewId: "r", status: "accepted" }),
+			registry: {
+				put: wrapPut,
+				get: (id: string) => registry.get(id),
+				consume: (id: string) => registry.consume(id),
+			} as never,
+			requestAdvisorReview: async () => ({ reviewId: "r", accepted: true }),
 			getAllTools: () => [],
 			sessionId: () => "s1",
 		});

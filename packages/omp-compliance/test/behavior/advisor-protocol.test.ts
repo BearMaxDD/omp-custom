@@ -52,7 +52,7 @@ class MinimalTestAPI implements ExtensionAPI {
 	}
 	appendEntry(): void {}
 	requestAdvisorReview = (_request: AdvisorReviewRequest): Promise<AdvisorReviewReceipt> =>
-		Promise.resolve({ reviewId: "test-review", status: "accepted" });
+		Promise.resolve({ reviewId: "test-review", accepted: true });
 	logger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
 }
 
@@ -108,7 +108,7 @@ function setupRuntimeFixture(): ProtocolFixture {
 	const runtime = new ComplianceRuntime(() => store, collector, api, tmpDir, {
 		sessionId: () => "test-session",
 		registry,
-		requestAdvisorReview: (_req) => Promise.resolve({ reviewId: "test-review", status: "accepted" }),
+		requestAdvisorReview: (_req) => Promise.resolve({ reviewId: "test-review", accepted: true }),
 	});
 	const advisor = new FakeAdvisor();
 

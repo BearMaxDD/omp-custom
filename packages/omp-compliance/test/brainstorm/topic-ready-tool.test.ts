@@ -4,11 +4,8 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import {
-	createTopicReadyTool,
-	validateTopicReadyInput,
-} from "../../src/brainstorm/topic-ready-tool";
 import type { BrainstormRuntime } from "../../src/brainstorm/brainstorm-runtime";
+import { createTopicReadyTool, validateTopicReadyInput } from "../../src/brainstorm/topic-ready-tool";
 
 // ─── validateTopicReadyInput ───────────────────────────────────────────
 

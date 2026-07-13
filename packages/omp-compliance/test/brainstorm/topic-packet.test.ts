@@ -5,8 +5,8 @@
 
 import { describe, expect, it } from "bun:test";
 import { buildTopicPacket, renderTopicPacket } from "../../src/brainstorm/topic-packet";
-import { emptyEvidenceSnapshot, fullCodebaseSnapshot, makeTopicState, validTopicInput } from "./fixtures";
 import type { BrainstormTopicPacket } from "../../src/brainstorm/types";
+import { emptyEvidenceSnapshot, fullCodebaseSnapshot, makeTopicState, validTopicInput } from "./fixtures";
 
 // ─── Packet helpers for edge cases ──────────────────────────────────
 
@@ -48,8 +48,9 @@ function longSummaryPacket(): BrainstormTopicPacket {
 function sensitiveContentPacket(): BrainstormTopicPacket {
 	const topic = makeTopicState(
 		validTopicInput({
-			discussion_summary: "Key: Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\n"
-				+ "Also api_key=sk-abc123def456 and token=xyz789",
+			discussion_summary:
+				"Key: Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\n" +
+				"Also api_key=sk-abc123def456 and token=xyz789",
 		}),
 		fullCodebaseSnapshot(),
 	);
@@ -58,19 +59,13 @@ function sensitiveContentPacket(): BrainstormTopicPacket {
 
 /** Build a packet with no unresolved questions. */
 function noUnresolvedPacket(): BrainstormTopicPacket {
-	const topic = makeTopicState(
-		validTopicInput({ unresolved_questions: undefined }),
-		emptyEvidenceSnapshot(),
-	);
+	const topic = makeTopicState(validTopicInput({ unresolved_questions: undefined }), emptyEvidenceSnapshot());
 	return buildTopicPacket(topic, emptyEvidenceSnapshot());
 }
 
 /** Build a packet with empty codebase references (optional, no refs). */
 function noRefsPacket(): BrainstormTopicPacket {
-	const topic = makeTopicState(
-		validTopicInput({ codebase_relevance: "none" }),
-		emptyEvidenceSnapshot(),
-	);
+	const topic = makeTopicState(validTopicInput({ codebase_relevance: "none" }), emptyEvidenceSnapshot());
 	return buildTopicPacket(topic, emptyEvidenceSnapshot());
 }
 
@@ -111,7 +106,7 @@ describe("buildTopicPacket / renderTopicPacket", () => {
 
 	it("caps title at 200 characters", () => {
 		const rendered = renderTopicPacket(longTitlePacket());
-		const titleLine = rendered.split("\n").find(l => l.startsWith("  title:"));
+		const titleLine = rendered.split("\n").find((l) => l.startsWith("  title:"));
 		expect(titleLine).toBeDefined();
 		const titleValue = titleLine!.replace("  title: ", "");
 		expect(titleValue.length).toBeLessThanOrEqual(200);
@@ -119,7 +114,7 @@ describe("buildTopicPacket / renderTopicPacket", () => {
 
 	it("caps discussion_summary at 8,000 characters", () => {
 		const rendered = renderTopicPacket(longSummaryPacket());
-		const summaryLine = rendered.split("\n").find(l => l.startsWith("  discussion_summary:"));
+		const summaryLine = rendered.split("\n").find((l) => l.startsWith("  discussion_summary:"));
 		expect(summaryLine).toBeDefined();
 		const summaryValue = summaryLine!.replace("  discussion_summary: ", "");
 		expect(summaryValue.length).toBeLessThanOrEqual(8_000);

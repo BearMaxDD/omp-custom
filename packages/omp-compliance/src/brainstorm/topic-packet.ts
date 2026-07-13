@@ -8,10 +8,10 @@
  * @see 2026-07-13-omp-advisor-brainstorm-topic-review-trd.md §5.2
  */
 
+import type { EvidenceSnapshot } from "../signals/types";
 import { buildTopicCodebaseEvidence } from "./codebase-evidence";
 import type { BrainstormTopicPacket } from "./types";
 import type { BrainstormTopicState } from "./types";
-import type { EvidenceSnapshot } from "../signals/types";
 
 // ─── Build Topic Packet ────────────────────────────────────────────
 
@@ -22,10 +22,7 @@ import type { EvidenceSnapshot } from "../signals/types";
  * stable identifiers. No raw source code is embedded — only label/source
  * references to codebase evidence.
  */
-export function buildTopicPacket(
-	topic: BrainstormTopicState,
-	snapshot: EvidenceSnapshot,
-): BrainstormTopicPacket {
+export function buildTopicPacket(topic: BrainstormTopicState, snapshot: EvidenceSnapshot): BrainstormTopicPacket {
 	const evidence = buildTopicCodebaseEvidence(topic.input.codebase_relevance, snapshot);
 
 	return {

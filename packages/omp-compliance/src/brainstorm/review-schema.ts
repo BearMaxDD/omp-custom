@@ -74,9 +74,7 @@ export function parseBrainstormReview(raw: Record<string, unknown>, context: Rev
 		throw new BrainstormReviewError(`Invalid input_hash: must be a sha256: string, got "${String(inputHash)}"`);
 	}
 	if (inputHash !== context.inputHash) {
-		throw new BrainstormReviewError(
-			`input_hash mismatch: expected "${context.inputHash}", got "${inputHash}"`,
-		);
+		throw new BrainstormReviewError(`input_hash mismatch: expected "${context.inputHash}", got "${inputHash}"`);
 	}
 
 	// ── Status ─────────────────────────────────────────────────────

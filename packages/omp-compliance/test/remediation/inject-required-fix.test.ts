@@ -50,7 +50,7 @@ describe("injectRemediation", () => {
 		expect(msg.options?.triggerTurn).toBe(true);
 
 		const payload = msg.message as CustomMessagePayload;
-		expect(payload.type).toBe("compliance_remediation");
+		expect(payload.customType).toBe("compliance_remediation");
 	});
 
 	it("should include task id, contract hash, and findings in the payload", () => {
@@ -75,8 +75,8 @@ describe("injectRemediation", () => {
 		});
 		const msg = ext.sent[0].message;
 		expect(msg).toBeDefined();
-		if (msg && typeof msg === "object" && "data" in msg) {
-			const payload = msg.data as Record<string, unknown>;
+		if (msg && typeof msg === "object" && "details" in msg) {
+			const payload = msg.details as Record<string, unknown>;
 			expect(payload.taskId).toBe("task-xyz");
 			expect(payload.contractHash).toBe("sha256:123");
 			if (Array.isArray(payload.findings)) {

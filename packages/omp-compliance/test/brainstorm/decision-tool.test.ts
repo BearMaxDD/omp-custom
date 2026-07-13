@@ -12,13 +12,10 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-	validateDecisionInput,
-	createDecisionTool,
-} from "../../src/brainstorm/decision-tool";
+import { createDecisionTool, validateDecisionInput } from "../../src/brainstorm/decision-tool";
 import { TopicCoordinator } from "../../src/brainstorm/topic-coordinator";
 import { TopicStore } from "../../src/brainstorm/topic-store";
-import { validTopicInput, fullCodebaseSnapshot, validReview } from "./fixtures";
+import { fullCodebaseSnapshot, validReview, validTopicInput } from "./fixtures";
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 

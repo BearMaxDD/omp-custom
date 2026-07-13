@@ -22,7 +22,9 @@ import type { ExtensionAPI } from "../types";
  *   retry <topic_id>    — retry a review_unavailable topic
  *   park <topic_id>     — park a topic without deleting history
  */
-export function registerBrainstormCommand(api: ExtensionAPI, coordinator: TopicCoordinator): void {
+/** Lazy getter for TopicCoordinator — avoids FS side effects at registration time. */
+type CoordinatorGetter = () => TopicCoordinator;
+export function registerBrainstormCommand(api: ExtensionAPI, getCoordinator: CoordinatorGetter): void {
 	api.registerCommand("brainstorm", {
 		description:
 			"Manage brainstorm topics. " +
@@ -32,34 +34,29 @@ export function registerBrainstormCommand(api: ExtensionAPI, coordinator: TopicC
 			if (args.length === 0) {
 				throw new Error("用法: /brainstorm status | history <topic_id> | retry <topic_id> | park <topic_id>");
 			}
-
+			const coordinator = getCoordinator();
 			const subcommand = args[0].toLowerCase();
-
 			switch (subcommand) {
 				case "status": {
 					handleStatus(coordinator);
 					break;
 				}
-
 				case "history": {
 					await handleHistory(coordinator, args.slice(1));
 					break;
 				}
-
 				case "retry": {
 					await handleRetry(coordinator, args.slice(1));
 					break;
 				}
-
 				case "park": {
 					await handlePark(coordinator, args.slice(1));
 					break;
 				}
-
 				default:
 					throw new Error(
 						`未知子命令: ${subcommand}. ` +
-						"用法: /brainstorm status | history <topic_id> | retry <topic_id> | park <topic_id>",
+							"用法: /brainstorm status | history <topic_id> | retry <topic_id> | park <topic_id>",
 					);
 			}
 		},
@@ -135,40 +132,16 @@ async function handleRetry(coordinator: TopicCoordinator, args: string[]): Promi
 	}
 
 	if (topic.status !== "review_unavailable") {
-		throw new Error(
-			`无法重试: 专题状态为 "${topic.status}"，仅 review_unavailable 可重试。`,
-		);
+		throw new Error(`无法重试: 专题状态为 "${topic.status}"，仅 review_unavailable 可重试。`);
 	}
 
-	// Chain through two transitions:
-	//   review_unavailable -> awaiting_user_decision (acceptReview)
-	//   awaiting_user_decision -> drafting (recordDecision reopen)
-	// acceptReview requires a BrainstormReview; use a placeholder if none exists
 	if (!topic.review) {
-		await coordinator.acceptReview({
-			schema_version: 1,
-			topic_id: topicId,
-			input_hash: topic.inputHash,
-			status: "insufficient_evidence",
-			summary: "重试占位 review",
-			findings: [],
-			alternatives: [],
-			recommendation: "重试占位",
-			confidence: "low",
-		});
-	} else {
-		await coordinator.acceptReview(topic.review);
+		console.log(`专题 "${topicId}" 之前无 review，直接重试。`);
 	}
 
-	// Now transition to drafting via reopen (increments attempt)
-	await coordinator.recordDecision(topicId, {
-		topic_id: topicId,
-		decision: "reopen",
-		rationale: "用户请求重试 Advisor 评审",
-		ts: new Date().toISOString(),
-	});
+	await coordinator.markReady(topicId);
 
-	console.log(`专题 "${topicId}" 已重置为 drafting，可重新提交。`);
+	console.log(`专题 "${topicId}" 已重置为 ready_for_advisor_review，可重新提交评审。`);
 }
 
 async function handlePark(coordinator: TopicCoordinator, args: string[]): Promise<void> {
@@ -184,9 +157,7 @@ async function handlePark(coordinator: TopicCoordinator, args: string[]): Promis
 	}
 
 	if (topic.status !== "awaiting_user_decision") {
-		throw new Error(
-			`无法暂存: 专题状态为 "${topic.status}"，仅等待用户决策时方可暂存。`,
-		);
+		throw new Error(`无法暂存: 专题状态为 "${topic.status}"，仅等待用户决策时方可暂存。`);
 	}
 
 	await coordinator.recordDecision(topicId, {

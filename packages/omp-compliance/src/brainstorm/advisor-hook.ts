@@ -19,10 +19,10 @@
 
 import type { AdvisorBeforeRunEvent, AdvisorBeforeRunResult, AgentTool } from "../types";
 import { BRAINSTORM_READ_ONLY_TOOL_NAMES } from "./advisor-rules";
+import { renderDecisionCard } from "./decision-card";
 import type { BrainstormReviewRegistry } from "./review-registry";
 import type { BrainstormReviewEnvelope } from "./review-registry";
 import { parseBrainstormReview } from "./review-schema";
-import { renderDecisionCard } from "./decision-card";
 import type { TopicCoordinator } from "./topic-coordinator";
 
 // ─── Public API ─────────────────────────────────────────────────────
@@ -34,7 +34,10 @@ import type { TopicCoordinator } from "./topic-coordinator";
 export function createBrainstormAdvisorHook(
 	registry: BrainstormReviewRegistry,
 	coordinator: TopicCoordinator,
-	sendMessage: (msg: { customType: string; content: string; display: boolean; attribution: string; details?: unknown }, options?: { deliverAs?: string; triggerTurn?: boolean }) => void,
+	sendMessage: (
+		msg: { customType: string; content: string; display: boolean; attribution: string; details?: unknown },
+		options?: { deliverAs?: string; triggerTurn?: boolean },
+	) => void,
 ): (event: AdvisorBeforeRunEvent) => AdvisorBeforeRunResult | undefined {
 	return (event: AdvisorBeforeRunEvent): AdvisorBeforeRunResult | undefined => {
 		if (event.trigger !== "brainstorm_review") {
@@ -74,7 +77,10 @@ export function createBrainstormReviewTool(
 	envelope: BrainstormReviewEnvelope,
 	coordinator: TopicCoordinator,
 	registry: BrainstormReviewRegistry,
-	sendMessage: (msg: { customType: string; content: string; display: boolean; attribution: string; details?: unknown }, options?: { deliverAs?: string; triggerTurn?: boolean }) => void,
+	sendMessage: (
+		msg: { customType: string; content: string; display: boolean; attribution: string; details?: unknown },
+		options?: { deliverAs?: string; triggerTurn?: boolean },
+	) => void,
 ): AgentTool {
 	return {
 		name: "brainstorm_review",

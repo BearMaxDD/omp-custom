@@ -43,7 +43,7 @@ class TestAPI implements ExtensionAPI {
 	registerTool(): void {}
 	registerCommand(): void {}
 	requestAdvisorReview = (_request: AdvisorReviewRequest): Promise<AdvisorReviewReceipt> =>
-		Promise.resolve({ reviewId: "test-review", status: "accepted" });
+		Promise.resolve({ reviewId: "test-review", accepted: true });
 	on(): void {}
 
 	sendMessage(message: unknown, _options?: { triggerTurn?: boolean; deliverAs?: string }): void {
@@ -114,7 +114,7 @@ function setupFixture(tddContent: string = DEFAULT_TDD_MD): FixtureSetup {
 		sessionId: () => "test-session",
 		registry,
 		requestAdvisorReview: (_req: AdvisorReviewRequest) =>
-			Promise.resolve<AdvisorReviewReceipt>({ reviewId: "test-review", status: "accepted" }),
+			Promise.resolve<AdvisorReviewReceipt>({ reviewId: "test-review", accepted: true }),
 	});
 	const fakeAdvisor = new FakeAdvisor();
 	const fakeTask = new FakeTaskTool(collector.collector);
@@ -128,11 +128,11 @@ function expectRemediationInjection(sentMessages: unknown[], fixText: string): v
 	const remediationMsg = sentMessages.find((m) => {
 		if (!m || typeof m !== "object") return false;
 		const msg = m as Record<string, unknown>;
-		return msg.type === "compliance_remediation";
+		return msg.customType === "compliance_remediation";
 	});
 	expect(remediationMsg).toBeDefined();
 
-	const data = (remediationMsg as Record<string, unknown>).data;
+	const data = (remediationMsg as Record<string, unknown>).details;
 	expect(data).toBeDefined();
 	expect(typeof data === "object" || data === null).toBe(true);
 
@@ -197,8 +197,8 @@ describe("End-to-end compliance flow — remediate scenarios", () => {
 		const hasFix = api.sentMessages.some((m) => {
 			if (!m || typeof m !== "object") return false;
 			const msg = m as Record<string, unknown>;
-			if (msg.type !== "compliance_remediation") return false;
-			const data = msg.data;
+			if (msg.customType !== "compliance_remediation") return false;
+			const data = msg.details;
 			if (!data || typeof data !== "object") return false;
 			const findings = (data as Record<string, unknown>).findings;
 			return (
@@ -288,8 +288,8 @@ describe("End-to-end compliance flow — remediate scenarios", () => {
 		const hasScopeRef = api.sentMessages.some((m) => {
 			if (!m || typeof m !== "object") return false;
 			const msg = m as Record<string, unknown>;
-			if (msg.type !== "compliance_remediation") return false;
-			const data = msg.data;
+			if (msg.customType !== "compliance_remediation") return false;
+			const data = msg.details;
 			if (!data || typeof data !== "object") return false;
 			const findings = (data as Record<string, unknown>).findings as Array<Record<string, unknown>> | undefined;
 			if (!Array.isArray(findings)) return false;

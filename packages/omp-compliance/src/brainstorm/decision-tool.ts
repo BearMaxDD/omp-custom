@@ -13,8 +13,8 @@
  *   user_confirmed: boolean (required, must be true)
  */
 
-import type { TopicCoordinator } from "./topic-coordinator";
 import type { ToolDefinition } from "../types";
+import type { TopicCoordinator } from "./topic-coordinator";
 
 // ─── Validation Types ────────────────────────────────────────────────
 
@@ -57,7 +57,10 @@ export function validateDecisionInput(raw: Record<string, unknown>): DecisionVal
 	// selected_alternative — required when decision is "accept_alternative"
 	if (raw.decision === "accept_alternative") {
 		if (typeof raw.selected_alternative !== "string" || raw.selected_alternative.length === 0) {
-			errors.push({ field: "selected_alternative", message: "selected_alternative is required when decision is accept_alternative" });
+			errors.push({
+				field: "selected_alternative",
+				message: "selected_alternative is required when decision is accept_alternative",
+			});
 		}
 	}
 

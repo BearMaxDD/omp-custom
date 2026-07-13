@@ -9,9 +9,9 @@
  * Input schema matches BrainstormTopicReadyInput with strict validation.
  */
 
+import type { ToolDefinition } from "../types";
 import type { BrainstormRuntime } from "./brainstorm-runtime";
 import type { BrainstormTopicReadyInput } from "./types";
-import type { ToolDefinition } from "../types";
 
 // ─── Validation ────────────────────────────────────────────────────────
 
@@ -77,10 +77,7 @@ export function validateTopicReadyInput(raw: Record<string, unknown>): TopicRead
 
 	// unresolved_questions — optional, array of strings, max 30 items
 	if (raw.unresolved_questions !== undefined) {
-		if (
-			!Array.isArray(raw.unresolved_questions) ||
-			!raw.unresolved_questions.every((i) => typeof i === "string")
-		) {
+		if (!Array.isArray(raw.unresolved_questions) || !raw.unresolved_questions.every((i) => typeof i === "string")) {
 			errors.push({ field: "unresolved_questions", message: "unresolved_questions must be an array of strings" });
 		} else if (raw.unresolved_questions.length > 30) {
 			errors.push({
@@ -174,14 +171,22 @@ export function createTopicReadyTool(deps: TopicReadyToolDependencies): ToolDefi
 					description: "Open questions for the advisor.",
 				},
 			},
-			required: ["topic_kind", "title", "candidate_decision", "constraints", "success_criteria", "codebase_relevance", "discussion_summary"],
+			required: [
+				"topic_kind",
+				"title",
+				"candidate_decision",
+				"constraints",
+				"success_criteria",
+				"codebase_relevance",
+				"discussion_summary",
+			],
 		},
 		handler: async (params: Record<string, unknown>) => {
 			const errors = validateTopicReadyInput(params);
 			if (errors.length > 0) {
 				return { ok: false, errors };
 			}
- 
+
 			try {
 				const input = params as unknown as BrainstormTopicReadyInput;
 				const result = await deps.runtime.submitTopic(input);

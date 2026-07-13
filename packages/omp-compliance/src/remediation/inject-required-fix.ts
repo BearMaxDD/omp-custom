@@ -54,8 +54,8 @@ export function injectRemediation(api: ExtensionAPI, payload: RemediationPayload
 	}
 
 	const message: CustomMessagePayload<RemediationPayload> = {
-		type: "compliance_remediation",
-		data: payload,
+		customType: "compliance_remediation",
+		details: payload,
 	};
 
 	api.sendMessage(message, {

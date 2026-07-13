@@ -11,7 +11,7 @@
 
 import { describe, expect, it } from "bun:test";
 import { renderDecisionCard } from "../../src/brainstorm/decision-card";
-import { makeTopicState, validTopicInput, fullCodebaseSnapshot, validReview } from "./fixtures";
+import { fullCodebaseSnapshot, makeTopicState, validReview, validTopicInput } from "./fixtures";
 
 // ─── renderDecisionCard ──────────────────────────────────────────────
 
@@ -32,17 +32,12 @@ describe("renderDecisionCard", () => {
 	});
 
 	it("includes the candidate decision in the card", () => {
-		const topic = makeTopicState(
-			validTopicInput({ candidate_decision: "采用分层架构" }),
-			fullCodebaseSnapshot(),
-		);
+		const topic = makeTopicState(validTopicInput({ candidate_decision: "采用分层架构" }), fullCodebaseSnapshot());
 		const reviewed = {
 			...topic,
 			status: "awaiting_user_decision" as const,
 			review: validReview(topic, {
-				findings: [
-					{ category: "risk", statement: "分层增加延迟", impact: "medium" },
-				],
+				findings: [{ category: "risk", statement: "分层增加延迟", impact: "medium" }],
 				alternatives: [
 					{ name: "扁平架构", description: "减少层次", tradeoffs: ["耦合增加"], when_to_choose: "团队小" },
 				],

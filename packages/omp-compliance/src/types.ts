@@ -36,8 +36,11 @@ export interface ToolCallEventResult {
 }
 
 export interface CustomMessagePayload<T = unknown> {
-	type: string;
-	data?: T;
+	customType: string;
+	content: string;
+	display: boolean;
+	attribution: string;
+	details?: T;
 }
 
 export interface ExtensionAPI {
@@ -67,6 +70,7 @@ export interface ExtensionAPI {
 		error: (msg: string) => void;
 		debug: (msg: string) => void;
 	};
+	getAllTools: () => string[];
 }
 
 /**
@@ -144,6 +148,6 @@ export interface AdvisorReviewRequest {
  */
 export interface AdvisorReviewReceipt {
 	readonly reviewId: string;
-	readonly status: "accepted" | "rejected";
+	readonly accepted: boolean;
 	readonly reason?: string;
 }

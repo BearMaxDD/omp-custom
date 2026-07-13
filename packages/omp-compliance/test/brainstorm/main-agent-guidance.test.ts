@@ -4,22 +4,12 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import {
-	appendBrainstormGuidance,
-	renderMainAgentBrainstormGuidance,
-} from "../../src/brainstorm/main-agent-guidance";
+import { appendBrainstormGuidance, renderMainAgentBrainstormGuidance } from "../../src/brainstorm/main-agent-guidance";
 
 describe("renderMainAgentBrainstormGuidance", () => {
 	it("lists all topic kinds in the guidance text", () => {
 		const guidance = renderMainAgentBrainstormGuidance();
-		for (const kind of [
-			"architecture",
-			"scope",
-			"contract",
-			"migration",
-			"risk",
-			"implementation_route",
-		]) {
+		for (const kind of ["architecture", "scope", "contract", "migration", "risk", "implementation_route"]) {
 			expect(guidance).toContain(kind);
 		}
 	});

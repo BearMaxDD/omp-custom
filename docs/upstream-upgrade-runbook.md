@@ -121,6 +121,7 @@ Verify the extension's standalone test suites:
 | Status | `test/status/*.test.ts` | Status view model, history reader |
 | Installation smoke | `test/installation-smoke.test.ts` | Module import and activation |
 | Extension loading | `test/extension-loading.test.ts` | Extension export contract |
+| Brainstorm | `test/brainstorm/*.test.ts` | Topic lifecycle, advisor hook, fingerprint, decision card |
 
 ### Step 6: Verify Extension Disabled Behavior
 
@@ -207,6 +208,7 @@ git worktree remove ../omp-upgrade-checkout
 - [ ] Extension unit tests pass (behavior fixtures)
 - [ ] Extension disabled behavior verified
 - [ ] Pass, remediate, stalled semantics verified
+- [ ] Brainstorm tests pass (topic lifecycle, advisor hook, fingerprint, decision card)
 - [ ] Bridge patches audited (ComplianceVerdictTool, buildAdvisorRuntime only)
 - [ ] Superseded bridge patches deleted with regression tests
 - [ ] Branch rebased or merged

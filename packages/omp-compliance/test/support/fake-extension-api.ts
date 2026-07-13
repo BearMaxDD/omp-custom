@@ -1,4 +1,12 @@
-import type { AdvisorBeforeRunEvent, AdvisorBeforeRunResult, AdvisorReviewReceipt, AdvisorReviewRequest, CustomMessagePayload, ExtensionAPI, ToolDefinition } from "../../src/types";
+import type {
+	AdvisorBeforeRunEvent,
+	AdvisorBeforeRunResult,
+	AdvisorReviewReceipt,
+	AdvisorReviewRequest,
+	CustomMessagePayload,
+	ExtensionAPI,
+	ToolDefinition,
+} from "../../src/types";
 
 /**
  * A minimal fake implementation of ExtensionAPI for testing.
@@ -12,7 +20,7 @@ export class FakeExtensionAPI {
 	public readonly appendedEntries: Array<{ type: string; data?: unknown }> = [];
 	public requestAdvisorReview: (request: AdvisorReviewRequest) => Promise<AdvisorReviewReceipt> = async (
 		_request: AdvisorReviewRequest,
-	) => ({ reviewId: _request.reviewId, status: "accepted" });
+	) => ({ reviewId: _request.reviewId, accepted: true });
 
 	registerTool<TParams = unknown, TDetails = unknown>(tool: ToolDefinition<TParams, TDetails>): void {
 		this.tools.push(tool.name);
@@ -65,9 +73,7 @@ export class FakeExtensionAPI {
 	}
 
 	/** Simulate an advisor_before_run event and return collected results. */
-	async fireAdvisorBeforeRun(
-		event: Partial<AdvisorBeforeRunEvent>,
-	): Promise<AdvisorBeforeRunResult | undefined> {
+	async fireAdvisorBeforeRun(event: Partial<AdvisorBeforeRunEvent>): Promise<AdvisorBeforeRunResult | undefined> {
 		const handlers = this.eventHandlers.get("advisor_before_run") ?? [];
 		const fullEvent: AdvisorBeforeRunEvent = {
 			type: "advisor_before_run",
