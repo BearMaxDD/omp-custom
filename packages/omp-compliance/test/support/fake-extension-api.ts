@@ -14,6 +14,7 @@ import type {
  */
 export class FakeExtensionAPI {
 	public readonly tools: string[] = [];
+	public readonly toolDefinitions: ToolDefinition[] = [];
 	public readonly commands: string[] = [];
 	public readonly eventHandlers: Map<string, Array<(event: unknown) => unknown>> = new Map();
 	public readonly sentMessages: CustomMessagePayload[] = [];
@@ -24,6 +25,7 @@ export class FakeExtensionAPI {
 
 	registerTool<TParams = unknown, TDetails = unknown>(tool: ToolDefinition<TParams, TDetails>): void {
 		this.tools.push(tool.name);
+		this.toolDefinitions.push(tool as ToolDefinition);
 	}
 
 	registerCommand(

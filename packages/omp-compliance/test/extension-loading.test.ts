@@ -35,4 +35,14 @@ describe("omp-compliance extension packaging", () => {
 		expect(events).toContain("turn_end");
 		expect(events).toContain("agent_end");
 	});
+
+	it("registers an object parameter schema for every model-facing tool", async () => {
+		const api = new FakeExtensionAPI();
+		const activate = (await import("../src/extension")).default;
+		activate(api.toAPI());
+
+		for (const tool of api.toolDefinitions) {
+			expect(tool.parameters, `${tool.name} must declare parameters`).toMatchObject({ type: "object" });
+		}
+	});
 });

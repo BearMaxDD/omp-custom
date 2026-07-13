@@ -86,6 +86,25 @@ export function registerComplianceCompleteTool(api: ExtensionAPI, runtime: Compl
 			"Notify the compliance system that a task has been completed. " +
 			"Requires a summary of what was done. " +
 			"Returns advisor_reviewing status — the Advisor will review and issue a verdict.",
+		parameters: {
+			type: "object",
+			properties: {
+				summary: {
+					type: "string",
+					minLength: 1,
+					maxLength: 4_000,
+					description: "Summary of the completed work.",
+				},
+				claimed_verification: {
+					type: "array",
+					items: { type: "string", maxLength: 500 },
+					maxItems: 30,
+					description: "Verification commands or checks claimed by the main agent.",
+				},
+			},
+			required: ["summary"],
+			additionalProperties: false,
+		},
 		handler: async (params: Record<string, unknown>) => {
 			const errors = validateCompletionParams(params);
 			if (errors.length > 0) {
