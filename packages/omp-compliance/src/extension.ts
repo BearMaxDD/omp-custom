@@ -32,6 +32,7 @@ import { createRepeatAdviseDetector } from "./supervision/detectors/repeat-advis
 import { createSlowReviewDetector } from "./supervision/detectors/slow-review-detector";
 import { StatusCollector } from "./status/collector";
 import { renderCLIStatus } from "./status/cli-renderer";
+import { renderTUIStatus } from "./status/tui-renderer";
 
 /** Default compliance store directory within the repo. */
 const DEFAULT_COMPLIANCE_DIR = ".omp/compliance";
@@ -139,6 +140,16 @@ export default function activate(api: ExtensionAPI): void {
 		await triggerRegistry.startAll().catch((err: unknown) => {
 			api.logger.error(`[triggers] startAll failed: ${String(err)}`);
 		});
+
+		// ── TUI status bar ──
+		const ctx = context as unknown as { ui?: { setStatus: (s: string) => void; setFooter: (s: string) => void } };
+		const ui = ctx.ui;
+		if (!ui) return;
+		const timer = setInterval(() => {
+			const { status, footer } = renderTUIStatus(statusCollector.snapshot());
+			try { ui.setStatus(status); if (footer) ui.setFooter(footer); } catch { /* harness may close session */ }
+		}, 2000);
+		api.on("session_stop", () => clearInterval(timer));
 	});
 	api.on("session_switch", (_event: unknown, context: ExtensionContext) => {
 		sessionId = context.sessionManager.getSessionId();
