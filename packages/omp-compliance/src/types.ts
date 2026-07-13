@@ -134,15 +134,15 @@ export interface AdvisorBeforeRunResult {
  * Request payload for triggering an Advisor compliance review run.
  */
 export interface AdvisorReviewRequest {
-	readonly trigger: AdvisorRunTrigger;
-	readonly sessionId: string;
-	readonly taskId: string;
-	readonly contractHash: `sha256:${string}`;
-	readonly attempt: number;
-	readonly context: string;
-	readonly rules: string;
 	readonly reviewId: string;
-	readonly metadata: Record<string, unknown>;
+	readonly trigger?: AdvisorRunTrigger;
+	readonly sessionId?: string;
+	readonly taskId?: string;
+	readonly contractHash?: `sha256:${string}`;
+	readonly attempt?: number;
+	readonly context?: string;
+	readonly rules?: string;
+	readonly metadata?: Record<string, unknown>;
 }
 
 /**
