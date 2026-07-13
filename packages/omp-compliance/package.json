@@ -14,6 +14,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "bundle:omp": "bun build src/extension.ts --target=bun --format=esm --banner='// @ts-nocheck' --outfile=dist/extension.bundle.js",
     "check": "cd ../.. && biome check packages/omp-compliance/src packages/omp-compliance/test",
     "test": "bun test --preload ./test/setup.ts"
   },
