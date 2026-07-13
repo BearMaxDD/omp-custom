@@ -37,9 +37,9 @@ export interface ToolCallEventResult {
 
 export interface CustomMessagePayload<T = unknown> {
 	customType: string;
-	content?: string;
-	display?: boolean;
-	attribution?: "agent" | "user";
+	content: string;
+	display: boolean;
+	attribution: "agent" | "user";
 	details?: T;
 }
 

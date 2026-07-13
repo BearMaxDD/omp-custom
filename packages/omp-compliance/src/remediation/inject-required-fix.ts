@@ -55,15 +55,13 @@ export function injectRemediation(api: ExtensionAPI, payload: RemediationPayload
 
 	const message: CustomMessagePayload<RemediationPayload> = {
 		customType: "compliance_remediation",
+		content: "Compliance fix required",
+		display: true,
+		attribution: "agent",
 		details: payload,
 	};
 
-	api.sendMessage({
-		...message,
-		content: message.content ?? "Compliance fix required",
-		display: true,
-		attribution: "agent" as const,
-	}, {
+	api.sendMessage(message, {
 		deliverAs: "nextTurn",
 		triggerTurn: true,
 	});

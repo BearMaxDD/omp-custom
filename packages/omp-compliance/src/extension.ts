@@ -108,7 +108,7 @@ export default function activate(api: ExtensionAPI): void {
 				customType: msg.customType,
 				content: msg.content,
 				display: msg.display,
-				attribution: msg.attribution as "agent" | "user" | undefined,
+				attribution: msg.attribution as "agent" | "user",
 				details: msg.details,
 			},
 			{
@@ -159,7 +159,7 @@ export default function activate(api: ExtensionAPI): void {
 					coordinator: getCoordinator(),
 					registry: brainstormRegistry,
 					requestAdvisorReview: (request) => api.requestAdvisorReview(request),
-					getAllTools: () => [] as readonly string[],
+					getAllTools: () => api.getAllTools() as readonly string[],
 					sessionId: () => sessionId ?? "unknown",
 				});
 			},
