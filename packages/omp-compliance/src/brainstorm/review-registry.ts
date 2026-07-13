@@ -16,6 +16,7 @@ export interface BrainstormReviewEnvelope {
 	readonly inputHash: `sha256:${string}`;
 	readonly context: string;
 	readonly rules: string;
+	readonly requestedToolNames: readonly string[];
 	readonly createdAt: string;
 }
 

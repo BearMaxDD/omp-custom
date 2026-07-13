@@ -35,7 +35,7 @@ export function createBrainstormAdvisorHook(
 	registry: BrainstormReviewRegistry,
 	coordinator: TopicCoordinator,
 	sendMessage: (
-		msg: { customType: string; content: string; display: boolean; attribution: string; details?: unknown },
+		msg: { customType: string; content: string; display: boolean; attribution: "agent" | "user"; details?: unknown },
 		options?: { deliverAs?: string; triggerTurn?: boolean },
 	) => void,
 ): (event: AdvisorBeforeRunEvent) => AdvisorBeforeRunResult | undefined {
@@ -54,7 +54,7 @@ export function createBrainstormAdvisorHook(
 		return {
 			additionalSystemContext: Object.freeze([envelope.rules, envelope.context]),
 			additionalTools: Object.freeze([createBrainstormReviewTool(envelope, coordinator, registry, sendMessage)]),
-			additionalToolNames: Object.freeze([...BRAINSTORM_READ_ONLY_TOOL_NAMES]),
+			additionalToolNames: Object.freeze([...envelope.requestedToolNames]),
 			metadata: Object.freeze({ brainstormReviewId: envelope.reviewId }),
 		};
 	};
@@ -78,7 +78,7 @@ export function createBrainstormReviewTool(
 	coordinator: TopicCoordinator,
 	registry: BrainstormReviewRegistry,
 	sendMessage: (
-		msg: { customType: string; content: string; display: boolean; attribution: string; details?: unknown },
+		msg: { customType: string; content: string; display: boolean; attribution: "agent" | "user"; details?: unknown },
 		options?: { deliverAs?: string; triggerTurn?: boolean },
 	) => void,
 ): AgentTool {

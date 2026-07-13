@@ -16,6 +16,7 @@ function makeEnvelope(overrides: Partial<BrainstormReviewEnvelope> = {}): Brains
 		inputHash: "sha256:abc" as const,
 		context: "test-brainstorm-context",
 		rules: "test-brainstorm-rules",
+		requestedToolNames: [],
 		createdAt: "2026-01-01T00:00:00.000Z",
 		...overrides,
 	});

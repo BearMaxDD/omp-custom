@@ -121,6 +121,7 @@ export class BrainstormRuntime {
 			inputHash: topic.inputHash,
 			context,
 			rules,
+			requestedToolNames: Object.freeze([...toolNames]),
 			createdAt: new Date().toISOString(),
 		};
 
