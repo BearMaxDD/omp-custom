@@ -81,81 +81,89 @@ export class BrainstormRuntime {
 	 * a new review. Conflicts return the active topic id without change.
 	 */
 	async submitTopic(input: BrainstormTopicReadyInput): Promise<BrainstormSubmitTopicResult> {
-		const { coordinator, registry, collector } = this.config;
-
-		// 1. Collect tool event evidence snapshot
-		const snapshot = collector.collector.snapshot();
-
-		// 2. Delegate to coordinator for dedup and conflict detection
-		const submitResult = await coordinator.submit(input, snapshot);
-
-		if (submitResult.kind === "reused") {
-			return { topic: submitResult.topic, status: "reused" };
-		}
-
-		if (submitResult.kind === "conflict") {
-			const currentTopic = coordinator.current();
-			if (currentTopic && currentTopic.topicId === submitResult.activeTopicId) {
-				return { topic: currentTopic, status: "conflict" };
-			}
-			return { topic: { topicId: submitResult.activeTopicId } as BrainstormTopicState, status: "conflict" };
-		}
-
-		// submitResult.kind === "created"
-		const topic = submitResult.topic;
-
-		// 3. Build codebase evidence, topic packet, rules, and envelope
-		const codebaseEvidence = buildTopicCodebaseEvidence(topic.input.codebase_relevance, snapshot);
-		const packet = buildTopicPacket(topic, snapshot);
-		const context = renderTopicPacket(packet);
-		const toolNames = codebaseEvidence.requestedToolNames;
-		const rules =
-			toolNames.length > 0
-				? `${BRAINSTORM_REVIEW_RULES}\n\nAvailable codebase read-only tools: ${toolNames.join(", ")}`
-				: BRAINSTORM_REVIEW_RULES;
-
-		const reviewId = `br-${randomUUID()}`;
-		const envelope = {
-			reviewId,
-			topicId: topic.topicId,
-			inputHash: topic.inputHash,
-			context,
-			rules,
-			createdAt: new Date().toISOString(),
-		};
-
-		// 4. Register envelope
-		registry.put(envelope);
-
-		await coordinator.markReviewRequested(topic.topicId, reviewId);
-
-		// 6. Request advisor review via the injected adapter
 		try {
-			const receipt = await this.config.requestAdvisorReview({
-				trigger: "brainstorm_review",
-				sessionId: this.config.sessionId(),
-				taskId: `brainstorm-${topic.topicId}`,
-				contractHash: topic.inputHash,
-				attempt: topic.attempt,
+			const { coordinator, registry, collector } = this.config;
+
+			// 1. Collect tool event evidence snapshot
+			const snapshot = collector.collector.snapshot();
+
+			// 2. Delegate to coordinator for dedup and conflict detection
+			const submitResult = await coordinator.submit(input, snapshot);
+
+			if (submitResult.kind === "reused") {
+				return { topic: submitResult.topic, status: "reused" };
+			}
+
+			if (submitResult.kind === "conflict") {
+				const currentTopic = coordinator.current();
+				if (currentTopic && currentTopic.topicId === submitResult.activeTopicId) {
+					return { topic: currentTopic, status: "conflict" };
+				}
+				return { topic: { topicId: submitResult.activeTopicId } as BrainstormTopicState, status: "conflict" };
+			}
+
+			// submitResult.kind === "created"
+			const topic = submitResult.topic;
+
+			// 3. Build codebase evidence, topic packet, rules, and envelope
+			const codebaseEvidence = buildTopicCodebaseEvidence(topic.input.codebase_relevance, snapshot);
+			const packet = buildTopicPacket(topic, snapshot);
+			const context = renderTopicPacket(packet);
+			const toolNames = codebaseEvidence.requestedToolNames;
+			const rules =
+				toolNames.length > 0
+					? `${BRAINSTORM_REVIEW_RULES}\n\nAvailable codebase read-only tools: ${toolNames.join(", ")}`
+					: BRAINSTORM_REVIEW_RULES;
+
+			const reviewId = `br-${randomUUID()}`;
+			const envelope = {
+				reviewId,
+				topicId: topic.topicId,
+				inputHash: topic.inputHash,
 				context,
 				rules,
-				reviewId,
-				metadata: {
-					topicId: topic.topicId,
-					inputHash: topic.inputHash,
-					codebaseRelevance: topic.input.codebase_relevance,
-				},
-			});
+				createdAt: new Date().toISOString(),
+			};
 
-			if (receipt.status !== "accepted") {
-				await coordinator.markReviewUnavailable(topic.topicId, "Advisor review not accepted");
+			// 4. Register envelope
+			registry.put(envelope);
+
+			await coordinator.markReviewRequested(topic.topicId, reviewId);
+
+			// 5. Request advisor review via the injected adapter
+			try {
+				const receipt = await this.config.requestAdvisorReview({
+					trigger: "brainstorm_review",
+					sessionId: this.config.sessionId(),
+					taskId: `brainstorm-${topic.topicId}`,
+					contractHash: topic.inputHash,
+					attempt: topic.attempt,
+					context,
+					rules,
+					reviewId,
+					metadata: {
+						topicId: topic.topicId,
+						inputHash: topic.inputHash,
+						codebaseRelevance: topic.input.codebase_relevance,
+					},
+				});
+
+				if (receipt.status !== "accepted") {
+					await coordinator.markReviewUnavailable(topic.topicId, "Advisor review not accepted");
+					return { reviewId, topic, status: "review_unavailable" };
+				}
+
+				return { reviewId, topic, status: "advisor_reviewing" };
+			} catch {
+				await coordinator.markReviewUnavailable(topic.topicId, "Advisor review request failed");
 				return { reviewId, topic, status: "review_unavailable" };
 			}
-
-			return { reviewId, topic, status: "advisor_reviewing" };
-		} catch {
-			await coordinator.markReviewUnavailable(topic.topicId, "Advisor review request failed");
-			return { reviewId, topic, status: "review_unavailable" };
+		} catch (error) {
+			await this.config.coordinator.markReviewUnavailable(
+				"unknown",
+				`submitTopic failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return { topic: {} as BrainstormTopicState, status: "review_unavailable" };
 		}
 	}
 }

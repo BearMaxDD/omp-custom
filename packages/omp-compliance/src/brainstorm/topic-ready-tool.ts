@@ -174,7 +174,7 @@ export function createTopicReadyTool(deps: TopicReadyToolDependencies): ToolDefi
 					description: "Open questions for the advisor.",
 				},
 			},
-			required: ["topic_kind", "title", "candidate_decision"],
+			required: ["topic_kind", "title", "candidate_decision", "constraints", "success_criteria", "codebase_relevance", "discussion_summary"],
 		},
 		handler: async (params: Record<string, unknown>) => {
 			const errors = validateTopicReadyInput(params);
