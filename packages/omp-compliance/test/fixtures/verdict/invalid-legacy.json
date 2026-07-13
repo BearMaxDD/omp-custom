@@ -1,0 +1,6 @@
+{
+  "task": "task-9",
+  "hash": "sha256:a00000000000000000000000000000000000000000000000000000000000000",
+  "action": "remediate",
+  "requiredFix": "execute the loaded extension through AgentSession"
+}

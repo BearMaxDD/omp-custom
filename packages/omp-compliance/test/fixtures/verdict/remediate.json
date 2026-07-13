@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "task_id": "task-9",
+  "contract_hash": "sha256:a00000000000000000000000000000000000000000000000000000000000000",
+  "attempt": 1,
+  "status": "remediate",
+  "findings": [
+    {
+      "id": "F-1",
+      "reason": "integration path missing",
+      "required_fix": "execute the loaded extension through AgentSession"
+    }
+  ]
+}

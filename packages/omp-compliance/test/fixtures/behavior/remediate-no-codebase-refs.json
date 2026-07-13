@@ -1,0 +1,26 @@
+{
+	"description": "Advisor remediate verdict: subagent delegation exists but lacked codebase references in results",
+	"scenario": "子代理无 codebase 引用",
+	"verdictTemplate": {
+		"schema_version": 1,
+		"status": "remediate",
+		"findings": [
+			{
+				"id": "missing-subagent-codebase-refs",
+				"reason": "Subagent delegation completed but produced no traceable codebase symbol or call-chain references — evidence must include file paths, symbol names, or call chain artifacts",
+				"category": "process",
+				"severity": "warning",
+				"required_fix": "Configure subagent tasks to produce codebase references: ensure each delegated task's result includes codebaseRefs with file paths or symbol names that can be traced back to the source code",
+				"evidence_refs": ["task://delegation-result", "policy://traceability"]
+			}
+		]
+	},
+	"assertions": {
+		"finalStatus": "remediation_required",
+		"findingCount": 1,
+		"findingHasFix": true,
+		"fixReferencesSymbols": true,
+		"fixReferencesCallChain": true,
+		"injectionReceived": true
+	}
+}

@@ -1,0 +1,25 @@
+{
+	"description": "Advisor remediate verdict: agent did not delegate any work via the task tool",
+	"scenario": "未委派 task 子代理",
+	"verdictTemplate": {
+		"schema_version": 1,
+		"status": "remediate",
+		"findings": [
+			{
+				"id": "missing-delegation-evidence",
+				"reason": "No subagent task delegation was recorded — the contract policy requires using the official 'task' tool for subagent work",
+				"category": "process",
+				"severity": "error",
+				"required_fix": "Invoke the 'task' tool to delegate work to subagents with explicit assignments, then ensure each delegation produces a completed result with output artifacts — re-run compliance_complete after delegations",
+				"evidence_refs": ["policy://requiresSubagentDelegation"]
+			}
+		]
+	},
+	"assertions": {
+		"finalStatus": "remediation_required",
+		"findingCount": 1,
+		"findingRequiresTaskTool": true,
+		"findingRequiresResult": true,
+		"injectionReceived": true
+	}
+}

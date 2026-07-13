@@ -1,0 +1,25 @@
+{
+	"description": "Advisor remediate verdict: agent changed files outside the TDD contract scope",
+	"scenario": "范围超出 TDD",
+	"verdictTemplate": {
+		"schema_version": 1,
+		"status": "remediate",
+		"findings": [
+			{
+				"id": "scope-violation",
+				"reason": "Changed paths fall outside the contract-defined scope — the contract limits changes to src/routes/login.ts and src/middleware/auth.ts",
+				"category": "process",
+				"severity": "error",
+				"required_fix": "Revert changes outside the defined scope and limit modifications to only files listed in the contract scope section",
+				"evidence_refs": ["contract://scope-section", "diff://worktree"]
+			}
+		]
+	},
+	"assertions": {
+		"finalStatus": "remediation_required",
+		"findingCount": 1,
+		"findingReferencesContract": true,
+		"findingReferencesDiff": true,
+		"injectionReceived": true
+	}
+}

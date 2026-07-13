@@ -1,0 +1,26 @@
+{
+	"description": "Advisor remediate verdict: agent did not call any codebase-memory tool before completing",
+	"scenario": "未调用 codebase-memory",
+	"verdictTemplate": {
+		"schema_version": 1,
+		"status": "remediate",
+		"findings": [
+			{
+				"id": "missing-codebase-evidence",
+				"reason": "No codebase-memory tool was invoked — the contract requires using index, search, and source analysis tools to produce traceable evidence",
+				"category": "process",
+				"severity": "error",
+				"required_fix": "Use codebase-memory MCP tools: run index_status, perform search_graph/search_code queries, call get_code_snippet for relevant files, and trace_path for call-chain analysis — then re-request completion",
+				"evidence_refs": ["policy://requiresCodebaseMcp"]
+			}
+		]
+	},
+	"assertions": {
+		"finalStatus": "remediation_required",
+		"findingCount": 1,
+		"findingRequiresIndex": true,
+		"findingRequiresSearch": true,
+		"findingRequiresSnippetTrace": true,
+		"injectionReceived": true
+	}
+}

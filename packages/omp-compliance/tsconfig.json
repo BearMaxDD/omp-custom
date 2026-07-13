@@ -13,11 +13,8 @@
     "declarationMap": true,
     "sourceMap": true,
     "outDir": "dist",
-    "paths": {
-      "@bearmaxdd/omp-compliance": ["./packages/omp-compliance/src"],
-      "@bearmaxdd/omp-compliance/*": ["./packages/omp-compliance/src/*"]
-    }
+    "rootDir": "src"
   },
-  "include": ["packages/*/src/**/*.ts"],
-  "exclude": ["node_modules", "dist", "**/*.test.ts"]
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "test"]
 }
