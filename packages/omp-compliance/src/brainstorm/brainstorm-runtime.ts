@@ -124,21 +124,21 @@ export class BrainstormRuntime {
 			createdAt: new Date().toISOString(),
 		};
 
-		// 4. Register envelope
-		registry.put(envelope);
-
-		await coordinator.markReviewRequested(topic.topicId, reviewId);
-
-		// 5. Request advisor review via the injected adapter
+		// 4. Transition state and register envelope (inside try for atomicity)
+		try {
+			await coordinator.markReviewRequested(topic.topicId, reviewId);
+			registry.put(envelope);
+		} catch {
+			registry.consume(reviewId);
+			await coordinator.markReviewUnavailable(topic.topicId, "Failed to initiate review");
+			return { reviewId, topic, status: "review_unavailable" };
+		}
+		// 5. Request advisor review
 		try {
 			const receipt = await this.config.requestAdvisorReview({
 				trigger: "brainstorm_review",
 				sessionId: this.config.sessionId(),
 				taskId: `brainstorm-${topic.topicId}`,
-				contractHash: topic.inputHash,
-				attempt: topic.attempt,
-				context,
-				rules,
 				reviewId,
 				metadata: {
 					topicId: topic.topicId,
@@ -146,14 +146,14 @@ export class BrainstormRuntime {
 					codebaseRelevance: topic.input.codebase_relevance,
 				},
 			});
-
 			if (receipt.status !== "accepted") {
+				registry.consume(reviewId);
 				await coordinator.markReviewUnavailable(topic.topicId, "Advisor review not accepted");
 				return { reviewId, topic, status: "review_unavailable" };
 			}
-
 			return { reviewId, topic, status: "advisor_reviewing" };
 		} catch {
+			registry.consume(reviewId);
 			await coordinator.markReviewUnavailable(topic.topicId, "Advisor review request failed");
 			return { reviewId, topic, status: "review_unavailable" };
 		}
