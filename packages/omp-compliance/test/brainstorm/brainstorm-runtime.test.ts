@@ -19,6 +19,7 @@ import type { BrainstormTopicReadyInput } from "../../src/brainstorm/types";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
 import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "../../src/types";
 import { validTopicInput } from "./fixtures";
+import { FakeCodebaseMemory } from "../support/fake-codebase-memory";
 
 // ─── Helpers ───────────────────────────────────────────────────────────
 
@@ -214,5 +215,28 @@ describe("BrainstormRuntime", () => {
 		});
 		await expect(runtime.submitTopic(validTopicInput())).rejects.toThrow("mark failed");
 		expect(putCount).toBe(0);
+	});
+
+	it("only includes tool names that pass getAllTools filter", async () => {
+		const collector = new CollectorRuntime();
+		const memory = new FakeCodebaseMemory(collector.collector);
+		memory.recordIndexReady();
+		memory.recordSearchGraph("test", ["ref"]);
+		memory.recordGetSnippet("src/a.ts", "foo");
+		const store = new TopicStore(tempDir());
+		const coordinator = new TopicCoordinator(store);
+		const registry = new BrainstormReviewRegistry();
+		const runtime = new BrainstormRuntime({
+			api: { requestAdvisorReview: async () => ({ reviewId: "r", accepted: true }) },
+			collector,
+			coordinator,
+			registry,
+			requestAdvisorReview: async () => ({ reviewId: "r", accepted: true }),
+			getAllTools: () => ["search_graph"],
+			sessionId: () => "s1",
+		});
+		const result = await runtime.submitTopic(validTopicInput({ codebase_relevance: "required" }));
+		const envelope = registry.get(result.reviewId);
+		expect(envelope?.requestedToolNames).toEqual(["search_graph"]);
 	});
 });
