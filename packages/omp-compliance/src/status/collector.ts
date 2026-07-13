@@ -43,6 +43,10 @@ export class StatusCollector {
 			topicKind?: string;
 		},
 	) {}
+	// Supervision advice tracking
+	private adviceBlockers = 0;
+	private adviceConcerns = 0;
+	private adviceNits = 0;
 
 	/**
 	 * Record a tool_call event — tracks MCP calls and maintains tool log.
@@ -138,9 +142,9 @@ export class StatusCollector {
 				lastToolCalls: [...this.lastToolCalls],
 			},
 			advice: {
-				blockers: 0,
-				concerns: 0,
-				nits: 0,
+				blockers: this.adviceBlockers,
+				concerns: this.adviceConcerns,
+				nits: this.adviceNits,
 			},
 			compliance: {
 				active: complianceState !== null,
@@ -169,6 +173,9 @@ export class StatusCollector {
 		this.currentReviewId = undefined;
 		this.currentReviewTrigger = undefined;
 		this.reviewStartedAt = undefined;
+		this.adviceBlockers = 0;
+		this.adviceConcerns = 0;
+		this.adviceNits = 0;
 	}
 
 	// ─── Spec methods ───────────────────────────────────────────────────
@@ -204,5 +211,14 @@ export class StatusCollector {
 	setBrainstormState(_active: boolean, _topicId?: string, _status?: string, _topicKind?: string): void {
 		// Brainstorm state is derived from the getBrainstormState callback — no-op for direct set.
 		// Exists for test convenience.
+	}
+
+	/** Apply a SupervisionEngine finding to the advice counters. */
+	onSupervisionFinding(finding: { severity: "nit" | "concern" | "blocker" }): void {
+		switch (finding.severity) {
+			case "blocker": this.adviceBlockers++; break;
+			case "concern": this.adviceConcerns++; break;
+			case "nit":     this.adviceNits++; break;
+		}
 	}
 }

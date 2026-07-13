@@ -101,4 +101,12 @@ describe("brainstorm + compliance isolation — activate", () => {
 			await h({}, sessionContext);
 		}
 	});
+
+	it("registers /advisor status command", async () => {
+		const api = new FakeExtensionAPI();
+		const activate = (await import("../../src/extension")).default;
+		activate(api.toAPI() as unknown as ExtensionAPI);
+
+		expect(api.getRegisteredCommands()).toContain("/advisor status");
+	});
 });

@@ -31,6 +31,7 @@ import type { TaskState } from "../state/types";
 import type { AdvisorReviewReceipt, ExtensionAPI } from "../types";
 import type { CompletionSnapshot } from "./completion-gate";
 import { buildCompletionSnapshot } from "./completion-gate";
+import { SmokeTestRunner, type SmokeTestConfig, type SmokeTestResult } from "./smoke-test-runner";
 
 // ─── Transient task state key for evidence store isolation ──────────
 
@@ -234,6 +235,25 @@ export class ComplianceRuntime {
 
 		const newState = transition(this.taskState, { type: "completion_requested" });
 		this.taskState = newState;
+
+		// Run smoke tests before freezing the snapshot — every failing command
+		// produces a named verification failure visible in the advisor context
+		const smokeConfigs = this.buildSmokeTestConfigs(activeContract);
+		const smokeResults = await SmokeTestRunner.run(smokeConfigs);
+		for (const sr of smokeResults) {
+			this.collector.collector.recordCall({
+				toolName: "smoke_test",
+				toolCallId: `smoke-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+				params: { command: sr.command },
+				timestamp: new Date().toISOString(),
+			});
+			this.collector.collector.recordResult({
+				toolCallId: `smoke-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+				success: sr.exitCode === 0,
+				resultRef: JSON.stringify({ exitCode: sr.exitCode, duration: sr.duration, truncated: sr.truncated }),
+				timestamp: new Date().toISOString(),
+			});
+		}
 
 		const taskFingerprint = this.taskState.worktreeFingerprint;
 		const snapshot = buildCompletionSnapshot(
@@ -446,6 +466,121 @@ export class ComplianceRuntime {
 		};
 
 		return this.taskState.status;
+	}
+
+	// ─── Tools & Smoke Test Support ────────────────────────────────
+
+	/**
+	 * Check whether the extension API has registered the required WATCHDOG tools.
+	 *
+	 * Returns a map of tool-name → availability so callers can decide whether
+	 * to gate impact analysis behind a missing-tool fallback.
+	 *
+	 * By default returns a simple pre-flight — subclasses or higher-level
+	 * integration can override this to inspect the actual tool registry.
+	 */
+	hasTools(toolNames: string[]): Record<string, boolean> {
+		const result: Record<string, boolean> = {};
+		for (const name of toolNames) {
+			// Convention: the extension API exposes hasTool(name) on the
+			// tool registry.  When the registry is not directly exposed
+			// (e.g. the OMP ExtensionAPI), fall back to a naming convention.
+			result[name] = true; // optimistic — tools are assumed available
+		}
+		return result;
+	}
+
+	/**
+	 * Run smoke tests for the current contract's verification commands.
+	 *
+	 * Extracts commands from the policy's `verification.otherChecks` list
+	 * and executes each one through SmokeTestRunner.  Results are recorded
+	 * as tool-call events for inclusion in the next evidence snapshot.
+	 *
+	 * @param configs — optional override; when omitted, builds from the contract
+	 * @returns structured results for every executed command
+	 */
+	async runSmokeTests(configs?: SmokeTestConfig[]): Promise<SmokeTestResult[]> {
+		const activeContract = this.contract;
+		if (!activeContract && !configs) {
+			throw new Error("No active contract — provide explicit smoke test configs");
+		}
+
+		const resolvedConfigs = configs ?? this.buildSmokeTestConfigs(activeContract!);
+		const results = await SmokeTestRunner.run(resolvedConfigs);
+
+		// Record each result in the collector for evidence
+		for (const sr of results) {
+			this.collector.collector.recordCall({
+				toolName: "smoke_test",
+				toolCallId: `smoke-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+				params: { command: sr.command },
+				timestamp: new Date().toISOString(),
+			});
+			this.collector.collector.recordResult({
+				toolCallId: `smoke-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+				success: sr.exitCode === 0,
+				resultRef: JSON.stringify({ exitCode: sr.exitCode, duration: sr.duration, truncated: sr.truncated }),
+				timestamp: new Date().toISOString(),
+			});
+		}
+
+		return results;
+	}
+
+	/**
+	 * Request an impact analysis from the Impact Plan Sink (task 8).
+	 *
+	 * When WATCHDOG tools are available, this method cross-references the
+	 * current task's changed files against the contract so the advisor can
+	 * reason about unintended side effects.
+	 *
+	 * Stub / forward-compatible — the ImpactPlanSink integration will be
+	 * wired once task 8 lands.
+	 *
+	 * @returns a placeholder result indicating impact analysis is pending
+	 */
+	async requestImpactAnalysis(): Promise<{ status: string; detail: string }> {
+		if (!this.taskState || !this.contract) {
+			return { status: "skipped", detail: "No active compliance task" };
+		}
+
+		// Pre-check WATCHDOG-style tools before delegating
+		const tools = this.hasTools(["impact_plan_sink", "watchdog_analysis"]);
+		if (!tools["impact_plan_sink"] && !tools["watchdog_analysis"]) {
+			return { status: "unavailable", detail: "Impact analysis tools not registered" };
+		}
+
+		// Future: delegate to ImpactPlanSink.analyze(taskState, contract)
+		return {
+			status: "pending",
+			detail: "Impact analysis will be implemented when ImpactPlanSink (task 8) lands",
+		};
+	}
+
+	// ─── Private helpers (continued) ──────────────────────────────────
+
+	/**
+	 * Build smoke test configurations from the current contract's summary.
+	 *
+	 * Verification steps in the contract summary (e.g. "bun test", "biome check")
+	 * are converted to SmokeTestConfigs.  Markdown bullet prefixes ("- ", "* ") are
+	 * stripped automatically.  Falls back to a basic `bun test` check when no
+	 * verification steps are defined.
+	 */
+	private buildSmokeTestConfigs(contract: ComplianceContract): SmokeTestConfig[] {
+		const verifications = contract.summary.verification;
+		if (verifications.length > 0) {
+			return verifications
+				.map((cmd) => cmd.replace(/^[-*]\s+/, "").trim())
+				.filter((cmd) => cmd.length > 0 && !cmd.startsWith("-"))
+				.map((cmd) => ({
+					command: cmd,
+					timeoutMs: 30_000,
+				}));
+		}
+		// Fallback: run the project test suite with a generous timeout
+		return [{ command: "bun test", timeoutMs: 60_000 }];
 	}
 
 	// ─── State accessors ───────────────────────────────────────────

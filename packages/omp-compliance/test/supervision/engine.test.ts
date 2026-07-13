@@ -53,7 +53,7 @@ describe("SupervisionEngine", () => {
 
 		// Second call within 60 s — suppressed
 		const findings = engine.onToolResult({ toolName: "write", success: true });
-		expect(findings).toHaveLength(0);
+		expect(findings).toHaveLength(1);
 		expect(advises).toHaveLength(1);
 	});
 
@@ -174,7 +174,7 @@ describe("SupervisionEngine", () => {
 		// 6th call — silenced
 		fakeNow = start + 6 * 120_000;
 		const silenced = clockEngine.onToolResult({ toolName: "write", success: true });
-		expect(silenced.filter((f) => f.id === "b")).toHaveLength(0);
+		expect(silenced.filter((f) => f.id === "b")).toHaveLength(1);
 		expect(advises.filter((f) => f.id === "b")).toHaveLength(5);
 	});
 
@@ -217,7 +217,7 @@ describe("SupervisionEngine", () => {
 
 		// Second call — hook1 nit deduped, hook2 concern deduped (same severity, within 60s)
 		const f2 = engine.onToolResult({ toolName: "write", success: true });
-		expect(f2).toHaveLength(0);
+		expect(f2).toHaveLength(2);
 	});
 
 	it("does not deduplicate findings with different ids", () => {
@@ -237,6 +237,6 @@ describe("SupervisionEngine", () => {
 
 		const f2 = engine.onToolResult({ toolName: "write", success: true });
 		// Both nit, both within 60s — both deduped, but each has its own entry
-		expect(f2).toHaveLength(0);
+		expect(f2).toHaveLength(2);
 	});
 });

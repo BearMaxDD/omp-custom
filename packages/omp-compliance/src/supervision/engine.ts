@@ -44,11 +44,13 @@ export class SupervisionEngine {
 			const finding = hook.onToolResult(event);
 			if (!finding) continue;
 
-			if (!this.shouldAdvise(finding)) continue;
-
-			this.advise(finding);
+			// Evidence: always persist regardless of dedup
 			this.evidence(finding);
 			findings.push(finding);
+
+			// Advise: independently dedup/rate-limit
+			if (!this.shouldAdvise(finding)) continue;
+			this.advise(finding);
 		}
 
 		return findings;
