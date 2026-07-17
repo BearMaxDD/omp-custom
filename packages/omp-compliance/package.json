@@ -19,11 +19,17 @@
     "test": "bun test --preload ./test/setup.ts"
   },
   "peerDependencies": {
-    "@oh-my-pi/pi-coding-agent": "16.4.x"
+    "@oh-my-pi/pi-coding-agent": ">=17.0.1 <18"
   },
   "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "link:@oh-my-pi/pi-coding-agent",
+    "@oh-my-pi/pi-agent-core": "17.0.1",
     "@biomejs/biome": "^1.9.4",
     "@types/bun": "^1.2.0",
     "typescript": "^5.7.0"
+  },
+  "ompCustom": {
+    "hostSource": "/Users/mima1234/Code/super/.worktrees/oh-my-pi-v17-advisor-protocol",
+    "hostCommit": "2adbf91f6d73534342f194f99b1a305db37ae1cf"
   }
 }

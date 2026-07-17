@@ -1,4 +1,5 @@
-import type { AdvisorBeforeRunEvent, AdvisorBeforeRunResult, AgentTool } from "../types";
+import type { AdvisorBeforeRunEvent, AdvisorRunAugmentation } from "@oh-my-pi/pi-coding-agent/advisor/index";
+import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 /**
  * Compliance Advisor Hook — injects review context and the
  * `compliance_verdict` tool into a dedicated Advisor run.
@@ -26,13 +27,13 @@ export function createComplianceAdvisorHook(
 	runtime: {
 		acceptVerdict: (verdict: Record<string, unknown>) => Promise<{ accepted: boolean; reason?: string }>;
 	},
-): (event: AdvisorBeforeRunEvent) => AdvisorBeforeRunResult | undefined {
-	return (event: AdvisorBeforeRunEvent): AdvisorBeforeRunResult | undefined => {
+): (event: AdvisorBeforeRunEvent) => AdvisorRunAugmentation | undefined {
+	return (event: AdvisorBeforeRunEvent): AdvisorRunAugmentation | undefined => {
 		if (event.trigger !== "compliance_review") {
 			return undefined;
 		}
 
-		const reviewId = typeof event.metadata?.reviewId === "string" ? (event.metadata.reviewId as string) : "";
+		const reviewId = event.reviewId;
 
 		const envelope = registry.get(reviewId);
 		if (!envelope || !matchesEnvelope(event, envelope)) {
@@ -40,8 +41,8 @@ export function createComplianceAdvisorHook(
 		}
 
 		return {
-			additionalSystemContext: Object.freeze([envelope.rules, envelope.context]),
-			additionalTools: Object.freeze([createComplianceVerdictTool(envelope, runtime, registry)]),
+			additionalSystemContext: `${envelope.rules}\n\n${envelope.context}`,
+			additionalTools: [createComplianceVerdictTool(envelope, runtime, registry)],
 			metadata: Object.freeze({ complianceReviewId: envelope.reviewId }),
 		};
 	};
@@ -65,12 +66,13 @@ export function createComplianceVerdictTool(
 		acceptVerdict: (verdict: Record<string, unknown>) => Promise<{ accepted: boolean; reason?: string }>;
 	},
 	registry: ComplianceReviewRegistry,
-): AgentTool {
+): ToolDefinition {
 	return {
 		name: "compliance_verdict",
 		label: "Compliance Verdict",
 		description: "Submit a compliance verdict after reviewing the task completion",
-		intent: "omit",
+		loadMode: "essential",
+		approval: "write",
 		parameters: {
 			type: "object",
 			properties: {

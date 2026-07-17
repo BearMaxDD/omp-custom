@@ -69,7 +69,7 @@ describe("BrainstormRuntime", () => {
 		const result = await harness.runtime.submitTopic(validTopicInput());
 
 		expect(reviewRequests).toHaveLength(1);
-		expect(reviewRequests[0]).not.toHaveProperty("trigger");
+		expect(reviewRequests[0]).toMatchObject({ trigger: "brainstorm_review", priority: 80 });
 		expect(reviewRequests[0].metadata).toMatchObject({
 			topicId: result.topic.topicId,
 			inputHash: result.topic.inputHash,

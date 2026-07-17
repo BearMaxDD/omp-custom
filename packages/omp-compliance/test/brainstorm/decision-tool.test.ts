@@ -131,6 +131,14 @@ describe("validateDecisionInput", () => {
 // ─── createDecisionTool ─────────────────────────────────────────────
 
 describe("createDecisionTool", () => {
+	const execute = async (
+		tool: ReturnType<typeof createDecisionTool>,
+		params: Record<string, unknown>,
+	): Promise<Record<string, unknown>> => {
+		const result = await tool.execute("decision-test", params, undefined, undefined, {} as never);
+		return result.details as Record<string, unknown>;
+	};
+
 	it("creates a tool definition with the correct name", () => {
 		const coordinator = {} as TopicCoordinator;
 		const tool = createDecisionTool({ coordinator });
@@ -148,7 +156,7 @@ describe("createDecisionTool", () => {
 	it("rejects user_confirmed false even with valid decision", async () => {
 		const coordinator = {} as TopicCoordinator;
 		const tool = createDecisionTool({ coordinator });
-		const result = await (tool.handler as (params: Record<string, unknown>) => Promise<unknown>)({
+		const result = await execute(tool, {
 			topic_id: "topic-01",
 			decision: "accept_candidate",
 			user_confirmed: false,
@@ -164,7 +172,7 @@ describe("createDecisionTool", () => {
 		const tool = createDecisionTool({ coordinator });
 
 		// user_confirmed: false should be rejected
-		const rejected = await (tool.handler as (params: Record<string, unknown>) => Promise<unknown>)({
+		const rejected = await execute(tool, {
 			topic_id: coordinator.current()?.topicId,
 			decision: "accept_candidate",
 			user_confirmed: false,
@@ -174,7 +182,7 @@ describe("createDecisionTool", () => {
 		expect(rej.ok).toBe(false);
 
 		// user_confirmed: true should succeed
-		const accepted = await (tool.handler as (params: Record<string, unknown>) => Promise<unknown>)({
+		const accepted = await execute(tool, {
 			topic_id: coordinator.current()?.topicId,
 			decision: "accept_candidate",
 			user_confirmed: true,
@@ -189,7 +197,7 @@ describe("createDecisionTool", () => {
 		const coordinator = await fixtureCoordinatorWithReview();
 		const tool = createDecisionTool({ coordinator });
 
-		const result = await (tool.handler as (params: Record<string, unknown>) => Promise<unknown>)({
+		const result = await execute(tool, {
 			topic_id: coordinator.current()?.topicId,
 			decision: "accept_alternative",
 			selected_alternative: "扁平架构",
@@ -206,7 +214,7 @@ describe("createDecisionTool", () => {
 		const coordinator = await fixtureCoordinatorWithReview();
 		const tool = createDecisionTool({ coordinator });
 
-		const result = await (tool.handler as (params: Record<string, unknown>) => Promise<unknown>)({
+		const result = await execute(tool, {
 			topic_id: coordinator.current()?.topicId,
 			decision: "park",
 			user_confirmed: true,

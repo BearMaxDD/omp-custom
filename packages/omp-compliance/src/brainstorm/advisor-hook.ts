@@ -17,7 +17,8 @@
  * intervention).
  */
 
-import type { AdvisorBeforeRunEvent, AdvisorBeforeRunResult, AgentTool } from "../types";
+import type { AdvisorBeforeRunEvent, AdvisorRunAugmentation } from "@oh-my-pi/pi-coding-agent/advisor/index";
+import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { BRAINSTORM_READ_ONLY_TOOL_NAMES } from "./advisor-rules";
 import { renderDecisionCard } from "./decision-card";
 import type { BrainstormReviewRegistry } from "./review-registry";
@@ -38,13 +39,13 @@ export function createBrainstormAdvisorHook(
 		msg: { customType: string; content: string; display: boolean; attribution: "agent" | "user"; details?: unknown },
 		options?: { deliverAs?: string; triggerTurn?: boolean },
 	) => void,
-): (event: AdvisorBeforeRunEvent) => AdvisorBeforeRunResult | undefined {
-	return (event: AdvisorBeforeRunEvent): AdvisorBeforeRunResult | undefined => {
-		if (event.trigger !== "compliance_review") {
+): (event: AdvisorBeforeRunEvent) => AdvisorRunAugmentation | undefined {
+	return (event: AdvisorBeforeRunEvent): AdvisorRunAugmentation | undefined => {
+		if (event.trigger !== "brainstorm_review") {
 			return undefined;
 		}
 
-		const reviewId = typeof event.metadata?.reviewId === "string" ? (event.metadata.reviewId as string) : "";
+		const reviewId = event.reviewId;
 
 		const envelope = registry.get(reviewId);
 		if (!envelope) {
@@ -52,8 +53,8 @@ export function createBrainstormAdvisorHook(
 		}
 
 		return {
-			additionalSystemContext: Object.freeze([envelope.rules, envelope.context]),
-			additionalTools: Object.freeze([createBrainstormReviewTool(envelope, coordinator, registry, sendMessage)]),
+			additionalSystemContext: `${envelope.rules}\n\n${envelope.context}`,
+			additionalTools: [createBrainstormReviewTool(envelope, coordinator, registry, sendMessage)],
 			metadata: Object.freeze({ brainstormReviewId: envelope.reviewId }),
 		};
 	};
@@ -80,12 +81,13 @@ export function createBrainstormReviewTool(
 		msg: { customType: string; content: string; display: boolean; attribution: "agent" | "user"; details?: unknown },
 		options?: { deliverAs?: string; triggerTurn?: boolean },
 	) => void,
-): AgentTool {
+): ToolDefinition {
 	return {
 		name: "brainstorm_review",
 		label: "Brainstorm Review",
 		description: "Submit a structured brainstorm review after evaluating the topic",
-		intent: "omit",
+		loadMode: "essential",
+		approval: "write",
 		parameters: {
 			type: "object",
 			properties: {

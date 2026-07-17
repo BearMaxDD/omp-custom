@@ -8,8 +8,8 @@
  * park records decision without deleting history.
  */
 
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { TopicCoordinator } from "../brainstorm/topic-coordinator";
-import type { ExtensionAPI } from "../types";
 
 // ─── Command Registration ───────────────────────────────────────────
 
@@ -30,7 +30,10 @@ export function registerBrainstormCommand(api: ExtensionAPI, getCoordinator: Coo
 			"Manage brainstorm topics. " +
 			"Usage: /brainstorm status | history <topic_id> | retry <topic_id> | park <topic_id>",
 		getArgumentCompletions: () => ["status", "history", "retry", "park"],
-		handler: async (args: string[]) => {
+		handler: async (rawArgs: string) => {
+			const args: string[] = Array.isArray(rawArgs)
+				? (rawArgs as string[])
+				: rawArgs.trim().split(/\s+/).filter(Boolean);
 			if (args.length === 0) {
 				throw new Error("用法: /brainstorm status | history <topic_id> | retry <topic_id> | park <topic_id>");
 			}

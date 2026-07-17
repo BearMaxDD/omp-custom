@@ -13,7 +13,8 @@
  *   user_confirmed: boolean (required, must be true)
  */
 
-import type { ToolDefinition } from "../types";
+import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { TopicCoordinator } from "./topic-coordinator";
 
 // ─── Validation Types ────────────────────────────────────────────────
@@ -94,10 +95,13 @@ export interface DecisionToolDependencies {
 export function createDecisionTool(deps: DecisionToolDependencies): ToolDefinition {
 	return {
 		name: "brainstorm_decision",
+		label: "Brainstorm Decision",
 		description:
 			"Record the user's explicit decision on a brainstorm topic. " +
 			"Requires user_confirmed: true — advisor support alone cannot decide. " +
 			"Use after showing the decision card to the user.",
+		loadMode: "essential",
+		approval: "write",
 		parameters: {
 			type: "object",
 			properties: {
@@ -126,10 +130,13 @@ export function createDecisionTool(deps: DecisionToolDependencies): ToolDefiniti
 			},
 			required: ["topic_id", "decision", "user_confirmed"],
 		},
-		handler: async (params: Record<string, unknown>) => {
+		execute: async (
+			_toolCallId,
+			params: Record<string, unknown>,
+		): Promise<AgentToolResult<Record<string, unknown>>> => {
 			const errors = validateDecisionInput(params);
 			if (errors.length > 0) {
-				return { ok: false, errors };
+				return toToolResult({ ok: false, errors }, true);
 			}
 
 			try {
@@ -146,13 +153,24 @@ export function createDecisionTool(deps: DecisionToolDependencies): ToolDefiniti
 					ts: new Date().toISOString(),
 				});
 
-				return { ok: true };
+				return toToolResult({ ok: true });
 			} catch (err) {
-				return {
-					ok: false,
-					errors: [{ field: "_handler", message: `recordDecision failed: ${(err as Error).message}` }],
-				};
+				return toToolResult(
+					{
+						ok: false,
+						errors: [{ field: "_handler", message: `recordDecision failed: ${(err as Error).message}` }],
+					},
+					true,
+				);
 			}
 		},
+	};
+}
+
+function toToolResult(details: Record<string, unknown>, isError = false): AgentToolResult<Record<string, unknown>> {
+	return {
+		content: [{ type: "text", text: JSON.stringify(details) }],
+		details,
+		isError,
 	};
 }

@@ -1,11 +1,17 @@
 import { join } from "node:path";
+import type {
+	AdvisorBeforeRunEvent,
+	AdvisorReviewReceipt,
+	AdvisorReviewRequest,
+} from "@oh-my-pi/pi-coding-agent/advisor/index";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { createComplianceAdvisorHook } from "./advisor/compliance-advisor-hook";
 import { ComplianceReviewRegistry } from "./advisor/review-envelope";
 import type { ComplianceReviewDependencies } from "./advisor/review-envelope";
 import { createBrainstormAdvisorHook } from "./brainstorm/advisor-hook";
 import { BrainstormRuntime } from "./brainstorm/brainstorm-runtime";
 import { createDecisionTool } from "./brainstorm/decision-tool";
-import { type BeforeAgentStartEvent, appendBrainstormGuidance } from "./brainstorm/main-agent-guidance";
+import { appendBrainstormGuidance } from "./brainstorm/main-agent-guidance";
 import { BrainstormReviewRegistry } from "./brainstorm/review-registry";
 import { TopicCoordinator } from "./brainstorm/topic-coordinator";
 import { createTopicReadyTool } from "./brainstorm/topic-ready-tool";
@@ -16,7 +22,6 @@ import { EvidenceStore } from "./evidence/evidence-store";
 import { ComplianceRuntime } from "./runtime/compliance-runtime";
 import { CollectorRuntime } from "./signals/collector-runtime";
 import { registerComplianceCompleteTool } from "./tools/compliance-complete-tool";
-import type { AdvisorBeforeRunEvent, ExtensionAPI, ExtensionContext } from "./types";
 
 /** Default compliance store directory within the repo. */
 const DEFAULT_COMPLIANCE_DIR = ".omp/compliance";
@@ -74,13 +79,19 @@ export default function activate(api: ExtensionAPI): void {
 	// ── Review registries (pure in-memory — no side effects) ──
 	const registry = new ComplianceReviewRegistry();
 	const brainstormRegistry = new BrainstormReviewRegistry();
+	const requestAdvisorReview = async (request: AdvisorReviewRequest): Promise<AdvisorReviewReceipt> => {
+		if (!api.requestAdvisorReview) {
+			return { reviewId: request.reviewId, status: "rejected", reason: "Advisor Review Protocol is unavailable" };
+		}
+		return api.requestAdvisorReview(request);
+	};
 
 	// ── Session tracking ──
 	let sessionId: string | null = null;
-	api.on("session_start", (_event: unknown, context: ExtensionContext) => {
+	api.on("session_start", (_event, context) => {
 		sessionId = context.sessionManager.getSessionId();
 	});
-	api.on("session_switch", (_event: unknown, context: ExtensionContext) => {
+	api.on("session_switch", (_event, context) => {
 		sessionId = context.sessionManager.getSessionId();
 	});
 
@@ -91,7 +102,7 @@ export default function activate(api: ExtensionAPI): void {
 			return sessionId;
 		},
 		registry,
-		requestAdvisorReview: (request) => api.requestAdvisorReview(request),
+		requestAdvisorReview,
 	};
 
 	// Compliance runtime — the main coordinator (gets factory, not store)
@@ -120,13 +131,12 @@ export default function activate(api: ExtensionAPI): void {
 	};
 
 	// ── Single advisor_before_run handler (compliance first, then brainstorm) ──
-	api.on("advisor_before_run", (event: unknown, _context: ExtensionContext) => {
-		const e = event as AdvisorBeforeRunEvent;
+	api.on("advisor_before_run", (e: AdvisorBeforeRunEvent) => {
 		// Compliance hook first (no lazy init needed)
 		const complianceResult = createComplianceAdvisorHook(registry, runtime)(e);
 		if (complianceResult) return complianceResult;
 		// Brainstorm hook — only init when compliance didn't match
-		if (e.trigger === "compliance_review") {
+		if (e.trigger === "brainstorm_review") {
 			return createBrainstormAdvisorHook(
 				brainstormRegistry,
 				getBrainstormInfra().coordinator,
@@ -136,7 +146,7 @@ export default function activate(api: ExtensionAPI): void {
 		return undefined;
 	});
 
-	api.on("before_agent_start", (event: unknown) => appendBrainstormGuidance(event as BeforeAgentStartEvent));
+	api.on("before_agent_start", (event) => appendBrainstormGuidance(event));
 
 	// ── Register compliance command and tool ──
 	registerComplianceCommand(api, runtime);
@@ -157,11 +167,11 @@ export default function activate(api: ExtensionAPI): void {
 			// only accesses it when the handler is invoked.
 			get runtime(): BrainstormRuntime {
 				return new BrainstormRuntime({
-					api: { requestAdvisorReview: (request) => api.requestAdvisorReview(request) },
+					api: { requestAdvisorReview },
 					collector,
 					coordinator: getCoordinator(),
 					registry: brainstormRegistry,
-					requestAdvisorReview: (request) => api.requestAdvisorReview(request),
+					requestAdvisorReview,
 					getAllTools: () => api.getAllTools() as readonly string[],
 					sessionId: () => sessionId ?? "unknown",
 				});
@@ -179,8 +189,8 @@ export default function activate(api: ExtensionAPI): void {
 	);
 
 	// ── Passive event handlers ──
-	api.on("tool_call", (event) => collector.recordToolCall(event as Record<string, unknown>));
-	api.on("tool_result", (event) => collector.recordToolResult(event as Record<string, unknown>));
-	api.on("turn_end", (event) => collector.recordTurnEnd(event as Record<string, unknown>));
+	api.on("tool_call", (event) => collector.recordToolCall(event as unknown as Record<string, unknown>));
+	api.on("tool_result", (event) => collector.recordToolResult(event as unknown as Record<string, unknown>));
+	api.on("turn_end", (event) => collector.recordTurnEnd(event as unknown as Record<string, unknown>));
 	api.on("agent_end", () => collector.refreshPresentation());
 }

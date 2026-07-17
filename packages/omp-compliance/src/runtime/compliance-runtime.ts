@@ -275,6 +275,8 @@ export class ComplianceRuntime {
 		try {
 			receipt = await this.reviewDeps.requestAdvisorReview({
 				reviewId: envelope.reviewId,
+				trigger: "compliance_review",
+				priority: 100,
 				metadata: {
 					sessionId,
 					taskId: this.taskState.taskId,

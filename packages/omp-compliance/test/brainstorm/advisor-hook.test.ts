@@ -88,17 +88,18 @@ const defaultTopic: BrainstormTopicState = Object.freeze({
 function brainstormEvent(overrides: Partial<AdvisorBeforeRunEvent> = {}): AdvisorBeforeRunEvent {
 	return {
 		type: "advisor_before_run",
-		sessionId: "session-1",
-		advisorId: "default",
-		trigger: "compliance_review",
-		messages: [],
+		reviewId: "review-bs-1",
+		trigger: "brainstorm_review",
+		priority: 80,
 		metadata: { reviewId: "review-bs-1" },
+		primarySessionId: "session-1",
+		advisorSessionId: "default",
 		...overrides,
 	};
 }
 
 describe("createBrainstormAdvisorHook", () => {
-	it("injects topic rules and brainstorm_review tool for compliance_review trigger", () => {
+	it("injects topic rules and brainstorm_review tool for brainstorm_review trigger", () => {
 		const registry = new BrainstormReviewRegistry();
 		const coordinator = makeCoordinator();
 		const names = ["mcp__codebase_memory_mcp__search_graph", "mcp__codebase_memory_mcp__get_code_snippet"];
@@ -109,19 +110,18 @@ describe("createBrainstormAdvisorHook", () => {
 		const result = hook(brainstormEvent());
 
 		expect(result).toBeDefined();
-		expect(result?.additionalSystemContext).toHaveLength(2);
+		expect(result?.additionalSystemContext).toBe("test-brainstorm-rules\n\ntest-brainstorm-context");
 		expect(result?.additionalTools?.map((t) => t.name)).toEqual(["brainstorm_review"]);
 	});
 
-	it("matches on compliance_review trigger", () => {
+	it("matches on brainstorm_review trigger", () => {
 		const registry = new BrainstormReviewRegistry();
 		const coordinator = makeCoordinator();
 		const env = makeEnvelope();
 		registry.put(env);
 
 		const hook = createBrainstormAdvisorHook(registry, coordinator, () => {});
-		const result = hook({ ...brainstormEvent(), trigger: "compliance_review" });
-		// With the fix, hook now accepts compliance_review trigger (upstream only sends this)
+		const result = hook({ ...brainstormEvent(), trigger: "brainstorm_review" });
 		expect(result).toBeDefined();
 	});
 
@@ -130,7 +130,7 @@ describe("createBrainstormAdvisorHook", () => {
 		const coordinator = makeCoordinator();
 
 		const hook = createBrainstormAdvisorHook(registry, coordinator, () => {});
-		const result = hook(brainstormEvent({ metadata: { reviewId: "nonexistent" } }));
+		const result = hook(brainstormEvent({ reviewId: "nonexistent", metadata: { reviewId: "nonexistent" } }));
 		expect(result).toBeUndefined();
 	});
 });

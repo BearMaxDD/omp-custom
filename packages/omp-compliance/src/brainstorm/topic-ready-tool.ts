@@ -9,7 +9,8 @@
  * Input schema matches BrainstormTopicReadyInput with strict validation.
  */
 
-import type { ToolDefinition } from "../types";
+import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { BrainstormRuntime } from "./brainstorm-runtime";
 import type { BrainstormTopicReadyInput } from "./types";
 
@@ -125,9 +126,12 @@ export interface TopicReadyToolDependencies {
 export function createTopicReadyTool(deps: TopicReadyToolDependencies): ToolDefinition {
 	return {
 		name: "brainstorm_topic_ready",
+		label: "Brainstorm Topic Ready",
 		description:
 			"Submit a substantive brainstorm topic for independent advisor review. " +
 			"Call only when the conversation has converged on a well-formed candidate decision.",
+		loadMode: "essential",
+		approval: "write",
 		parameters: {
 			type: "object",
 			properties: {
@@ -181,22 +185,36 @@ export function createTopicReadyTool(deps: TopicReadyToolDependencies): ToolDefi
 				"discussion_summary",
 			],
 		},
-		handler: async (params: Record<string, unknown>) => {
+		execute: async (
+			_toolCallId,
+			params: Record<string, unknown>,
+		): Promise<AgentToolResult<Record<string, unknown>>> => {
 			const errors = validateTopicReadyInput(params);
 			if (errors.length > 0) {
-				return { ok: false, errors };
+				return toToolResult({ ok: false, errors }, true);
 			}
 
 			try {
 				const input = params as unknown as BrainstormTopicReadyInput;
 				const result = await deps.runtime.submitTopic(input);
-				return { ok: true, result };
+				return toToolResult({ ok: true, result });
 			} catch (err) {
-				return {
-					ok: false,
-					errors: [{ field: "_handler", message: `submitTopic failed: ${(err as Error).message}` }],
-				};
+				return toToolResult(
+					{
+						ok: false,
+						errors: [{ field: "_handler", message: `submitTopic failed: ${(err as Error).message}` }],
+					},
+					true,
+				);
 			}
 		},
+	};
+}
+
+function toToolResult(details: Record<string, unknown>, isError = false): AgentToolResult<Record<string, unknown>> {
+	return {
+		content: [{ type: "text", text: JSON.stringify(details) }],
+		details,
+		isError,
 	};
 }

@@ -1,12 +1,15 @@
 import type {
 	AdvisorBeforeRunEvent,
-	AdvisorBeforeRunResult,
 	AdvisorReviewReceipt,
 	AdvisorReviewRequest,
-	CustomMessagePayload,
+	AdvisorRunAugmentation,
+} from "@oh-my-pi/pi-coding-agent/advisor/index";
+import type {
 	ExtensionAPI,
+	ExtensionContext,
 	ToolDefinition,
-} from "../../src/types";
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { CustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
 
 /**
  * A minimal fake implementation of ExtensionAPI for testing.
@@ -16,14 +19,15 @@ export class FakeExtensionAPI {
 	public readonly tools: string[] = [];
 	public readonly toolDefinitions: ToolDefinition[] = [];
 	public readonly commands: string[] = [];
-	public readonly eventHandlers: Map<string, Array<(event: unknown) => unknown>> = new Map();
+	public readonly eventHandlers: Map<string, Array<(event: unknown, context?: ExtensionContext) => unknown>> =
+		new Map();
 	public readonly sentMessages: CustomMessagePayload[] = [];
 	public readonly appendedEntries: Array<{ type: string; data?: unknown }> = [];
 	public requestAdvisorReview: (request: AdvisorReviewRequest) => Promise<AdvisorReviewReceipt> = async (
 		_request: AdvisorReviewRequest,
 	) => ({ status: "accepted", reviewId: _request.reviewId });
 
-	registerTool<TParams = unknown, TDetails = unknown>(tool: ToolDefinition<TParams, TDetails>): void {
+	registerTool(tool: ToolDefinition): void {
 		this.tools.push(tool.name);
 		this.toolDefinitions.push(tool as ToolDefinition);
 	}
@@ -75,21 +79,22 @@ export class FakeExtensionAPI {
 	}
 
 	/** Simulate an advisor_before_run event and return collected results. */
-	async fireAdvisorBeforeRun(event: Partial<AdvisorBeforeRunEvent>): Promise<AdvisorBeforeRunResult | undefined> {
+	async fireAdvisorBeforeRun(event: Partial<AdvisorBeforeRunEvent>): Promise<AdvisorRunAugmentation | undefined> {
 		const handlers = this.eventHandlers.get("advisor_before_run") ?? [];
 		const fullEvent: AdvisorBeforeRunEvent = {
 			type: "advisor_before_run",
-			sessionId: event.sessionId ?? "test-session",
-			advisorId: event.advisorId ?? "test-advisor",
+			reviewId: event.reviewId ?? "test-review",
 			trigger: event.trigger ?? "compliance_review",
-			messages: event.messages ?? [],
+			priority: event.priority ?? 0,
 			metadata: event.metadata,
+			primarySessionId: event.primarySessionId ?? "test-session",
+			advisorSessionId: event.advisorSessionId ?? "test-advisor",
 		};
 		for (const handler of handlers) {
 			const result = await handler(fullEvent, {
-				sessionManager: { getSessionId: () => fullEvent.sessionId },
-			});
-			if (result !== undefined) return result as AdvisorBeforeRunResult;
+				sessionManager: { getSessionId: () => fullEvent.primarySessionId },
+			} as unknown as ExtensionContext);
+			if (result !== undefined) return result as AdvisorRunAugmentation;
 		}
 		return undefined;
 	}
@@ -148,6 +153,6 @@ export class FakeExtensionAPI {
 				error: () => {},
 				debug: () => {},
 			},
-		};
+		} as unknown as ExtensionAPI;
 	}
 }

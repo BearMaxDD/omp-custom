@@ -7,10 +7,10 @@
  * Status and history are READ-ONLY projections — no side effects.
  */
 
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { ComplianceRuntime } from "../runtime/compliance-runtime";
 import { readHistory } from "../status/history-reader";
 import { toStatusViewModel } from "../status/status-view-model";
-import type { ExtensionAPI } from "../types";
 
 // ─── Command Registration ───────────────────────────────────────────
 
@@ -29,7 +29,10 @@ export function registerComplianceCommand(api: ExtensionAPI, runtime: Compliance
 		description:
 			"Manage compliance tasks. " + "Usage: /compliance start <tdd.md> | stop | resume <task_id> | status | history",
 		getArgumentCompletions: () => ["start", "stop", "resume", "status", "history"],
-		handler: async (args: string[]) => {
+		handler: async (rawArgs: string) => {
+			const args: string[] = Array.isArray(rawArgs)
+				? (rawArgs as string[])
+				: rawArgs.trim().split(/\s+/).filter(Boolean);
 			if (args.length === 0) {
 				throw new Error("Usage: /compliance start <tdd.md> | stop | resume <task_id> | status | history");
 			}

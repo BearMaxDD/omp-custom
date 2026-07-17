@@ -222,7 +222,7 @@ describe("ComplianceRuntime — requestCompletion advisor review path", () => {
 		expect(mockRequestReviewCalls.length).toBe(1);
 		const req = mockRequestReviewCalls[0];
 		expect(req.reviewId).toMatch(/^compliance:/);
-		expect(req).not.toHaveProperty("trigger");
+		expect(req).toMatchObject({ trigger: "compliance_review", priority: 100 });
 		// Metadata binds task/hash/attempt
 		expect(req.metadata?.taskId).toBe(result.completionSnapshot.taskId);
 		expect(req.metadata?.contractHash).toMatch(/^sha256:/);

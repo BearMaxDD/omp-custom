@@ -39,16 +39,6 @@ The advisor will independently challenge the decision.`;
 
 // ─── Event Types ───────────────────────────────────────────────────────
 
-export interface BeforeAgentStartEvent {
-	readonly systemPrompt: readonly string[];
-}
-
-export interface BeforeAgentStartEventResult {
-	readonly systemPrompt: readonly string[];
-}
-
-// ─── Hook ──────────────────────────────────────────────────────────────
-
 /**
  * Append brainstorm topic review guidance to the system prompt before
  * each agent start.
@@ -59,3 +49,7 @@ export interface BeforeAgentStartEventResult {
 export function appendBrainstormGuidance(event: BeforeAgentStartEvent): BeforeAgentStartEventResult {
 	return { systemPrompt: [...event.systemPrompt, renderMainAgentBrainstormGuidance()] };
 }
+import type {
+	BeforeAgentStartEvent,
+	BeforeAgentStartEventResult,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";

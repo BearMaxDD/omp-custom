@@ -157,7 +157,7 @@ describe("createTopicReadyTool", () => {
 		expect(typeof tool.parameters === "object").toBe(true);
 	});
 
-	it("returns validation errors from handler for invalid input", async () => {
+	it("returns validation errors from execute for invalid input", async () => {
 		const tool = createTopicReadyTool({
 			runtime: {
 				submitTopic: async () => ({ status: "created", topic: {}, reviewId: "br-test" }),
@@ -165,9 +165,10 @@ describe("createTopicReadyTool", () => {
 			sessionId: () => "session-1",
 		});
 
-		const result = await (tool.handler as (params: Record<string, unknown>) => Promise<unknown>)({});
-		expect(result).toHaveProperty("ok", false);
-		expect(result).toHaveProperty("errors");
-		expect((result as { errors: unknown[] }).errors.length).toBeGreaterThan(0);
+		const result = await tool.execute("topic-ready-test", {}, undefined, undefined, {} as never);
+		expect(result.details).toHaveProperty("ok", false);
+		expect(result.details).toHaveProperty("errors");
+		expect((result.details as { errors: unknown[] }).errors.length).toBeGreaterThan(0);
+		expect(result.isError).toBe(true);
 	});
 });

@@ -20,16 +20,17 @@ function makeMockRuntime(): ComplianceRuntime {
 function makeComplianceEvent(overrides: Partial<AdvisorBeforeRunEvent> = {}): AdvisorBeforeRunEvent {
 	return {
 		type: "advisor_before_run",
-		sessionId: SESSION_ID,
-		advisorId: "default",
+		reviewId: `compliance:${"0".repeat(64)}`,
 		trigger: "compliance_review",
-		messages: [],
+		priority: 100,
 		metadata: {
 			reviewId: `compliance:${"0".repeat(64)}`,
 			taskId: TASK_ID,
 			contractHash: HASH,
 			attempt: 1,
 		},
+		primarySessionId: SESSION_ID,
+		advisorSessionId: "default",
 		...overrides,
 	};
 }
@@ -37,10 +38,11 @@ function makeComplianceEvent(overrides: Partial<AdvisorBeforeRunEvent> = {}): Ad
 function makeTurnEndEvent(): AdvisorBeforeRunEvent {
 	return {
 		type: "advisor_before_run",
-		sessionId: SESSION_ID,
-		advisorId: "default",
+		reviewId: "turn-end",
 		trigger: "turn_end",
-		messages: [],
+		priority: 100,
+		primarySessionId: SESSION_ID,
+		advisorSessionId: "default",
 	};
 }
 
@@ -78,9 +80,10 @@ describe("createComplianceAdvisorHook", () => {
 		expect(result).toBeUndefined();
 	});
 
-	it("returns undefined when metadata.reviewId is missing", () => {
+	it("returns undefined when reviewId does not match", () => {
 		const { hook } = setupFixture();
 		const event = makeComplianceEvent({
+			reviewId: "compliance:missing",
 			metadata: { taskId: TASK_ID, contractHash: HASH, attempt: 1 },
 		});
 		const result = hook(event);
@@ -90,6 +93,7 @@ describe("createComplianceAdvisorHook", () => {
 	it("returns additionalSystemContext and a single tool when matched", () => {
 		const { hook, env } = setupFixture();
 		const event = makeComplianceEvent({
+			reviewId: env.reviewId,
 			metadata: {
 				reviewId: env.reviewId,
 				taskId: TASK_ID,
@@ -99,13 +103,11 @@ describe("createComplianceAdvisorHook", () => {
 		});
 		const result = hook(event);
 		expect(result).toBeDefined();
-		expect(result?.additionalSystemContext).toEqual(["test-rules", "test-context"]);
-		expect(Object.isFrozen(result?.additionalSystemContext)).toBe(true);
+		expect(result?.additionalSystemContext).toBe("test-rules\n\ntest-context");
 		expect(result?.additionalTools).toHaveLength(1);
 		expect(result?.additionalTools?.[0]?.name).toBe("compliance_verdict");
 		expect(result?.additionalTools?.[0]?.label).toBe("Compliance Verdict");
 		expect(typeof result?.additionalTools?.[0]?.execute).toBe("function");
-		expect(Object.isFrozen(result?.additionalTools)).toBe(true);
 		expect(result?.metadata).toEqual({ complianceReviewId: env.reviewId });
 		expect(Object.isFrozen(result?.metadata)).toBe(true);
 	});
@@ -116,6 +118,7 @@ describe("createComplianceAdvisorHook", () => {
 		const { hook, env, registry } = setupFixture({ runtime });
 
 		const event = makeComplianceEvent({
+			reviewId: env.reviewId,
 			metadata: { reviewId: env.reviewId, taskId: TASK_ID, contractHash: HASH, attempt: 1 },
 		});
 		const resultC = hook(event) as AdvisorBeforeRunResult;
@@ -146,6 +149,7 @@ describe("createComplianceAdvisorHook", () => {
 		const { hook, env, registry } = setupFixture({ runtime });
 		const result = hook(
 			makeComplianceEvent({
+				reviewId: env.reviewId,
 				metadata: { reviewId: env.reviewId, taskId: TASK_ID, contractHash: HASH, attempt: 1 },
 			}),
 		) as AdvisorBeforeRunResult;
@@ -169,6 +173,7 @@ describe("createComplianceAdvisorHook", () => {
 		const { hook, env } = setupFixture({ runtime });
 
 		const event = makeComplianceEvent({
+			reviewId: env.reviewId,
 			metadata: { reviewId: env.reviewId, taskId: TASK_ID, contractHash: HASH, attempt: 1 },
 		});
 		const resultC = hook(event) as AdvisorBeforeRunResult;
@@ -192,6 +197,7 @@ describe("createComplianceAdvisorHook", () => {
 		const { hook, env } = setupFixture({ runtime });
 
 		const event = makeComplianceEvent({
+			reviewId: env.reviewId,
 			metadata: { reviewId: env.reviewId, taskId: TASK_ID, contractHash: HASH, attempt: 1 },
 		});
 		const resultC = hook(event) as AdvisorBeforeRunResult;
@@ -215,6 +221,7 @@ describe("createComplianceAdvisorHook", () => {
 		const { hook, env } = setupFixture({ runtime });
 
 		const event = makeComplianceEvent({
+			reviewId: env.reviewId,
 			metadata: { reviewId: env.reviewId, taskId: TASK_ID, contractHash: HASH, attempt: 1 },
 		});
 		const resultC = hook(event) as AdvisorBeforeRunResult;

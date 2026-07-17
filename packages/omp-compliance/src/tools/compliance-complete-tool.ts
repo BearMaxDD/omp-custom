@@ -11,8 +11,9 @@
  *   claimed_verification: string[], max 30 items, each max 500 chars, optional
  */
 
+import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import type { ExtensionAPI, ToolDefinition } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { ComplianceRuntime } from "../runtime/compliance-runtime";
-import type { ExtensionAPI } from "../types";
 
 // ─── Parameter validation ───────────────────────────────────────────
 
@@ -80,12 +81,15 @@ export function validateCompletionParams(raw: Record<string, unknown>): Validati
  *  3. Returns { status: "advisor_reviewing", completionSnapshot }
  */
 export function registerComplianceCompleteTool(api: ExtensionAPI, runtime: ComplianceRuntime): void {
-	api.registerTool({
+	const tool: ToolDefinition = {
 		name: "compliance_complete",
+		label: "Compliance Complete",
 		description:
 			"Notify the compliance system that a task has been completed. " +
 			"Requires a summary of what was done. " +
 			"Returns advisor_reviewing status — the Advisor will review and issue a verdict.",
+		loadMode: "essential",
+		approval: "write",
 		parameters: {
 			type: "object",
 			properties: {
@@ -105,14 +109,20 @@ export function registerComplianceCompleteTool(api: ExtensionAPI, runtime: Compl
 			required: ["summary"],
 			additionalProperties: false,
 		},
-		handler: async (params: Record<string, unknown>) => {
+		execute: async (
+			_toolCallId,
+			params: Record<string, unknown>,
+		): Promise<AgentToolResult<Record<string, unknown>>> => {
 			const errors = validateCompletionParams(params);
 			if (errors.length > 0) {
-				return {
-					success: false,
-					error: "Validation failed",
-					validationErrors: errors,
-				};
+				return toToolResult(
+					{
+						success: false,
+						error: "Validation failed",
+						validationErrors: errors,
+					},
+					true,
+				);
 			}
 
 			const { summary, claimed_verification } = params as unknown as CompletionToolParams;
@@ -122,20 +132,32 @@ export function registerComplianceCompleteTool(api: ExtensionAPI, runtime: Compl
 					summary,
 					claimedVerification: claimed_verification,
 				});
-				return {
+				return toToolResult({
 					success: true,
 					status: result.status,
 					completionSnapshot: result.completionSnapshot,
 					reviewId: result.reviewId,
 					receipt: result.receipt,
-				};
+				});
 			} catch (err: unknown) {
 				const message = err instanceof Error ? err.message : String(err);
-				return {
-					success: false,
-					error: message,
-				};
+				return toToolResult(
+					{
+						success: false,
+						error: message,
+					},
+					true,
+				);
 			}
 		},
-	});
+	};
+	api.registerTool(tool);
+}
+
+function toToolResult(details: Record<string, unknown>, isError = false): AgentToolResult<Record<string, unknown>> {
+	return {
+		content: [{ type: "text", text: JSON.stringify(details) }],
+		details,
+		isError,
+	};
 }
