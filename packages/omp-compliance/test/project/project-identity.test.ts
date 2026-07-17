@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
+	openSync,
 	readFileSync,
 	readdirSync,
 	realpathSync,
@@ -22,6 +23,7 @@ import {
 	type ProjectBinding,
 	ProjectIdentityStore,
 	normalizeRemoteIdentity,
+	readProjectBindingIfPresent,
 } from "../../src/project/project-identity";
 
 const cleanup: string[] = [];
@@ -110,6 +112,18 @@ describe("ProjectIdentityStore", () => {
 		expect(reopened.status).toBe("project_mismatch");
 		expect(reopened.observedRemote).toBe("bob@git.example.com/repos/widget");
 		expect(reopened.binding.projectId).toBe(initial.binding.projectId);
+	});
+
+	it("returns project_mismatch when an SSH URL port changes to an SCP numeric path", () => {
+		const root = initGit("ssh://git@git.example.com:2222/team/repo.git");
+		const initial = ProjectIdentityStore.open(root);
+		git(root, "remote", "set-url", "origin", "git@git.example.com:2222/team/repo.git");
+
+		const reopened = ProjectIdentityStore.open(root);
+
+		expect(initial.binding.gitRemoteIdentity).toBe("git.example.com!2222/team/repo");
+		expect(reopened.observedRemote).toBe("git.example.com/2222/team/repo");
+		expect(reopened.status).toBe("project_mismatch");
 	});
 
 	it("uses a non-Git cwd as the stable root and supports a missing remote", () => {
@@ -351,6 +365,75 @@ describe("ProjectIdentityStore", () => {
 		expect(existsSync(lockPath)).toBe(false);
 	});
 
+	it("recovers a stale lock with an out-of-range owner PID", () => {
+		const root = initGit();
+		const directory = join(root, ".omp", "compliance");
+		const lockPath = join(directory, ".project.lock");
+		mkdirSync(directory, { recursive: true });
+		const staleTime = new Date(Date.now() - 60_000);
+		writeFileSync(
+			lockPath,
+			JSON.stringify({ token: randomUUID(), pid: Number.MAX_SAFE_INTEGER, createdAt: staleTime.toISOString() }),
+		);
+		utimesSync(lockPath, staleTime, staleTime);
+
+		const result = ProjectIdentityStore.open(root);
+
+		expect(result.status).toBe("bound");
+		expect(existsSync(lockPath)).toBe(false);
+	});
+
+	it("recovers an expired lock when the owner process probe is unknown", () => {
+		const root = initGit();
+		const directory = join(root, ".omp", "compliance");
+		const lockPath = join(directory, ".project.lock");
+		mkdirSync(directory, { recursive: true });
+		const unknownPid = 123_456;
+		const staleTime = new Date(Date.now() - 60_000);
+		writeFileSync(
+			lockPath,
+			JSON.stringify({ token: randomUUID(), pid: unknownPid, createdAt: staleTime.toISOString() }),
+		);
+		utimesSync(lockPath, staleTime, staleTime);
+		const originalKill = process.kill;
+		process.kill = ((pid: number, signal?: string | number) => {
+			if (pid === unknownPid && signal === 0)
+				throw Object.assign(new Error("unknown process state"), { code: "EINVAL" });
+			return originalKill(pid, signal as never);
+		}) as typeof process.kill;
+
+		try {
+			const result = ProjectIdentityStore.open(root);
+			expect(result.status).toBe("bound");
+		} finally {
+			process.kill = originalKill;
+		}
+		expect(existsSync(lockPath)).toBe(false);
+	});
+
+	it("does not remove a recent lock with an unverified owner PID", async () => {
+		const root = initGit();
+		const directory = join(root, ".omp", "compliance");
+		const lockPath = join(directory, ".project.lock");
+		mkdirSync(directory, { recursive: true });
+		writeFileSync(
+			lockPath,
+			JSON.stringify({ token: randomUUID(), pid: Number.MAX_SAFE_INTEGER, createdAt: new Date().toISOString() }),
+		);
+		const before = statSync(lockPath);
+		const modulePath = join(import.meta.dir, "../../src/project/project-identity.ts");
+		const script = `import { ProjectIdentityStore } from ${JSON.stringify(modulePath)}; ProjectIdentityStore.open(${JSON.stringify(root)});`;
+		const child = Bun.spawn([process.execPath, "-e", script], { stderr: "pipe", stdout: "pipe" });
+		await Bun.sleep(100);
+		const after = statSync(lockPath);
+		child.kill();
+		await child.exited;
+
+		expect(after.ino).toBe(before.ino);
+		expect(after.mtimeMs).toBe(before.mtimeMs);
+		expect(existsSync(bindingPath(root))).toBe(false);
+	});
+
 	it("does not recover a lock owned by a live process", async () => {
 		const root = initGit();
 		const directory = join(root, ".omp", "compliance");
@@ -419,6 +502,52 @@ describe("ProjectIdentityStore", () => {
 		expect(readBinding(root)).toEqual(expected);
 		expect(existsSync(lockPath)).toBe(true);
 	});
+
+	it("fails closed when project.json is replaced after its fd is opened", () => {
+		const root = initGit();
+		const initial = ProjectIdentityStore.open(root);
+		const filePath = bindingPath(root);
+		const replacementPath = `${filePath}.replacement`;
+		writeFileSync(
+			replacementPath,
+			`${JSON.stringify({ ...initial.binding, projectId: randomUUID(), createdAt: new Date().toISOString() })}\n`,
+		);
+
+		expect(() =>
+			readProjectBindingIfPresent(filePath, (path, flags) => {
+				const fd = openSync(path, flags);
+				renameSync(replacementPath, filePath);
+				return fd;
+			}),
+		).toThrow(PROJECT_IDENTITY_INVALID_ERROR);
+	});
+
+	it("fails closed when the opened project.json fd is not a regular file", () => {
+		const root = initGit();
+		ProjectIdentityStore.open(root);
+		const filePath = bindingPath(root);
+		const directory = join(root, ".omp", "compliance");
+
+		expect(() => readProjectBindingIfPresent(filePath, (_path, flags) => openSync(directory, flags))).toThrow(
+			PROJECT_IDENTITY_INVALID_ERROR,
+		);
+	});
+
+	it("fails closed when storage directories are replaced during binding read", () => {
+		const root = initGit();
+		ProjectIdentityStore.open(root);
+		const filePath = bindingPath(root);
+		const ompDirectory = join(root, ".omp");
+
+		expect(() =>
+			readProjectBindingIfPresent(filePath, (path, flags) => {
+				const fd = openSync(path, flags);
+				renameSync(ompDirectory, join(root, ".omp-during-read"));
+				mkdirSync(join(ompDirectory, "compliance"), { recursive: true });
+				return fd;
+			}),
+		).toThrow(PROJECT_IDENTITY_INVALID_ERROR);
+	});
 });
 
 describe("normalizeRemoteIdentity", () => {
@@ -428,7 +557,7 @@ describe("normalizeRemoteIdentity", () => {
 		["ssh://git@github.com:22/acme/platform/widget.git", "github.com/acme/platform/widget"],
 		["git@github.com:acme/platform/widget.git", "github.com/acme/platform/widget"],
 		["https://github.com:443/acme/platform/widget.git", "github.com/acme/platform/widget"],
-		["ssh://git@[2001:db8::1]:2222/acme/widget.git", "[2001:db8::1]:2222/acme/widget"],
+		["ssh://git@[2001:db8::1]:2222/acme/widget.git", "[2001:db8::1]!2222/acme/widget"],
 		["https://GitHub.COM/acme/%77idget.git", "github.com/acme/widget"],
 	])("normalizes %s", (remote, expected) => {
 		const canonical = normalizeRemoteIdentity(remote);
@@ -438,6 +567,13 @@ describe("normalizeRemoteIdentity", () => {
 	});
 
 	it("keeps host, port, and the full namespace collision-resistant", () => {
+		const urlPort = normalizeRemoteIdentity("ssh://git@git.example.com:2222/team/repo.git");
+		const scpPath = normalizeRemoteIdentity("git@git.example.com:2222/team/repo.git");
+		expect(urlPort).toBe("git.example.com!2222/team/repo");
+		expect(scpPath).toBe("git.example.com/2222/team/repo");
+		expect(urlPort).not.toBe(scpPath);
+		expect(normalizeRemoteIdentity(urlPort as string)).toBe(urlPort);
+		expect(normalizeRemoteIdentity(scpPath as string)).toBe(scpPath);
 		expect(normalizeRemoteIdentity("https://git.example.com:8443/team/platform/widget.git")).not.toBe(
 			normalizeRemoteIdentity("https://git.example.com/team/platform/widget.git"),
 		);
