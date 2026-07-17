@@ -135,6 +135,65 @@ describe("EventLog", () => {
 		expect(claims[0]).not.toContain("-");
 	});
 
+	it.each([200, 1_000])("追加 %d 个事件后 done claim 数量保持在压缩阈值内", (count) => {
+		const root = temporaryRoot();
+		const path = join(root, "events.jsonl");
+		const log = new EventLog<TestEvent>(path);
+		const eventIds = Array.from({ length: count }, (_, index) => eventId(`checkpoint-${count}-${index}`));
+		for (const currentEventId of eventIds) log.append({ eventId: currentEventId, type: "checkpoint" });
+
+		const claimDirectory = join(root, ".events.jsonl.claims");
+		const doneClaims = readdirSync(claimDirectory).filter((name) => name.endsWith(".claim"));
+		expect(doneClaims.length).toBeLessThanOrEqual(64);
+		expect(existsSync(join(claimDirectory, ".checkpoint.json"))).toBeTrue();
+		const reopened = new EventLog<TestEvent>(path);
+		reopened.append({ eventId: eventIds[0] as string, type: "checkpoint" });
+		const physical = readFileSync(path, "utf8");
+		expect(physical.match(new RegExp(eventIds[0] as string, "g"))).toHaveLength(1);
+	});
+
+	it.each(["checkpoint_persisted", "claims_compacted"] as const)(
+		"%s 阶段进程崩溃后仍可恢复且重复事件不重写",
+		async (crashStage) => {
+			const root = temporaryRoot();
+			const path = join(root, "events.jsonl");
+			const ready = join(root, "ready");
+			const eventIds = Array.from({ length: 65 }, (_, index) => eventId(`checkpoint-crash-${index}`));
+			const secureFsModule = new URL("../../src/evidence/secure-fs.ts", import.meta.url).href;
+			const script = `
+			import { writeFileSync } from "node:fs";
+			import { EventLog } from ${JSON.stringify(eventLogModule)};
+			import { setSecureFsTestHook } from ${JSON.stringify(secureFsModule)};
+			const ids = ${JSON.stringify(eventIds)};
+			setSecureFsTestHook((event) => {
+				if (event.stage !== ${JSON.stringify(crashStage)}) return;
+				writeFileSync(process.argv[2], "ready");
+				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+			});
+			const log = new EventLog(process.argv[1]);
+			for (const eventId of ids) log.append({ eventId, type: "checkpoint" });
+		`;
+			const child = Bun.spawn([process.execPath, "-e", script, path, ready], { stderr: "pipe" });
+			const deadline = Date.now() + 10_000;
+			while (!existsSync(ready) && Date.now() < deadline) await Bun.sleep(10);
+			expect(existsSync(ready)).toBeTrue();
+			child.kill("SIGKILL");
+			await child.exited;
+
+			const reopened = new EventLog<TestEvent>(path);
+			for (const currentEventId of eventIds) reopened.append({ eventId: currentEventId, type: "checkpoint" });
+			const physicalLines = readFileSync(path, "utf8").trim().split("\n");
+			expect(physicalLines).toHaveLength(65);
+			for (const currentEventId of eventIds) {
+				expect(physicalLines.filter((line) => line.includes(currentEventId))).toHaveLength(1);
+			}
+			expect(
+				readdirSync(join(root, ".events.jsonl.claims")).filter((name) => name.endsWith(".claim")).length,
+			).toBeLessThanOrEqual(64);
+		},
+		20_000,
+	);
+
 	it("读取时按 eventId 去重跨进程重试留下的重复行", () => {
 		const path = join(temporaryRoot(), "events.jsonl");
 		const event = { eventId: eventId("stable-disk-event"), type: "completion" };

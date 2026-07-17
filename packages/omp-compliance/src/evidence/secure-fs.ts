@@ -33,13 +33,45 @@ export interface SecureFsTestEvent {
 		| "claim_created"
 		| "event_appended"
 		| "tail_recovered"
-		| "recovery_entries_listed";
+		| "recovery_entries_listed"
+		| "snapshot_lock_acquired"
+		| "snapshot_temp_synced"
+		| "checkpoint_persisted"
+		| "claims_compacted";
 }
 
 let testHook: ((event: SecureFsTestEvent) => void) | undefined;
 
 export function setSecureFsTestHook(hook: ((event: SecureFsTestEvent) => void) | undefined): void {
 	testHook = hook;
+}
+
+export type SecureFsSyscall =
+	| "open"
+	| "openat"
+	| "mkdirat"
+	| "renameat"
+	| "unlinkat"
+	| "fstat"
+	| "fsync"
+	| "fchmod"
+	| "close"
+	| "write"
+	| "read"
+	| "pread"
+	| "flock"
+	| "lseek";
+
+let eintrTestPlan = new Map<SecureFsSyscall, number>();
+
+export function setSecureFsEintrTestPlan(plan: Partial<Record<SecureFsSyscall, number>> | undefined): void {
+	eintrTestPlan = new Map(
+		Object.entries(plan ?? {}).filter((entry): entry is [SecureFsSyscall, number] => (entry[1] ?? 0) > 0),
+	);
+}
+
+export function getSecureFsEintrTestRemaining(): Partial<Record<SecureFsSyscall, number>> {
+	return Object.fromEntries([...eintrTestPlan].filter(([, remaining]) => remaining > 0));
 }
 
 const supportedPlatform = process.platform === "darwin" || process.platform === "linux";
@@ -74,6 +106,7 @@ const LOCK_EX = 2;
 const LOCK_UN = 8;
 const SEEK_SET = 0;
 const SEEK_END = 2;
+const EINTR = osConstants.errno.EINTR;
 
 function requirePosix(): NonNullable<typeof posix> {
 	if (!posix) {
@@ -91,6 +124,21 @@ function errno(): number {
 	return address ? read.u32(address) : 0;
 }
 
+function retryPosix<T extends number | bigint>(syscall: SecureFsSyscall, operation: () => T): T {
+	for (;;) {
+		const simulated = eintrTestPlan.get(syscall) ?? 0;
+		if (simulated > 0) {
+			if (simulated === 1) eintrTestPlan.delete(syscall);
+			else eintrTestPlan.set(syscall, simulated - 1);
+			continue;
+		}
+		const result = operation();
+		if (Number(result) >= 0) return result;
+		if (errno() !== EINTR) return result;
+		if (syscall === "close" && process.platform === "linux") return 0 as T;
+	}
+}
+
 function cString(value: string): Buffer {
 	return Buffer.from(`${value}\0`);
 }
@@ -106,7 +154,7 @@ function fail(operation: SecureFsOperation): never {
 
 function closeQuietly(descriptor: number): void {
 	try {
-		requirePosix().close(descriptor);
+		retryPosix("close", () => requirePosix().close(descriptor));
 	} catch {
 		// Preserve the authoritative operation failure.
 	}
@@ -149,7 +197,7 @@ function canonicalTrustedRoot(path: string): CanonicalTrustedRoot {
 
 function directoryIdentity(descriptor: number): { device: bigint; inode: bigint } {
 	const status = Buffer.alloc(256);
-	if (requirePosix().fstat(descriptor, ptr(status)) < 0) fail("open_directory");
+	if (retryPosix("fstat", () => requirePosix().fstat(descriptor, ptr(status))) < 0) fail("open_directory");
 	return process.platform === "darwin"
 		? { device: BigInt(status.readUInt32LE(0)), inode: status.readBigUInt64LE(8) }
 		: { device: status.readBigUInt64LE(0), inode: status.readBigUInt64LE(8) };
@@ -157,7 +205,9 @@ function directoryIdentity(descriptor: number): { device: bigint; inode: bigint 
 
 function openAt(directory: number, name: string, flags: number, mode = 0): number {
 	assertComponent(name);
-	const descriptor = invokePath(name, (address) => requirePosix().openat(directory, address, flags, mode));
+	const descriptor = invokePath(name, (address) =>
+		retryPosix("openat", () => requirePosix().openat(directory, address, flags, mode)),
+	);
 	if (descriptor < 0) fail("open_file");
 	return descriptor;
 }
@@ -176,7 +226,7 @@ function openOrCreateAt(directory: number, name: string): number {
 			constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
 			0o600,
 		);
-		if (requirePosix().fchmod(descriptor, 0o600) < 0) {
+		if (retryPosix("fchmod", () => requirePosix().fchmod(descriptor, 0o600)) < 0) {
 			closeQuietly(descriptor);
 			fail("open_file");
 		}
@@ -190,18 +240,20 @@ function openOrCreateAt(directory: number, name: string): number {
 function writeAll(descriptor: number, content: Buffer): void {
 	let offset = 0;
 	while (offset < content.byteLength) {
-		const written = Number(requirePosix().write(descriptor, ptr(content, offset), content.byteLength - offset));
+		const written = Number(
+			retryPosix("write", () => requirePosix().write(descriptor, ptr(content, offset), content.byteLength - offset)),
+		);
 		if (written <= 0) fail("write_file");
 		offset += written;
 	}
 }
 
 function readAll(descriptor: number): Buffer {
-	if (Number(requirePosix().lseek(descriptor, 0, SEEK_SET)) < 0) fail("read_file");
+	if (Number(retryPosix("lseek", () => requirePosix().lseek(descriptor, 0, SEEK_SET))) < 0) fail("read_file");
 	const chunks: Buffer[] = [];
 	for (;;) {
 		const chunk = Buffer.allocUnsafe(64 * 1024);
-		const bytesRead = Number(requirePosix().read(descriptor, ptr(chunk), chunk.byteLength));
+		const bytesRead = Number(retryPosix("read", () => requirePosix().read(descriptor, ptr(chunk), chunk.byteLength)));
 		if (bytesRead < 0) fail("read_file");
 		if (bytesRead === 0) break;
 		chunks.push(chunk.subarray(0, bytesRead));
@@ -232,9 +284,9 @@ function createExclusiveAt(directory: number, name: string, content: Buffer): bo
 			constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
 			0o600,
 		);
-		if (requirePosix().fchmod(descriptor, 0o600) < 0) fail("open_file");
+		if (retryPosix("fchmod", () => requirePosix().fchmod(descriptor as number, 0o600)) < 0) fail("open_file");
 		writeAll(descriptor, content);
-		if (requirePosix().fsync(descriptor) < 0) fail("sync_file");
+		if (retryPosix("fsync", () => requirePosix().fsync(descriptor as number)) < 0) fail("sync_file");
 		return true;
 	} catch (error) {
 		if (error instanceof SecureFsError && error.code === osConstants.errno.EEXIST) return false;
@@ -244,7 +296,7 @@ function createExclusiveAt(directory: number, name: string, content: Buffer): bo
 	}
 }
 
-function atomicReplaceAt(directory: number, name: string, content: Buffer): void {
+function atomicReplaceAt(directory: number, name: string, content: Buffer, afterTemporarySync?: () => void): void {
 	const temporaryName = `.${name}.${randomUUID()}.tmp`;
 	let descriptor: number | undefined;
 	let temporaryExists = false;
@@ -256,22 +308,27 @@ function atomicReplaceAt(directory: number, name: string, content: Buffer): void
 			0o600,
 		);
 		temporaryExists = true;
-		if (requirePosix().fchmod(descriptor, 0o600) < 0) fail("open_file");
+		if (retryPosix("fchmod", () => requirePosix().fchmod(descriptor as number, 0o600)) < 0) fail("open_file");
 		writeAll(descriptor, content);
-		if (requirePosix().fsync(descriptor) < 0) fail("sync_file");
+		if (retryPosix("fsync", () => requirePosix().fsync(descriptor as number)) < 0) fail("sync_file");
+		afterTemporarySync?.();
 		closeQuietly(descriptor);
 		descriptor = undefined;
 		const result = invokePath(temporaryName, (temporaryAddress) =>
-			invokePath(name, (finalAddress) => requirePosix().renameat(directory, temporaryAddress, directory, finalAddress)),
+			invokePath(name, (finalAddress) =>
+				retryPosix("renameat", () => requirePosix().renameat(directory, temporaryAddress, directory, finalAddress)),
+			),
 		);
 		if (result < 0) fail("rename_file");
 		temporaryExists = false;
-		if (requirePosix().fsync(directory) < 0) fail("sync_file");
+		if (retryPosix("fsync", () => requirePosix().fsync(directory)) < 0) fail("sync_file");
 	} finally {
 		if (descriptor !== undefined) closeQuietly(descriptor);
 		if (temporaryExists) {
 			try {
-				const result = invokePath(temporaryName, (address) => requirePosix().unlinkat(directory, address, 0));
+				const result = invokePath(temporaryName, (address) =>
+					retryPosix("unlinkat", () => requirePosix().unlinkat(directory, address, 0)),
+				);
 				if (result < 0 && errno() !== osConstants.errno.ENOENT) fail("unlink_file");
 			} catch {
 				// Cleanup cannot replace the authoritative write failure.
@@ -292,12 +349,57 @@ export interface SecureRecoveryRecord {
 
 export type SecureRecoveryFactory = (content: string, truncatedTail: string) => SecureRecoveryRecord;
 
+const CLAIM_CHECKPOINT_NAME = ".checkpoint.json";
+const CLAIM_COMPACTION_THRESHOLD = 64;
+
+interface ClaimCheckpoint {
+	version: 1;
+	eventIds: string[];
+}
+
+interface ClaimCheckpointCache {
+	device: bigint;
+	inode: bigint;
+	size: bigint;
+	mtimeNs: bigint;
+	eventIds: Set<string>;
+}
+
+function claimState(content: string): { state: "pending" | "done"; eventId?: string } | undefined {
+	const match = /^(pending|done)(?: ([^\n]+))?\n$/.exec(content);
+	if (!match) return undefined;
+	return { state: match[1] as "pending" | "done", eventId: match[2] };
+}
+
+function withNamedLock<T>(directory: number, lockName: string, operation: () => T): T {
+	let descriptor: number | undefined;
+	let directoryLocked = false;
+	let locked = false;
+	try {
+		if (retryPosix("flock", () => requirePosix().flock(directory, LOCK_EX)) < 0) fail("lock_file");
+		directoryLocked = true;
+		descriptor = openOrCreateAt(directory, lockName);
+		if (retryPosix("flock", () => requirePosix().flock(descriptor as number, LOCK_EX)) < 0) fail("lock_file");
+		locked = true;
+		if (retryPosix("flock", () => requirePosix().flock(directory, LOCK_UN)) < 0) fail("lock_file");
+		directoryLocked = false;
+		return operation();
+	} finally {
+		if (directoryLocked) retryPosix("flock", () => requirePosix().flock(directory, LOCK_UN));
+		if (descriptor !== undefined) {
+			if (locked) retryPosix("flock", () => requirePosix().flock(descriptor as number, LOCK_UN));
+			closeQuietly(descriptor);
+		}
+	}
+}
+
 export class SecurePathScope {
 	private readonly components: string[];
 	private readonly absolutePath: string;
 	private readonly anchorDepth: number;
 	private readonly anchorDevice: bigint;
 	private readonly anchorInode: bigint;
+	private readonly checkpointCache = new Map<string, ClaimCheckpointCache>();
 
 	constructor(root: string, childDirectories: readonly string[] = []) {
 		const canonical = canonicalTrustedRoot(root);
@@ -333,7 +435,7 @@ export class SecurePathScope {
 		let locked = false;
 		let directoryLocked = false;
 		try {
-			if (requirePosix().flock(directory, LOCK_EX) < 0) fail("lock_file");
+			if (retryPosix("flock", () => requirePosix().flock(directory, LOCK_EX)) < 0) fail("lock_file");
 			directoryLocked = true;
 			try {
 				descriptor = options.createFile
@@ -345,25 +447,27 @@ export class SecurePathScope {
 				}
 				throw error;
 			}
-			if (requirePosix().flock(descriptor, LOCK_EX) < 0) fail("lock_file");
+			if (retryPosix("flock", () => requirePosix().flock(descriptor as number, LOCK_EX)) < 0) fail("lock_file");
 			locked = true;
-			if (requirePosix().flock(directory, LOCK_UN) < 0) fail("lock_file");
+			if (retryPosix("flock", () => requirePosix().flock(directory, LOCK_UN)) < 0) fail("lock_file");
 			directoryLocked = false;
 			testHook?.({ stage: "lock_acquired" });
 			const result = operation({
 				read: () => readAll(descriptor as number),
 				append: (content) => {
-					if (Number(requirePosix().lseek(descriptor as number, 0, SEEK_END)) < 0) fail("write_file");
+					if (Number(retryPosix("lseek", () => requirePosix().lseek(descriptor as number, 0, SEEK_END))) < 0) {
+						fail("write_file");
+					}
 					writeAll(descriptor as number, content);
-					if (requirePosix().fsync(descriptor as number) < 0) fail("sync_file");
+					if (retryPosix("fsync", () => requirePosix().fsync(descriptor as number)) < 0) fail("sync_file");
 				},
 			});
-			if (options.createFile && requirePosix().fsync(directory) < 0) fail("sync_file");
+			if (options.createFile && retryPosix("fsync", () => requirePosix().fsync(directory)) < 0) fail("sync_file");
 			return result;
 		} finally {
-			if (directoryLocked) requirePosix().flock(directory, LOCK_UN);
+			if (directoryLocked) retryPosix("flock", () => requirePosix().flock(directory, LOCK_UN));
 			if (descriptor !== undefined) {
-				if (locked) requirePosix().flock(descriptor, LOCK_UN);
+				if (locked) retryPosix("flock", () => requirePosix().flock(descriptor as number, LOCK_UN));
 				closeQuietly(descriptor);
 			}
 			closeQuietly(directory);
@@ -386,52 +490,63 @@ export class SecurePathScope {
 		let directoryLocked = false;
 		let logLocked = false;
 		try {
-			if (requirePosix().flock(directory, LOCK_EX) < 0) fail("lock_file");
+			if (retryPosix("flock", () => requirePosix().flock(directory, LOCK_EX)) < 0) fail("lock_file");
 			directoryLocked = true;
 			claimDirectory = this.openChildDirectory(directory, claimDirectoryName, true);
 			if (claimDirectory === undefined) fail("open_directory");
-			if (requirePosix().fsync(directory) < 0) fail("sync_file");
+			if (retryPosix("fsync", () => requirePosix().fsync(directory)) < 0) fail("sync_file");
 
-			const claimCreated = createExclusiveAt(claimDirectory, claimName, Buffer.from("pending\n"));
+			const claimCreated = createExclusiveAt(claimDirectory, claimName, Buffer.from(`pending ${eventId}\n`));
 			if (claimCreated) {
-				if (requirePosix().fsync(claimDirectory) < 0) fail("sync_file");
+				if (retryPosix("fsync", () => requirePosix().fsync(claimDirectory as number)) < 0) fail("sync_file");
 				testHook?.({ stage: "claim_created" });
 			} else {
 				const claimDescriptor = openAt(claimDirectory, claimName, constants.O_RDONLY | constants.O_NOFOLLOW);
 				try {
-					if (readAll(claimDescriptor).toString("utf8") === "done\n") return;
+					readAll(claimDescriptor);
 				} finally {
 					closeQuietly(claimDescriptor);
 				}
 			}
 
 			logDescriptor = openOrCreateAt(directory, name);
-			if (requirePosix().fsync(directory) < 0) fail("sync_file");
-			if (requirePosix().flock(logDescriptor, LOCK_EX) < 0) fail("lock_file");
+			if (retryPosix("fsync", () => requirePosix().fsync(directory)) < 0) fail("sync_file");
+			if (retryPosix("flock", () => requirePosix().flock(logDescriptor as number, LOCK_EX)) < 0) fail("lock_file");
 			logLocked = true;
-			if (requirePosix().flock(directory, LOCK_UN) < 0) fail("lock_file");
+			if (retryPosix("flock", () => requirePosix().flock(directory, LOCK_UN)) < 0) fail("lock_file");
 			directoryLocked = false;
 			testHook?.({ stage: "lock_acquired" });
+			if (this.loadClaimCheckpoint(claimDirectory).has(eventId)) {
+				if (claimCreated) this.unlinkClaim(claimDirectory, claimName);
+				else this.compactDoneClaims(claimDirectoryName, claimDirectory);
+				return;
+			}
 			this.recoverUnterminatedTail(logDescriptor, claimDirectory, recoveryFactory);
 
 			const currentClaim = openAt(claimDirectory, claimName, constants.O_RDONLY | constants.O_NOFOLLOW);
 			try {
-				if (readAll(currentClaim).toString("utf8") === "done\n") return;
+				if (claimState(readAll(currentClaim).toString("utf8"))?.state === "done") {
+					this.compactDoneClaims(claimDirectoryName, claimDirectory);
+					return;
+				}
 			} finally {
 				closeQuietly(currentClaim);
 			}
 
 			if (claimCreated || !fileContainsEventId(logDescriptor, eventId)) {
-				if (Number(requirePosix().lseek(logDescriptor, 0, SEEK_END)) < 0) fail("write_file");
+				if (Number(retryPosix("lseek", () => requirePosix().lseek(logDescriptor as number, 0, SEEK_END))) < 0) {
+					fail("write_file");
+				}
 				writeAll(logDescriptor, content);
-				if (requirePosix().fsync(logDescriptor) < 0) fail("sync_file");
+				if (retryPosix("fsync", () => requirePosix().fsync(logDescriptor as number)) < 0) fail("sync_file");
 				testHook?.({ stage: "event_appended" });
 			}
-			atomicReplaceAt(claimDirectory, claimName, Buffer.from("done\n"));
+			atomicReplaceAt(claimDirectory, claimName, Buffer.from(`done ${eventId}\n`));
+			this.compactDoneClaims(claimDirectoryName, claimDirectory);
 		} finally {
-			if (directoryLocked) requirePosix().flock(directory, LOCK_UN);
+			if (directoryLocked) retryPosix("flock", () => requirePosix().flock(directory, LOCK_UN));
 			if (logDescriptor !== undefined) {
-				if (logLocked) requirePosix().flock(logDescriptor, LOCK_UN);
+				if (logLocked) retryPosix("flock", () => requirePosix().flock(logDescriptor as number, LOCK_UN));
 				closeQuietly(logDescriptor);
 			}
 			if (claimDirectory !== undefined) closeQuietly(claimDirectory);
@@ -444,12 +559,14 @@ export class SecurePathScope {
 		claimDirectory: number,
 		recoveryFactory: SecureRecoveryFactory,
 	): void {
-		const size = Number(requirePosix().lseek(logDescriptor, 0, SEEK_END));
+		const size = Number(retryPosix("lseek", () => requirePosix().lseek(logDescriptor, 0, SEEK_END)));
 		if (size < 0) fail("read_file");
 		if (size === 0) return;
 
 		const finalByte = Buffer.allocUnsafe(1);
-		const bytesRead = Number(requirePosix().pread(logDescriptor, ptr(finalByte), 1, size - 1));
+		const bytesRead = Number(
+			retryPosix("pread", () => requirePosix().pread(logDescriptor, ptr(finalByte), 1, size - 1)),
+		);
 		if (bytesRead !== 1) fail("read_file");
 		if (finalByte[0] === 0x0a) return;
 
@@ -457,9 +574,11 @@ export class SecurePathScope {
 		const truncatedTail = content.slice(content.lastIndexOf("\n") + 1);
 		try {
 			JSON.parse(truncatedTail);
-			if (Number(requirePosix().lseek(logDescriptor, 0, SEEK_END)) < 0) fail("write_file");
+			if (Number(retryPosix("lseek", () => requirePosix().lseek(logDescriptor, 0, SEEK_END))) < 0) {
+				fail("write_file");
+			}
 			writeAll(logDescriptor, Buffer.from("\n"));
-			if (requirePosix().fsync(logDescriptor) < 0) fail("sync_file");
+			if (retryPosix("fsync", () => requirePosix().fsync(logDescriptor)) < 0) fail("sync_file");
 			return;
 		} catch (error) {
 			if (error instanceof SecureFsError) throw error;
@@ -482,26 +601,144 @@ export class SecurePathScope {
 		content: Buffer,
 	): void {
 		const claimName = `${createHash("sha256").update(eventId).digest("hex")}.claim`;
-		const claimCreated = createExclusiveAt(claimDirectory, claimName, Buffer.from("pending\n"));
+		const claimCreated = createExclusiveAt(claimDirectory, claimName, Buffer.from(`pending ${eventId}\n`));
+		if (this.loadClaimCheckpoint(claimDirectory).has(eventId)) {
+			if (claimCreated) this.unlinkClaim(claimDirectory, claimName);
+			return;
+		}
 		if (claimCreated) {
-			if (requirePosix().fsync(claimDirectory) < 0) fail("sync_file");
+			if (retryPosix("fsync", () => requirePosix().fsync(claimDirectory)) < 0) fail("sync_file");
 		} else {
 			const claimDescriptor = openAt(claimDirectory, claimName, constants.O_RDONLY | constants.O_NOFOLLOW);
 			try {
-				if (readAll(claimDescriptor).toString("utf8") === "done\n") return;
+				if (claimState(readAll(claimDescriptor).toString("utf8"))?.state === "done") return;
 			} finally {
 				closeQuietly(claimDescriptor);
 			}
 			if (fileContainsEventId(logDescriptor, eventId)) {
-				atomicReplaceAt(claimDirectory, claimName, Buffer.from("done\n"));
+				atomicReplaceAt(claimDirectory, claimName, Buffer.from(`done ${eventId}\n`));
 				return;
 			}
 		}
 
-		if (Number(requirePosix().lseek(logDescriptor, 0, SEEK_END)) < 0) fail("write_file");
+		if (Number(retryPosix("lseek", () => requirePosix().lseek(logDescriptor, 0, SEEK_END))) < 0) fail("write_file");
 		writeAll(logDescriptor, content);
-		if (requirePosix().fsync(logDescriptor) < 0) fail("sync_file");
-		atomicReplaceAt(claimDirectory, claimName, Buffer.from("done\n"));
+		if (retryPosix("fsync", () => requirePosix().fsync(logDescriptor)) < 0) fail("sync_file");
+		atomicReplaceAt(claimDirectory, claimName, Buffer.from(`done ${eventId}\n`));
+	}
+
+	private loadClaimCheckpoint(claimDirectory: number): Set<string> {
+		const directory = directoryIdentity(claimDirectory);
+		const cacheKey = `${directory.device}:${directory.inode}`;
+		let descriptor: number | undefined;
+		try {
+			descriptor = openAt(claimDirectory, CLAIM_CHECKPOINT_NAME, constants.O_RDONLY | constants.O_NOFOLLOW);
+		} catch (error) {
+			if (error instanceof SecureFsError && error.code === osConstants.errno.ENOENT) {
+				this.checkpointCache.delete(cacheKey);
+				return new Set();
+			}
+			throw error;
+		}
+
+		try {
+			const status = fstatSync(descriptor, { bigint: true });
+			const cached = this.checkpointCache.get(cacheKey);
+			if (
+				cached &&
+				cached.device === status.dev &&
+				cached.inode === status.ino &&
+				cached.size === status.size &&
+				cached.mtimeNs === status.mtimeNs
+			) {
+				return cached.eventIds;
+			}
+
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(readAll(descriptor).toString("utf8"));
+			} catch (error) {
+				throw new SecureFsError("read_file", undefined, error);
+			}
+			if (
+				typeof parsed !== "object" ||
+				parsed === null ||
+				(parsed as Partial<ClaimCheckpoint>).version !== 1 ||
+				!Array.isArray((parsed as Partial<ClaimCheckpoint>).eventIds) ||
+				!(parsed as ClaimCheckpoint).eventIds.every((eventId) => typeof eventId === "string")
+			) {
+				throw new SecureFsError("read_file", undefined, new Error("Invalid claim checkpoint"));
+			}
+			const eventIds = new Set((parsed as ClaimCheckpoint).eventIds);
+			this.checkpointCache.set(cacheKey, {
+				device: status.dev,
+				inode: status.ino,
+				size: status.size,
+				mtimeNs: status.mtimeNs,
+				eventIds,
+			});
+			return eventIds;
+		} finally {
+			closeQuietly(descriptor);
+		}
+	}
+
+	private unlinkClaim(claimDirectory: number, claimName: string): void {
+		const result = invokePath(claimName, (address) =>
+			retryPosix("unlinkat", () => requirePosix().unlinkat(claimDirectory, address, 0)),
+		);
+		if (result < 0 && errno() !== osConstants.errno.ENOENT) fail("unlink_file");
+		if (retryPosix("fsync", () => requirePosix().fsync(claimDirectory)) < 0) fail("sync_file");
+	}
+
+	private compactDoneClaims(claimDirectoryName: string, claimDirectory: number): void {
+		const claimPath = `${this.absolutePath}${sep}${claimDirectoryName}`;
+		const doneClaims: Array<{ name: string; eventId: string }> = [];
+		let claimNames: string[];
+		try {
+			claimNames = this.discoverEntriesAt(claimDirectory, claimPath);
+		} catch (error) {
+			if (error instanceof SecureFsError && error.operation === "list_directory") return;
+			throw error;
+		}
+		const candidateNames = claimNames.filter((name) => /^[0-9a-f]{64}\.claim$/.test(name));
+		if (candidateNames.length <= CLAIM_COMPACTION_THRESHOLD) return;
+		for (const name of candidateNames) {
+			let descriptor: number | undefined;
+			try {
+				descriptor = openAt(claimDirectory, name, constants.O_RDONLY | constants.O_NOFOLLOW);
+				const state = claimState(readAll(descriptor).toString("utf8"));
+				if (state?.state === "done" && state.eventId) doneClaims.push({ name, eventId: state.eventId });
+			} catch (error) {
+				if (
+					error instanceof SecureFsError &&
+					(error.code === osConstants.errno.ENOENT || error.code === osConstants.errno.ELOOP)
+				) {
+					continue;
+				}
+				throw error;
+			} finally {
+				if (descriptor !== undefined) closeQuietly(descriptor);
+			}
+		}
+		if (doneClaims.length <= CLAIM_COMPACTION_THRESHOLD) return;
+
+		const eventIds = new Set(this.loadClaimCheckpoint(claimDirectory));
+		for (const claim of doneClaims) eventIds.add(claim.eventId);
+		const checkpoint: ClaimCheckpoint = { version: 1, eventIds: [...eventIds].sort() };
+		atomicReplaceAt(claimDirectory, CLAIM_CHECKPOINT_NAME, Buffer.from(`${JSON.stringify(checkpoint)}\n`));
+		const identity = directoryIdentity(claimDirectory);
+		this.checkpointCache.delete(`${identity.device}:${identity.inode}`);
+		testHook?.({ stage: "checkpoint_persisted" });
+
+		for (const claim of doneClaims) {
+			const result = invokePath(claim.name, (address) =>
+				retryPosix("unlinkat", () => requirePosix().unlinkat(claimDirectory, address, 0)),
+			);
+			if (result < 0 && errno() !== osConstants.errno.ENOENT) fail("unlink_file");
+		}
+		if (retryPosix("fsync", () => requirePosix().fsync(claimDirectory)) < 0) fail("sync_file");
+		testHook?.({ stage: "claims_compacted" });
 	}
 
 	atomicWrite(name: string, content: Buffer): void {
@@ -510,7 +747,10 @@ export class SecurePathScope {
 		if (directory === undefined) fail("open_directory");
 		testHook?.({ stage: "directory_opened" });
 		try {
-			atomicReplaceAt(directory, name, content);
+			withNamedLock(directory, `.${name}.lock`, () => {
+				testHook?.({ stage: "snapshot_lock_acquired" });
+				atomicReplaceAt(directory, name, content, () => testHook?.({ stage: "snapshot_temp_synced" }));
+			});
 		} finally {
 			closeQuietly(directory);
 		}
@@ -524,7 +764,7 @@ export class SecurePathScope {
 		try {
 			child = this.openChildDirectory(parent, name, true);
 			if (child === undefined) fail("open_directory");
-			if (requirePosix().fsync(parent) < 0) fail("sync_file");
+			if (retryPosix("fsync", () => requirePosix().fsync(parent)) < 0) fail("sync_file");
 		} finally {
 			if (child !== undefined) closeQuietly(child);
 			closeQuietly(parent);
@@ -570,55 +810,60 @@ export class SecurePathScope {
 			`^\\.${escapedFileName}\\.[0-9a-f]{8}-[0-9a-f]{4}-[457][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.tmp$`,
 			"i",
 		);
-		const removed: string[] = [];
-		let locked = false;
 		try {
-			if (requirePosix().flock(directory, LOCK_EX) < 0) fail("lock_file");
-			locked = true;
-			for (const name of this.discoverEntries(directory)) {
-				if (!temporaryPattern.test(name)) continue;
-				let descriptor: number | undefined;
-				try {
-					descriptor = openAt(directory, name, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-					if (!fstatSync(descriptor).isFile()) continue;
-				} catch (error) {
-					if (
-						error instanceof SecureFsError &&
-						(error.code === osConstants.errno.ENOENT || error.code === osConstants.errno.ELOOP)
-					) {
-						continue;
+			return withNamedLock(directory, `.${fileName}.lock`, () => {
+				testHook?.({ stage: "snapshot_lock_acquired" });
+				const removed: string[] = [];
+				for (const name of this.discoverEntries(directory)) {
+					if (!temporaryPattern.test(name)) continue;
+					let descriptor: number | undefined;
+					try {
+						descriptor = openAt(directory, name, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+						if (!fstatSync(descriptor).isFile()) continue;
+					} catch (error) {
+						if (
+							error instanceof SecureFsError &&
+							(error.code === osConstants.errno.ENOENT || error.code === osConstants.errno.ELOOP)
+						) {
+							continue;
+						}
+						throw error;
+					} finally {
+						if (descriptor !== undefined) closeQuietly(descriptor);
 					}
-					throw error;
-				} finally {
-					if (descriptor !== undefined) closeQuietly(descriptor);
-				}
 
-				const result = invokePath(name, (address) => requirePosix().unlinkat(directory, address, 0));
-				if (result < 0) {
-					if (errno() === osConstants.errno.ENOENT) continue;
-					fail("unlink_file");
+					const result = invokePath(name, (address) =>
+						retryPosix("unlinkat", () => requirePosix().unlinkat(directory, address, 0)),
+					);
+					if (result < 0) {
+						if (errno() === osConstants.errno.ENOENT) continue;
+						fail("unlink_file");
+					}
+					removed.push(name);
 				}
-				removed.push(name);
-			}
-			if (removed.length > 0 && requirePosix().fsync(directory) < 0) fail("sync_file");
-			return removed;
+				if (removed.length > 0 && retryPosix("fsync", () => requirePosix().fsync(directory)) < 0) fail("sync_file");
+				return removed;
+			});
 		} finally {
-			if (locked) requirePosix().flock(directory, LOCK_UN);
 			closeQuietly(directory);
 		}
 	}
 
 	private discoverEntries(directory: number): string[] {
+		return this.discoverEntriesAt(directory, this.absolutePath, true);
+	}
+
+	private discoverEntriesAt(directory: number, absolutePath: string, emitRecoveryHook = false): string[] {
 		let entries: string[];
 		try {
-			entries = readdirSync(this.absolutePath);
+			entries = readdirSync(absolutePath);
 		} catch (error) {
 			throw new SecureFsError("list_directory", undefined, error);
 		}
-		testHook?.({ stage: "recovery_entries_listed" });
+		if (emitRecoveryHook) testHook?.({ stage: "recovery_entries_listed" });
 		let status: ReturnType<typeof lstatSync>;
 		try {
-			status = lstatSync(this.absolutePath, { bigint: true });
+			status = lstatSync(absolutePath, { bigint: true });
 		} catch (error) {
 			throw new SecureFsError("list_directory", undefined, error);
 		}
@@ -637,7 +882,9 @@ export class SecurePathScope {
 	private openDirectory(create: boolean): number | undefined {
 		const api = requirePosix();
 		const rootPath = cString(sep);
-		let current = api.open(ptr(rootPath), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW, 0);
+		let current = retryPosix("open", () =>
+			api.open(ptr(rootPath), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW, 0),
+		);
 		if (current < 0) fail("open_directory");
 		try {
 			if (this.anchorDepth === 0) this.verifyAnchor(current);
@@ -674,7 +921,9 @@ export class SecurePathScope {
 			if (!create) return undefined;
 		}
 
-		const result = invokePath(name, (address) => requirePosix().mkdirat(parent, address, 0o700));
+		const result = invokePath(name, (address) =>
+			retryPosix("mkdirat", () => requirePosix().mkdirat(parent, address, 0o700)),
+		);
 		if (result < 0 && errno() !== osConstants.errno.EEXIST) fail("open_directory");
 		return openAt(parent, name, flags);
 	}

@@ -219,7 +219,7 @@ describe("EvidenceRepository", () => {
 			].sort(),
 		);
 		expect(second).toEqual({ taskIds: ["task-a", "task-b"], topicIds: ["topic-a"], cleanedTemporarySnapshots: [] });
-		expect(readdirSync(firstTaskRoot)).toEqual([]);
+		expect(readdirSync(firstTaskRoot).sort()).toEqual([".contract.json.lock", ".state.json.lock"]);
 	});
 
 	it("仓库事件日志与快照可重新打开恢复", () => {
@@ -290,6 +290,7 @@ describe("SnapshotStore", () => {
 		expect(readdirSync(root).sort()).toEqual(
 			[
 				".contract.json.550e8400-e29b-41d4-a716-446655440000.tmp",
+				".state.json.lock",
 				".state.json.not-a-uuid.tmp",
 				symlinkTemp,
 				"outside.json",
