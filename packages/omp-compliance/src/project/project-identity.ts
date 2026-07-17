@@ -86,7 +86,14 @@ interface PublishOwner {
 	readonly token: string;
 	readonly pid: number;
 	readonly createdAt: string;
+	readonly processInstance?: ProcessInstanceObservation;
+	// v17 pre-release markers used a coarse value without recording its source.
 	readonly processStartedAtMs?: number;
+}
+
+interface ProcessInstanceObservation {
+	readonly source: "linux-proc-starttime-ticks" | "ps-lstart-seconds";
+	readonly value: string;
 }
 
 interface PublishMarkerSnapshot extends FileIdentity {
@@ -478,12 +485,12 @@ interface PublishAttempt {
 
 function createPublishMarker(directory: string, storageIdentity: StorageIdentity): PublishAttempt {
 	while (true) {
-		const processStartedAtMs = readProcessStartedAt(process.pid);
+		const processInstance = observeProcessInstance(process.pid);
 		const owner = Object.freeze({
 			token: randomUUID(),
 			pid: process.pid,
 			createdAt: new Date().toISOString(),
-			...(processStartedAtMs === undefined ? {} : { processStartedAtMs }),
+			...(processInstance === undefined ? {} : { processInstance }),
 		});
 		const markerPath = join(directory, `.project.publish.${owner.token}.json`);
 		let markerNode: FileNodeIdentity | undefined;
@@ -873,16 +880,20 @@ function removeFileIfIdentityMatches(path: string, identity: FileIdentity): bool
 function parsePublishOwner(content: string, expectedToken: string): PublishOwner | undefined {
 	try {
 		const value = JSON.parse(content) as unknown;
-		const hasProcessStartedAt = isRecord(value) && Object.hasOwn(value, "processStartedAtMs");
+		const hasProcessInstance = isRecord(value) && Object.hasOwn(value, "processInstance");
+		const hasLegacyProcessStartedAt = isRecord(value) && Object.hasOwn(value, "processStartedAtMs");
+		const processInstance = hasProcessInstance ? parseProcessInstance(value.processInstance) : undefined;
 		if (
 			!isRecord(value) ||
-			Object.keys(value).length !== (hasProcessStartedAt ? 4 : 3) ||
+			(hasProcessInstance && hasLegacyProcessStartedAt) ||
+			Object.keys(value).length !== (hasProcessInstance || hasLegacyProcessStartedAt ? 4 : 3) ||
 			value.token !== expectedToken ||
 			!Number.isSafeInteger(value.pid) ||
 			(value.pid as number) <= 0 ||
 			(value.pid as number) > MAX_PROBEABLE_PID ||
 			!isIsoTimestamp(value.createdAt) ||
-			(hasProcessStartedAt &&
+			(hasProcessInstance && processInstance === undefined) ||
+			(hasLegacyProcessStartedAt &&
 				(!Number.isSafeInteger(value.processStartedAtMs) ||
 					(value.processStartedAtMs as number) <= 0 ||
 					(value.processStartedAtMs as number) % 1_000 !== 0))
@@ -893,11 +904,25 @@ function parsePublishOwner(content: string, expectedToken: string): PublishOwner
 			token: value.token as string,
 			pid: value.pid as number,
 			createdAt: value.createdAt,
-			...(hasProcessStartedAt ? { processStartedAtMs: value.processStartedAtMs as number } : {}),
+			...(processInstance === undefined ? {} : { processInstance }),
+			...(hasLegacyProcessStartedAt ? { processStartedAtMs: value.processStartedAtMs as number } : {}),
 		});
 	} catch {
 		return undefined;
 	}
+}
+
+function parseProcessInstance(value: unknown): ProcessInstanceObservation | undefined {
+	if (
+		!isRecord(value) ||
+		Object.keys(value).length !== 2 ||
+		(value.source !== "linux-proc-starttime-ticks" && value.source !== "ps-lstart-seconds") ||
+		typeof value.value !== "string" ||
+		!/^[1-9]\d*$/.test(value.value)
+	) {
+		return undefined;
+	}
+	return Object.freeze({ source: value.source, value: value.value });
 }
 
 function readPublishMarkerSnapshot(marker: PublishMarkerPath): PublishMarkerSnapshot | undefined {
@@ -951,30 +976,47 @@ function probePublishOwner(owner: PublishOwner): PublishOwnerState {
 	const processState = probeProcess(owner.pid);
 	if (processState === "dead") return "stale";
 	if (processState === "unknown") return "unknown";
-	if (owner.processStartedAtMs === undefined) return "unknown";
-	const processStartedAt = readProcessStartedAt(owner.pid);
-	if (processStartedAt === undefined) return "unknown";
-	return processStartedAt === owner.processStartedAtMs ? "current" : "stale";
+	if (owner.processInstance === undefined) return "unknown";
+	const observed = observeProcessInstance(owner.pid);
+	if (observed === undefined || observed.source !== owner.processInstance.source) return "unknown";
+	if (observed.value !== owner.processInstance.value) return "stale";
+	return observed.source === "linux-proc-starttime-ticks" ? "current" : "unknown";
 }
 
-function readProcessStartedAt(pid: number): number | undefined {
-	if (process.platform === "win32") {
-		return pid === process.pid ? normalizeProcessStartedAt(Date.now() - process.uptime() * 1_000) : undefined;
+function observeProcessInstance(pid: number): ProcessInstanceObservation | undefined {
+	const linuxStarttimeTicks = readLinuxStarttimeTicks(pid);
+	if (linuxStarttimeTicks !== undefined) {
+		return Object.freeze({ source: "linux-proc-starttime-ticks", value: linuxStarttimeTicks });
 	}
+	if (process.platform === "win32") return undefined;
 	try {
 		const output = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
 			encoding: "utf8",
 			stdio: ["ignore", "pipe", "ignore"],
 		}).trim();
 		const timestamp = Date.parse(output);
-		return Number.isNaN(timestamp) ? undefined : normalizeProcessStartedAt(timestamp);
+		return Number.isNaN(timestamp)
+			? undefined
+			: Object.freeze({ source: "ps-lstart-seconds", value: String(Math.floor(timestamp / 1_000)) });
 	} catch {
 		return undefined;
 	}
 }
 
-function normalizeProcessStartedAt(timestamp: number): number {
-	return Math.floor(timestamp / 1_000) * 1_000;
+function readLinuxStarttimeTicks(pid: number): string | undefined {
+	try {
+		const content = readFileSync(`/proc/${pid}/stat`, "utf8");
+		const commandEnd = content.lastIndexOf(")");
+		if (commandEnd < 0) return undefined;
+		const fields = content
+			.slice(commandEnd + 1)
+			.trim()
+			.split(/\s+/);
+		const starttime = fields[19];
+		return starttime !== undefined && /^[1-9]\d*$/.test(starttime) ? starttime : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 function probeProcess(pid: number): ProcessState {

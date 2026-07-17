@@ -391,7 +391,7 @@ describe("ProjectIdentityStore", () => {
 		expect(readdirSync(directory)).toEqual(["project.json"]);
 	}, 8_000);
 
-	it("persists a stable process start identity in a new publish marker", async () => {
+	it("persists a sourced process instance observation in a new publish marker", async () => {
 		const root = initGit();
 		const directory = join(root, ".omp", "compliance");
 		const modulePath = join(import.meta.dir, "../../src/project/project-identity.ts");
@@ -408,8 +408,15 @@ describe("ProjectIdentityStore", () => {
 		const markerName = readdirSync(directory).find((name) => name.startsWith(".project.publish."));
 		expect(markerName).toBeDefined();
 		const owner = JSON.parse(readFileSync(join(directory, markerName as string), "utf8")) as Record<string, unknown>;
-		expect(Object.keys(owner).sort()).toEqual(["createdAt", "pid", "processStartedAtMs", "token"]);
-		expect(Number.isSafeInteger(owner.processStartedAtMs)).toBe(true);
+		if (process.platform === "win32") {
+			expect(Object.keys(owner).sort()).toEqual(["createdAt", "pid", "token"]);
+		} else {
+			expect(Object.keys(owner).sort()).toEqual(["createdAt", "pid", "processInstance", "token"]);
+			expect(owner.processInstance).toEqual({
+				source: process.platform === "linux" ? "linux-proc-starttime-ticks" : "ps-lstart-seconds",
+				value: expect.stringMatching(/^\d+$/),
+			});
+		}
 	});
 
 	it("publishes one UUID with two stale unique markers and concurrent new publishers", async () => {
@@ -665,7 +672,7 @@ describe("ProjectIdentityStore", () => {
 		expect(existsSync(markerPath)).toBe(true);
 	}, 8_000);
 
-	it("reclaims a marker when a PID is reused within the old timestamp tolerance", async () => {
+	it("reclaims a coarse marker when a PID start second differs", async () => {
 		const root = initGit();
 		const directory = join(root, ".omp", "compliance");
 		const token = randomUUID();
@@ -679,7 +686,12 @@ describe("ProjectIdentityStore", () => {
 		mkdirSync(directory, { recursive: true });
 		writeFileSync(
 			markerPath,
-			JSON.stringify({ token, pid: fakePid, createdAt: createdAt.toISOString(), processStartedAtMs: ownerStartedAtMs }),
+			JSON.stringify({
+				token,
+				pid: fakePid,
+				createdAt: createdAt.toISOString(),
+				processInstance: { source: "ps-lstart-seconds", value: String(ownerStartedAtMs / 1_000) },
+			}),
 		);
 		utimesSync(markerPath, createdAt, createdAt);
 		const child = Bun.spawn(
@@ -697,6 +709,77 @@ describe("ProjectIdentityStore", () => {
 		expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
 		expect(stdout).toBe("bound");
 		expect(readFileSync(tracePath, "utf8")).toBe("ps\n");
+		expect(existsSync(markerPath)).toBe(false);
+	});
+
+	it("keeps a live owner when a reused PID has the same coarse start second", async () => {
+		const root = initGit();
+		const directory = join(root, ".omp", "compliance");
+		const token = randomUUID();
+		const markerPath = join(directory, `.project.publish.${token}.json`);
+		const modulePath = join(import.meta.dir, "../../src/project/project-identity.ts");
+		const fakePid = 123_456;
+		const createdAt = new Date();
+		const coarseStartedAtMs = Math.floor((createdAt.getTime() - 10_000) / 1_000) * 1_000;
+		mkdirSync(directory, { recursive: true });
+		writeFileSync(
+			markerPath,
+			JSON.stringify({
+				token,
+				pid: fakePid,
+				createdAt: createdAt.toISOString(),
+				processInstance: { source: "ps-lstart-seconds", value: String(coarseStartedAtMs / 1_000) },
+			}),
+		);
+		utimesSync(markerPath, createdAt, createdAt);
+		const child = Bun.spawn(
+			[
+				process.execPath,
+				"-e",
+				`import { mock } from "bun:test"; import * as childProcess from "node:child_process"; const execFileSync = childProcess.execFileSync.bind(childProcess); mock.module("node:child_process", () => ({ ...childProcess, execFileSync(file, args, options) { if (file === "ps" && args?.includes(${JSON.stringify(String(fakePid))})) return ${JSON.stringify(new Date(coarseStartedAtMs).toUTCString())}; return execFileSync(file, args, options); } })); const originalKill = process.kill; process.kill = ((pid, signal) => pid === ${fakePid} && signal === 0 ? true : originalKill(pid, signal)); const { ProjectIdentityStore, PROJECT_IDENTITY_INVALID_ERROR } = await import(${JSON.stringify(modulePath)}); try { ProjectIdentityStore.open(${JSON.stringify(root)}); } catch (error) { if (error instanceof Error && error.message === PROJECT_IDENTITY_INVALID_ERROR) process.exit(2); throw error; }`,
+			],
+			{ stderr: "pipe", stdout: "pipe" },
+		);
+		const stderr = await new Response(child.stderr).text();
+
+		expect({ exitCode: await child.exited, stderr }).toEqual({ exitCode: 2, stderr: "" });
+		expect(existsSync(markerPath)).toBe(true);
+	}, 8_000);
+
+	it("reclaims a marker when an exact Linux process instance ID differs", async () => {
+		const root = initGit();
+		const directory = join(root, ".omp", "compliance");
+		const token = randomUUID();
+		const markerPath = join(directory, `.project.publish.${token}.json`);
+		const tracePath = join(root, "proc-starttime-probe.txt");
+		const modulePath = join(import.meta.dir, "../../src/project/project-identity.ts");
+		const fakePid = 123_456;
+		const procPath = `/proc/${fakePid}/stat`;
+		const procStat = `${fakePid} (test process) S ${Array.from({ length: 18 }, (_, index) => index + 1).join(" ")} 1001 0`;
+		mkdirSync(directory, { recursive: true });
+		writeFileSync(
+			markerPath,
+			JSON.stringify({
+				token,
+				pid: fakePid,
+				createdAt: new Date().toISOString(),
+				processInstance: { source: "linux-proc-starttime-ticks", value: "1000" },
+			}),
+		);
+		const child = Bun.spawn(
+			[
+				process.execPath,
+				"-e",
+				`import { mock } from "bun:test"; import * as fs from "node:fs"; const readFileSync = fs.readFileSync.bind(fs); const appendFileSync = fs.appendFileSync.bind(fs); mock.module("node:fs", () => ({ ...fs, readFileSync(path, ...args) { if (path === ${JSON.stringify(procPath)}) { appendFileSync(${JSON.stringify(tracePath)}, "proc\\n"); return ${JSON.stringify(procStat)}; } return readFileSync(path, ...args); } })); const originalKill = process.kill; process.kill = ((pid, signal) => pid === ${fakePid} && signal === 0 ? true : originalKill(pid, signal)); const { ProjectIdentityStore } = await import(${JSON.stringify(modulePath)}); console.log(ProjectIdentityStore.open(${JSON.stringify(root)}).status);`,
+			],
+			{ stderr: "pipe", stdout: "pipe" },
+		);
+		const stdout = (await new Response(child.stdout).text()).trim();
+		const stderr = await new Response(child.stderr).text();
+
+		expect({ exitCode: await child.exited, stderr }).toEqual({ exitCode: 0, stderr: "" });
+		expect(stdout).toBe("bound");
+		expect(readFileSync(tracePath, "utf8")).toBe("proc\n");
 		expect(existsSync(markerPath)).toBe(false);
 	});
 
