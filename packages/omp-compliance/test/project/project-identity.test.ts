@@ -59,6 +59,34 @@ function readBinding(root: string): ProjectBinding {
 }
 
 describe("ProjectIdentityStore", () => {
+	it("wraps a missing cwd in the stable project identity error", () => {
+		const cwd = join(tempProject(), "missing");
+		let thrown: unknown;
+		try {
+			ProjectIdentityStore.open(cwd);
+		} catch (error) {
+			thrown = error;
+		}
+
+		expect(thrown).toBeInstanceOf(Error);
+		expect((thrown as Error).message).toBe(PROJECT_IDENTITY_INVALID_ERROR);
+		expect((thrown as Error & { cause?: unknown }).cause).toBeInstanceOf(Error);
+		expect((thrown as Error & { cause?: { code?: string } }).cause?.code).toBe("ENOENT");
+	});
+
+	it("wraps a non-string cwd in the stable project identity error", () => {
+		let thrown: unknown;
+		try {
+			ProjectIdentityStore.open(undefined as never);
+		} catch (error) {
+			thrown = error;
+		}
+
+		expect(thrown).toBeInstanceOf(Error);
+		expect((thrown as Error).message).toBe(PROJECT_IDENTITY_INVALID_ERROR);
+		expect((thrown as Error & { cause?: unknown }).cause).toBeInstanceOf(TypeError);
+	});
+
 	it("creates one credential-free UUID binding atomically and reuses it", () => {
 		const root = initGit("https://github.com/acme/platform/widget.git");
 		const nested = join(root, "packages", "app");
@@ -475,6 +503,28 @@ describe("ProjectIdentityStore", () => {
 		expect(existsSync(bindingPath(root))).toBe(false);
 	});
 
+	it("uses the stable error when storage disappears while waiting for the lock", async () => {
+		const root = initGit();
+		const ompDirectory = join(root, ".omp");
+		const directory = join(ompDirectory, "compliance");
+		mkdirSync(directory, { recursive: true });
+		writeFileSync(
+			join(directory, ".project.lock"),
+			JSON.stringify({ token: randomUUID(), pid: process.pid, createdAt: new Date().toISOString() }),
+		);
+		const modulePath = join(import.meta.dir, "../../src/project/project-identity.ts");
+		const script = `import { ProjectIdentityStore } from ${JSON.stringify(modulePath)}; try { ProjectIdentityStore.open(${JSON.stringify(root)}); } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exit(2); }`;
+		const child = Bun.spawn([process.execPath, "-e", script], { stderr: "pipe", stdout: "pipe" });
+		await Bun.sleep(100);
+		renameSync(ompDirectory, join(root, ".omp-disappeared"));
+		const stderr = await new Response(child.stderr).text();
+
+		expect(await child.exited).toBe(2);
+		expect(stderr).toContain(PROJECT_IDENTITY_INVALID_ERROR);
+		expect(stderr).not.toContain("ENOENT:");
+		expect(existsSync(bindingPath(root))).toBe(false);
+	});
+
 	it("does not clobber a binding that appears while another opener waits", async () => {
 		const root = initGit();
 		const directory = join(root, ".omp", "compliance");
@@ -517,6 +567,25 @@ describe("ProjectIdentityStore", () => {
 			readProjectBindingIfPresent(filePath, (path, flags) => {
 				const fd = openSync(path, flags);
 				renameSync(replacementPath, filePath);
+				return fd;
+			}),
+		).toThrow(PROJECT_IDENTITY_INVALID_ERROR);
+	});
+
+	it("fails closed after an equal-length in-place write restores the original mtime", () => {
+		const root = initGit();
+		const initial = ProjectIdentityStore.open(root);
+		const filePath = bindingPath(root);
+		const originalContent = readFileSync(filePath, "utf8");
+		const replacementContent = originalContent.replace(initial.binding.projectId, randomUUID());
+		const originalStats = statSync(filePath);
+		expect(replacementContent.length).toBe(originalContent.length);
+
+		expect(() =>
+			readProjectBindingIfPresent(filePath, (path, flags) => {
+				const fd = openSync(path, flags);
+				writeFileSync(path, replacementContent);
+				utimesSync(path, originalStats.atimeMs / 1_000, originalStats.mtimeMs / 1_000);
 				return fd;
 			}),
 		).toThrow(PROJECT_IDENTITY_INVALID_ERROR);
@@ -597,6 +666,24 @@ describe("normalizeRemoteIdentity", () => {
 		expect(git).toBe(https);
 		expect(normalizeRemoteIdentity(alice as string)).toBe(alice);
 		expect(normalizeRemoteIdentity(bob as string)).toBe(bob);
+	});
+
+	it("normalizes expanded URL and compressed SCP IPv6 hosts to one identity", () => {
+		const url = normalizeRemoteIdentity("ssh://git@[2001:db8::1]/team/repo.git");
+		const scp = normalizeRemoteIdentity("git@[2001:0db8:0:0:0:0:0:1]:team/repo.git");
+
+		expect(url).toBe("[2001:db8::1]/team/repo");
+		expect(scp).toBe(url);
+		expect(normalizeRemoteIdentity(url as string)).toBe(url);
+	});
+
+	it("folds the git protocol default port 9418", () => {
+		const explicit = normalizeRemoteIdentity("git://git.example.com:9418/team/repo.git");
+		const implicit = normalizeRemoteIdentity("git://git.example.com/team/repo.git");
+
+		expect(explicit).toBe("git.example.com/team/repo");
+		expect(implicit).toBe(explicit);
+		expect(normalizeRemoteIdentity(explicit as string)).toBe(explicit);
 	});
 
 	it.each([

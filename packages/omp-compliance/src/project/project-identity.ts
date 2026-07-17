@@ -68,29 +68,26 @@ interface LockOwner {
 	readonly createdAt: string;
 }
 
-interface LockSnapshot {
-	readonly dev: number;
-	readonly ino: number;
-	readonly mtimeMs: number;
-	readonly size: number;
+interface LockSnapshot extends FileIdentity {
 	readonly owner?: LockOwner;
 }
 
 interface FileNodeIdentity {
-	readonly dev: number;
-	readonly ino: number;
+	readonly dev: bigint;
+	readonly ino: bigint;
 }
 
 interface FileIdentity extends FileNodeIdentity {
-	readonly mtimeMs: number;
-	readonly size: number;
+	readonly mtimeNs: bigint;
+	readonly ctimeNs: bigint;
+	readonly size: bigint;
 }
 
 interface DirectoryIdentity {
 	readonly path: string;
 	readonly realpath: string;
-	readonly dev: number;
-	readonly ino: number;
+	readonly dev: bigint;
+	readonly ino: bigint;
 }
 
 interface StorageIdentity {
@@ -110,25 +107,34 @@ type LockOwnerState = "current" | "stale" | "unknown";
 // biome-ignore lint/complexity/noStaticOnlyClass: The plan specifies a named ProjectIdentityStore.open boundary.
 export class ProjectIdentityStore {
 	static open(cwd: string, options: ProjectIdentityOpenOptions = {}): ProjectIdentityResult {
-		const codebaseProjectId = readCodebaseProjectId(options);
-		const canonicalCwd = canonicalPath(cwd);
-		const gitRoot = findGitRoot(canonicalCwd);
-		const observedRoot = gitRoot ?? canonicalCwd;
-		const observedRemote = gitRoot === undefined ? undefined : readGitRemoteIdentity(gitRoot);
-		const filePath = join(observedRoot, ".omp", "compliance", "project.json");
-		assertStoragePathSafe(observedRoot);
-		const existing = readProjectBindingIfPresent(filePath);
-		const binding = existing ?? createBindingAtomically(filePath, observedRoot, observedRemote, codebaseProjectId);
+		try {
+			const codebaseProjectId = readCodebaseProjectId(options);
+			const canonicalCwd = canonicalPath(cwd);
+			const gitRoot = findGitRoot(canonicalCwd);
+			const observedRoot = gitRoot ?? canonicalCwd;
+			const observedRemote = gitRoot === undefined ? undefined : readGitRemoteIdentity(gitRoot);
+			const filePath = join(observedRoot, ".omp", "compliance", "project.json");
+			assertStoragePathSafe(observedRoot);
+			const existing = readProjectBindingIfPresent(filePath);
+			const binding = existing ?? createBindingAtomically(filePath, observedRoot, observedRemote, codebaseProjectId);
 
-		const result = Object.freeze({
-			status: compareBinding(binding, observedRoot, observedRemote, codebaseProjectId),
-			binding,
-			observedRoot,
-			...(observedRemote === undefined ? {} : { observedRemote }),
-		});
-		PROJECT_IDENTITY_RESULTS.add(result);
-		return result;
+			const result = Object.freeze({
+				status: compareBinding(binding, observedRoot, observedRemote, codebaseProjectId),
+				binding,
+				observedRoot,
+				...(observedRemote === undefined ? {} : { observedRemote }),
+			});
+			PROJECT_IDENTITY_RESULTS.add(result);
+			return result;
+		} catch (error) {
+			if (isProjectIdentityError(error)) throw error;
+			throw new Error(PROJECT_IDENTITY_INVALID_ERROR, { cause: error });
+		}
 	}
+}
+
+function isProjectIdentityError(error: unknown): error is Error {
+	return error instanceof Error && error.message === PROJECT_IDENTITY_INVALID_ERROR;
 }
 
 export function isBoundProjectIdentityResult(value: unknown): value is ProjectIdentityResult {
@@ -228,13 +234,17 @@ export function normalizeRemoteIdentity(remoteUrl: string): string | undefined {
 	if (canonical?.[2] && canonical[4]) {
 		if (canonical[3] && !isValidPort(canonical[3])) return undefined;
 		sshUsername = canonical[1];
-		host = `${canonical[2].toLowerCase()}${canonical[3] ? `!${canonical[3]}` : ""}`;
+		const canonicalHost = normalizeRemoteHost(canonical[2]);
+		if (!canonicalHost) return undefined;
+		host = `${canonicalHost}${canonical[3] ? `!${canonical[3]}` : ""}`;
 		path = canonical[4];
 	} else if (!trimmed.includes("://")) {
 		const scpLike = trimmed.match(/^(?:([A-Za-z0-9._-]+)@)?(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):([^?#]+)$/);
 		if (!scpLike?.[2] || !scpLike[3] || scpLike[3].includes("@")) return undefined;
 		sshUsername = scpLike[1];
-		host = scpLike[2].toLowerCase();
+		const scpHost = normalizeRemoteHost(scpLike[2]);
+		if (!scpHost) return undefined;
+		host = scpHost;
 		path = scpLike[3];
 	} else {
 		try {
@@ -244,9 +254,9 @@ export function normalizeRemoteIdentity(remoteUrl: string): string | undefined {
 				return undefined;
 			if (parsed.username && !/^[A-Za-z0-9._-]+$/.test(parsed.username)) return undefined;
 			sshUsername = parsed.username || undefined;
-			host = parsed.hostname.toLowerCase();
+			host = normalizeRemoteHost(parsed.hostname) ?? "";
 			if (!host) return undefined;
-			const defaultPort = parsed.protocol === "ssh:" ? "22" : undefined;
+			const defaultPort = parsed.protocol === "ssh:" ? "22" : parsed.protocol === "git:" ? "9418" : undefined;
 			if (parsed.port && parsed.port !== defaultPort) host = `${host}!${parsed.port}`;
 			path = parsed.pathname;
 		} catch {
@@ -277,6 +287,16 @@ export function normalizeRemoteIdentity(remoteUrl: string): string | undefined {
 function isValidPort(value: string): boolean {
 	const port = Number(value);
 	return Number.isInteger(port) && port >= 1 && port <= 65_535 && String(port) === value;
+}
+
+function normalizeRemoteHost(value: string): string | undefined {
+	if (!value.startsWith("[")) return value.toLowerCase();
+	try {
+		const hostname = new URL(`http://${value}/`).hostname.toLowerCase();
+		return hostname.startsWith("[") && hostname.endsWith("]") ? hostname : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 function createBindingAtomically(
@@ -317,7 +337,7 @@ function createBindingAtomically(
 			assertStorageIdentity(storageIdentity);
 			const fd = openSync(temporaryPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | NO_FOLLOW, 0o600);
 			try {
-				const opened = fstatSync(fd);
+				const opened = fstatSync(fd, { bigint: true });
 				temporaryNode = Object.freeze({ dev: opened.dev, ino: opened.ino });
 				assertStorageIdentity(storageIdentity);
 				writeFileSync(fd, `${JSON.stringify(binding, null, 2)}\n`, "utf8");
@@ -340,7 +360,10 @@ function createBindingAtomically(
 				if (!competingBinding) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
 				publishedBinding = competingBinding;
 			}
-			if (linked) assertRegularFileIdentity(filePath, temporaryIdentity);
+			if (linked) {
+				const publishedIdentity = captureRegularFileIdentity(filePath, temporaryNode);
+				assertRegularFileIdentity(temporaryPath, publishedIdentity);
+			}
 			assertStorageIdentity(storageIdentity);
 			fsyncDirectory(directory, storageIdentity.compliance);
 			assertStorageIdentity(storageIdentity);
@@ -386,7 +409,7 @@ function acquireLock(
 			if (existsSync(filePath)) return undefined;
 			const snapshot = readLockSnapshot(lockPath);
 			if (snapshot) {
-				const ageMs = Date.now() - snapshot.mtimeMs;
+				const ageMs = Date.now() - nanosecondsToMilliseconds(snapshot.mtimeNs);
 				const ownerState = snapshot.owner ? probeLockOwner(snapshot.owner, snapshot) : undefined;
 				const recoverable =
 					(ownerState === undefined && ageMs >= LOCK_RECOVERY_GRACE_MS) ||
@@ -436,12 +459,12 @@ export function readProjectBindingIfPresent(
 function readFileNoFollow(filePath: string, expectedIdentity: FileIdentity, openFile: ProjectFileOpener): string {
 	const fd = openFile(filePath, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0) | NO_FOLLOW);
 	try {
-		const opened = fstatSync(fd);
+		const opened = fstatSync(fd, { bigint: true });
 		if (!opened.isFile() || !sameFileIdentity(expectedIdentity, opened)) {
 			throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
 		}
 		const content = readFileSync(fd, "utf8");
-		const afterRead = fstatSync(fd);
+		const afterRead = fstatSync(fd, { bigint: true });
 		if (!afterRead.isFile() || !sameFileIdentity(expectedIdentity, afterRead)) {
 			throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
 		}
@@ -500,7 +523,7 @@ function captureStorageIdentityFromDirectories(ompDirectory: string, complianceD
 
 function captureDirectoryIdentity(path: string): DirectoryIdentity {
 	try {
-		const stats = lstatSync(path);
+		const stats = lstatSync(path, { bigint: true });
 		if (stats.isSymbolicLink() || !stats.isDirectory()) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
 		return Object.freeze({ path, realpath: canonicalPath(path), dev: stats.dev, ino: stats.ino });
 	} catch (error) {
@@ -516,7 +539,7 @@ function assertStorageIdentity(identity: StorageIdentity): void {
 
 function assertDirectoryIdentity(identity: DirectoryIdentity): void {
 	try {
-		const stats = lstatSync(identity.path);
+		const stats = lstatSync(identity.path, { bigint: true });
 		if (
 			stats.isSymbolicLink() ||
 			!stats.isDirectory() ||
@@ -551,7 +574,7 @@ function assertStoragePathSafe(canonicalRoot: string): void {
 
 function assertDirectoryNotLink(path: string, allowMissing = false): void {
 	try {
-		const stats = lstatSync(path);
+		const stats = lstatSync(path, { bigint: true });
 		if (stats.isSymbolicLink() || !stats.isDirectory()) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
 	} catch (error) {
 		if (allowMissing && isNotFound(error)) return;
@@ -573,11 +596,17 @@ function assertRegularFileOrMissing(path: string): void {
 
 function captureRegularFileIdentity(path: string, expectedNode: FileNodeIdentity): FileIdentity {
 	try {
-		const stats = lstatSync(path);
+		const stats = lstatSync(path, { bigint: true });
 		if (stats.isSymbolicLink() || !stats.isFile() || stats.dev !== expectedNode.dev || stats.ino !== expectedNode.ino) {
 			throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
 		}
-		return Object.freeze({ dev: stats.dev, ino: stats.ino, mtimeMs: stats.mtimeMs, size: stats.size });
+		return Object.freeze({
+			dev: stats.dev,
+			ino: stats.ino,
+			mtimeNs: stats.mtimeNs,
+			ctimeNs: stats.ctimeNs,
+			size: stats.size,
+		});
 	} catch (error) {
 		if (error instanceof Error && error.message === PROJECT_IDENTITY_INVALID_ERROR) throw error;
 		throw new Error(PROJECT_IDENTITY_INVALID_ERROR, { cause: error });
@@ -585,14 +614,20 @@ function captureRegularFileIdentity(path: string, expectedNode: FileNodeIdentity
 }
 
 function captureExistingRegularFileIdentity(path: string): FileIdentity {
-	const stats = lstatSync(path);
+	const stats = lstatSync(path, { bigint: true });
 	if (stats.isSymbolicLink() || !stats.isFile()) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
-	return Object.freeze({ dev: stats.dev, ino: stats.ino, mtimeMs: stats.mtimeMs, size: stats.size });
+	return Object.freeze({
+		dev: stats.dev,
+		ino: stats.ino,
+		mtimeNs: stats.mtimeNs,
+		ctimeNs: stats.ctimeNs,
+		size: stats.size,
+	});
 }
 
 function assertRegularFileIdentity(path: string, identity: FileIdentity): void {
 	try {
-		const stats = lstatSync(path);
+		const stats = lstatSync(path, { bigint: true });
 		if (stats.isSymbolicLink() || !stats.isFile() || !sameFileIdentity(identity, stats)) {
 			throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
 		}
@@ -604,7 +639,7 @@ function assertRegularFileIdentity(path: string, identity: FileIdentity): void {
 
 function removeFileNodeIfUnchanged(path: string, identity: FileNodeIdentity): void {
 	try {
-		const stats = lstatSync(path);
+		const stats = lstatSync(path, { bigint: true });
 		if (!stats.isSymbolicLink() && stats.isFile() && stats.dev === identity.dev && stats.ino === identity.ino) {
 			unlinkSync(path);
 		}
@@ -639,15 +674,16 @@ function readLockOwner(lockPath: string): LockOwner | undefined {
 
 function readLockSnapshot(lockPath: string): LockSnapshot | undefined {
 	try {
-		const before = lstatSync(lockPath);
+		const before = lstatSync(lockPath, { bigint: true });
 		if (before.isSymbolicLink() || !before.isFile()) return undefined;
 		const owner = readLockOwner(lockPath);
-		const after = lstatSync(lockPath);
+		const after = lstatSync(lockPath, { bigint: true });
 		if (!sameFileIdentity(before, after)) return undefined;
 		return Object.freeze({
 			dev: after.dev,
 			ino: after.ino,
-			mtimeMs: after.mtimeMs,
+			mtimeNs: after.mtimeNs,
+			ctimeNs: after.ctimeNs,
 			size: after.size,
 			...(owner === undefined ? {} : { owner }),
 		});
@@ -658,7 +694,7 @@ function readLockSnapshot(lockPath: string): LockSnapshot | undefined {
 
 function removeLockIfUnchanged(lockPath: string, snapshot: LockSnapshot): boolean {
 	try {
-		const current = lstatSync(lockPath);
+		const current = lstatSync(lockPath, { bigint: true });
 		if (!sameFileIdentity(snapshot, current)) return false;
 		unlinkSync(lockPath);
 		return true;
@@ -668,15 +704,25 @@ function removeLockIfUnchanged(lockPath: string, snapshot: LockSnapshot): boolea
 }
 
 function sameFileIdentity(
-	left: Pick<LockSnapshot, "dev" | "ino" | "mtimeMs" | "size">,
-	right: Pick<LockSnapshot, "dev" | "ino" | "mtimeMs" | "size">,
+	left: Pick<FileIdentity, "dev" | "ino" | "mtimeNs" | "ctimeNs" | "size">,
+	right: Pick<FileIdentity, "dev" | "ino" | "mtimeNs" | "ctimeNs" | "size">,
 ): boolean {
-	return left.dev === right.dev && left.ino === right.ino && left.mtimeMs === right.mtimeMs && left.size === right.size;
+	return (
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.mtimeNs === right.mtimeNs &&
+		left.ctimeNs === right.ctimeNs &&
+		left.size === right.size
+	);
+}
+
+function nanosecondsToMilliseconds(value: bigint): number {
+	return Number(value / 1_000_000n);
 }
 
 function probeLockOwner(owner: LockOwner, snapshot: LockSnapshot): LockOwnerState {
 	const createdAt = Date.parse(owner.createdAt);
-	if (Math.abs(createdAt - snapshot.mtimeMs) > LOCK_TIMESTAMP_TOLERANCE_MS) return "stale";
+	if (Math.abs(createdAt - nanosecondsToMilliseconds(snapshot.mtimeNs)) > LOCK_TIMESTAMP_TOLERANCE_MS) return "stale";
 	const processState = probeProcess(owner.pid);
 	if (processState === "dead") return "stale";
 	if (processState === "unknown") return "unknown";
@@ -727,10 +773,10 @@ function fsyncDirectory(directory: string, identity: DirectoryIdentity): void {
 	try {
 		const fd = openSync(directory, constants.O_RDONLY | NO_FOLLOW);
 		try {
-			const before = fstatSync(fd);
+			const before = fstatSync(fd, { bigint: true });
 			if (before.dev !== identity.dev || before.ino !== identity.ino) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
 			fsyncSync(fd);
-			const after = fstatSync(fd);
+			const after = fstatSync(fd, { bigint: true });
 			if (after.dev !== identity.dev || after.ino !== identity.ino) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
 		} finally {
 			closeSync(fd);
