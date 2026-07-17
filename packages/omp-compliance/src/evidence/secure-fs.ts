@@ -1,5 +1,5 @@
 import { FFIType, type Pointer, dlopen, ptr, read } from "bun:ffi";
-import { createHash, randomUUID } from "node:crypto";
+import { type Hash, createHash, randomUUID } from "node:crypto";
 import { constants, fstatSync, lstatSync, readdirSync, realpathSync } from "node:fs";
 import { constants as osConstants } from "node:os";
 import { basename, dirname, isAbsolute, parse, resolve, sep } from "node:path";
@@ -36,7 +36,7 @@ export class ClaimJournalCorruptionError extends Error {
 		readonly path: string,
 		readonly line: number,
 		readonly offset: number,
-		readonly reason: "malformed_claim_json" | "invalid_claim_record",
+		readonly reason: "malformed_claim_json" | "invalid_claim_record" | "claim_line_too_long",
 		cause?: unknown,
 	) {
 		super(`Claim journal is corrupt at line ${line}`, { cause });
@@ -72,12 +72,15 @@ export interface SecureFsTestEvent {
 		| "claim_journal_truncated"
 		| "claim_journal_cache_stats"
 		| "claim_journal_target_scan"
+		| "claim_journal_stream_stats"
 		| "legacy_claims_persisted"
 		| "legacy_claims_migrated";
 	bloomBytes?: number;
 	pendingBloomBytes?: number;
 	hotSize?: number;
 	pendingSize?: number;
+	maxReadChunkBytes?: number;
+	maxCarryBytes?: number;
 }
 
 // Claims remain append-only for crash auditability. Memory is bounded; persisted history grows linearly.
@@ -86,6 +89,8 @@ export const CLAIM_JOURNAL_CAPACITY_POLICY = {
 	baselineEvents: 100_000,
 	maxBaselineBytes: 16 * 1024 * 1024,
 	maxColdStartMs: 5_000,
+	readChunkBytes: 64 * 1024,
+	maxLineBytes: 64 * 1024,
 } as const;
 
 let testHook: ((event: SecureFsTestEvent) => void) | undefined;
@@ -343,6 +348,18 @@ function preadAll(descriptor: number, offset: number, length: number): Buffer {
 	return content.subarray(0, bytesRead);
 }
 
+function hashFilePrefix(descriptor: number, length: number): Buffer {
+	const hash = createHash("sha256");
+	let offset = 0;
+	while (offset < length) {
+		const chunk = preadAll(descriptor, offset, Math.min(CLAIM_JOURNAL_CAPACITY_POLICY.readChunkBytes, length - offset));
+		if (chunk.byteLength === 0) fail("read_file");
+		hash.update(chunk);
+		offset += chunk.byteLength;
+	}
+	return hash.digest();
+}
+
 function appendAndSync(descriptor: number, content: Buffer): void {
 	if (Number(retryPosix("lseek", () => requirePosix().lseek(descriptor, 0, SEEK_END))) < 0) fail("write_file");
 	writeAll(descriptor, content);
@@ -414,7 +431,7 @@ export interface SecureRecoveryRecord {
 	content: Buffer;
 }
 
-export type SecureRecoveryFactory = (content: string, truncatedTail: string) => SecureRecoveryRecord;
+export type SecureRecoveryFactory = (content: Buffer, truncatedTail: Buffer) => SecureRecoveryRecord;
 
 type ClaimState = "pending" | "done";
 
@@ -457,6 +474,7 @@ class ClaimBloom {
 }
 
 interface ClaimJournalCache {
+	name: string;
 	device: bigint;
 	inode: bigint;
 	offset: number;
@@ -473,6 +491,9 @@ interface ValidatedLogCache {
 	inode: bigint;
 	offset: number;
 	nextLine: number;
+	ctimeNs: bigint;
+	mtimeNs: bigint;
+	prefixHash: Hash;
 }
 
 function rememberDone(cache: ClaimJournalCache, eventId: string): void {
@@ -685,7 +706,7 @@ export class SecurePathScope {
 					appendAndSync(logDescriptor, content);
 					testHook?.({ stage: "event_appended" });
 				}
-				this.validateCompleteLog(name, logDescriptor);
+				this.validateCompleteLog(name, logDescriptor, true);
 				verifyCommittedFiles();
 				return;
 			}
@@ -696,7 +717,7 @@ export class SecurePathScope {
 
 			this.recoverUnterminatedTail(logDescriptor, journalDescriptor, journal, recoveryFactory);
 			if (this.getClaimState(journalDescriptor, journal, eventId) === "done") {
-				this.validateCompleteLog(name, logDescriptor);
+				this.validateCompleteLog(name, logDescriptor, true);
 				verifyCommittedFiles();
 				return;
 			}
@@ -705,7 +726,7 @@ export class SecurePathScope {
 				(migratedEventIds?.has(eventId) ?? fileContainsEventId(logDescriptor, eventId))
 			) {
 				this.appendClaimJournalRecord(journalDescriptor, journal, { eventId, state: "done" });
-				this.validateCompleteLog(name, logDescriptor);
+				this.validateCompleteLog(name, logDescriptor, true);
 				verifyCommittedFiles();
 				return;
 			}
@@ -713,7 +734,7 @@ export class SecurePathScope {
 			appendAndSync(logDescriptor, content);
 			testHook?.({ stage: "event_appended" });
 			this.appendClaimJournalRecord(journalDescriptor, journal, { eventId, state: "done" });
-			this.validateCompleteLog(name, logDescriptor);
+			this.validateCompleteLog(name, logDescriptor, true);
 			verifyCommittedFiles();
 		} finally {
 			if (directoryLocked) retryPosix("flock", () => requirePosix().flock(directory, LOCK_UN));
@@ -726,39 +747,52 @@ export class SecurePathScope {
 		}
 	}
 
-	private validateCompleteLog(name: string, descriptor: number): void {
+	private validateCompleteLog(name: string, descriptor: number, trustedAppend = false): void {
 		const status = fstatSync(descriptor, { bigint: true });
 		const existing = this.validatedLogCache.get(name);
-		const canReadDelta =
+		let canReadDelta =
 			existing !== undefined &&
 			existing.device === status.dev &&
 			existing.inode === status.ino &&
 			status.size >= BigInt(existing.offset);
+		if (
+			canReadDelta &&
+			existing !== undefined &&
+			!trustedAppend &&
+			(existing.ctimeNs !== status.ctimeNs || existing.mtimeNs !== status.mtimeNs)
+		) {
+			canReadDelta = hashFilePrefix(descriptor, existing.offset).equals(existing.prefixHash.copy().digest());
+		}
 		const offset = canReadDelta ? (existing?.offset ?? 0) : 0;
 		const firstLine = canReadDelta ? (existing?.nextLine ?? 1) : 1;
+		const prefixHash = canReadDelta && existing ? existing.prefixHash.copy() : createHash("sha256");
 		const size = Number(status.size);
 		if (!Number.isSafeInteger(size))
 			throw new SecureFsError("read_file", undefined, new Error("Event log is too large"));
 		const unread = preadAll(descriptor, offset, size - offset);
 		const completeLength = unread.lastIndexOf(0x0a) + 1;
 		if (completeLength === 0) {
+			const refreshed = fstatSync(descriptor, { bigint: true });
 			this.validatedLogCache.set(name, {
-				device: status.dev,
-				inode: status.ino,
+				device: refreshed.dev,
+				inode: refreshed.ino,
 				offset,
 				nextLine: firstLine,
+				ctimeNs: refreshed.ctimeNs,
+				mtimeNs: refreshed.mtimeNs,
+				prefixHash,
 			});
 			return;
 		}
 
 		const complete = unread.subarray(0, completeLength);
-		const lines: Array<{ content: string; offset: number; line: number }> = [];
+		const lines: Array<{ content: Buffer; offset: number; line: number }> = [];
 		let lineStart = 0;
 		let lineNumber = firstLine;
 		for (let index = 0; index < complete.byteLength; index += 1) {
 			if (complete[index] !== 0x0a) continue;
 			lines.push({
-				content: complete.subarray(lineStart, index).toString("utf8"),
+				content: complete.subarray(lineStart, index),
 				offset: offset + lineStart,
 				line: lineNumber,
 			});
@@ -766,18 +800,19 @@ export class SecurePathScope {
 			lineNumber += 1;
 		}
 		for (const [index, line] of lines.entries()) {
-			if (!line.content.trim()) continue;
+			const decoded = line.content.toString("utf8");
+			if (!decoded.trim()) continue;
 			try {
-				JSON.parse(line.content);
+				JSON.parse(decoded);
 			} catch (error) {
 				let isAuditedTruncatedTail = false;
 				const next = lines[index + 1];
 				if (next !== undefined) {
 					try {
 						isAuditedTruncatedTail = isRecoveryTruncatedTailFor(
-							JSON.parse(next.content),
-							preadAll(descriptor, 0, line.offset + Buffer.byteLength(line.content)),
-							Buffer.from(line.content),
+							JSON.parse(next.content.toString("utf8")),
+							preadAll(descriptor, 0, line.offset + line.content.byteLength),
+							line.content,
 						);
 					} catch {
 						isAuditedTruncatedTail = false;
@@ -792,11 +827,16 @@ export class SecurePathScope {
 				}
 			}
 		}
+		prefixHash.update(complete);
+		const refreshed = fstatSync(descriptor, { bigint: true });
 		this.validatedLogCache.set(name, {
-			device: status.dev,
-			inode: status.ino,
+			device: refreshed.dev,
+			inode: refreshed.ino,
 			offset: offset + completeLength,
 			nextLine: lineNumber,
+			ctimeNs: refreshed.ctimeNs,
+			mtimeNs: refreshed.mtimeNs,
+			prefixHash,
 		});
 	}
 
@@ -845,10 +885,10 @@ export class SecurePathScope {
 		if (bytesRead !== 1) fail("read_file");
 		if (finalByte[0] === 0x0a) return;
 
-		const content = readAll(logDescriptor).toString("utf8");
-		const truncatedTail = content.slice(content.lastIndexOf("\n") + 1);
+		const content = readAll(logDescriptor);
+		const truncatedTail = content.subarray(content.lastIndexOf(0x0a) + 1);
 		try {
-			JSON.parse(truncatedTail);
+			JSON.parse(truncatedTail.toString("utf8"));
 			if (Number(retryPosix("lseek", () => requirePosix().lseek(logDescriptor, 0, SEEK_END))) < 0) {
 				fail("write_file");
 			}
@@ -903,6 +943,7 @@ export class SecurePathScope {
 		const cache: ClaimJournalCache = canReadDelta
 			? (existing as ClaimJournalCache)
 			: {
+					name,
 					device: status.dev,
 					inode: status.ino,
 					offset: 0,
@@ -916,70 +957,22 @@ export class SecurePathScope {
 		const size = Number(status.size);
 		if (!Number.isSafeInteger(size))
 			throw new SecureFsError("read_file", undefined, new Error("Claim journal is too large"));
-		const unread = preadAll(descriptor, offset, size - offset);
 		if (offset === 0) testHook?.({ stage: "claim_journal_full_read" });
-		else if (unread.byteLength > 0) testHook?.({ stage: "claim_journal_delta_read" });
+		else if (size > offset) testHook?.({ stage: "claim_journal_delta_read" });
 
-		let completeLength = unread.byteLength;
-		if (unread.byteLength > 0 && unread[unread.byteLength - 1] !== 0x0a) {
-			completeLength = unread.lastIndexOf(0x0a) + 1;
-			const committedLength = offset + completeLength;
+		const streamed = this.streamClaimJournal(name, descriptor, offset, size, cache.nextLine, (record) => {
+			applyClaimRecord(cache, record);
+		});
+		const committedLength = size - streamed.trailingBytes;
+		if (streamed.trailingBytes > 0) {
 			if (retryPosix("ftruncate", () => requirePosix().ftruncate(descriptor, committedLength)) < 0) {
 				fail("write_file");
 			}
 			if (retryPosix("fsync", () => requirePosix().fsync(descriptor)) < 0) fail("sync_file");
 			testHook?.({ stage: "claim_journal_truncated" });
 		}
-
-		const committed = unread.subarray(0, completeLength);
-		let lineStart = 0;
-		let lineNumber = cache.nextLine;
-		for (let index = 0; index < committed.byteLength; index += 1) {
-			if (committed[index] !== 0x0a) continue;
-			const lineBuffer = committed.subarray(lineStart, index);
-			const line = lineBuffer.toString("utf8");
-			const lineOffset = offset + lineStart;
-			lineStart = index + 1;
-			const currentLine = lineNumber;
-			lineNumber += 1;
-			if (!line) continue;
-			let record: unknown;
-			try {
-				record = JSON.parse(line);
-			} catch (error) {
-				throw new SecureFsError(
-					"read_file",
-					undefined,
-					new ClaimJournalCorruptionError(
-						`${this.absolutePath}${sep}${name}`,
-						currentLine,
-						lineOffset,
-						"malformed_claim_json",
-						error,
-					),
-				);
-			}
-			if (
-				typeof record !== "object" ||
-				record === null ||
-				typeof (record as Partial<ClaimJournalRecord>).eventId !== "string" ||
-				!(["pending", "done"] as const).includes((record as Partial<ClaimJournalRecord>).state as ClaimState)
-			) {
-				throw new SecureFsError(
-					"read_file",
-					undefined,
-					new ClaimJournalCorruptionError(
-						`${this.absolutePath}${sep}${name}`,
-						currentLine,
-						lineOffset,
-						"invalid_claim_record",
-					),
-				);
-			}
-			applyClaimRecord(cache, record as ClaimJournalRecord);
-		}
-		cache.offset = offset + completeLength;
-		cache.nextLine = lineNumber;
+		cache.offset = committedLength;
+		cache.nextLine = streamed.nextLine;
 		const refreshed = fstatSync(descriptor, { bigint: true });
 		cache.device = refreshed.dev;
 		cache.inode = refreshed.ino;
@@ -987,6 +980,87 @@ export class SecurePathScope {
 		this.claimJournalCache.set(name, cache);
 		emitClaimCacheStats(cache);
 		return cache;
+	}
+
+	private streamClaimJournal(
+		name: string,
+		descriptor: number,
+		start: number,
+		end: number,
+		firstLine: number,
+		onRecord: (record: ClaimJournalRecord) => void,
+	): { trailingBytes: number; nextLine: number } {
+		let position = start;
+		let carry = Buffer.alloc(0);
+		let carryOffset = start;
+		let lineNumber = firstLine;
+		let maxReadChunkBytes = 0;
+		let maxCarryBytes = 0;
+		while (position < end) {
+			const chunk = preadAll(
+				descriptor,
+				position,
+				Math.min(CLAIM_JOURNAL_CAPACITY_POLICY.readChunkBytes, end - position),
+			);
+			if (chunk.byteLength === 0) fail("read_file");
+			maxReadChunkBytes = Math.max(maxReadChunkBytes, chunk.byteLength);
+			position += chunk.byteLength;
+			const combined = carry.byteLength === 0 ? chunk : Buffer.concat([carry, chunk]);
+			let lineStart = 0;
+			for (;;) {
+				const newline = combined.indexOf(0x0a, lineStart);
+				if (newline < 0) break;
+				const lineLength = newline - lineStart;
+				if (lineLength > CLAIM_JOURNAL_CAPACITY_POLICY.maxLineBytes) {
+					this.throwClaimJournalCorruption(name, lineNumber, carryOffset + lineStart, "claim_line_too_long");
+				}
+				const line = combined.subarray(lineStart, newline);
+				if (line.byteLength > 0)
+					onRecord(this.parseClaimJournalRecord(name, line, lineNumber, carryOffset + lineStart));
+				lineNumber += 1;
+				lineStart = newline + 1;
+			}
+			carry = Buffer.from(combined.subarray(lineStart));
+			carryOffset += lineStart;
+			maxCarryBytes = Math.max(maxCarryBytes, carry.byteLength);
+			if (carry.byteLength > CLAIM_JOURNAL_CAPACITY_POLICY.maxLineBytes) {
+				this.throwClaimJournalCorruption(name, lineNumber, carryOffset, "claim_line_too_long");
+			}
+		}
+		testHook?.({ stage: "claim_journal_stream_stats", maxReadChunkBytes, maxCarryBytes });
+		return { trailingBytes: carry.byteLength, nextLine: lineNumber };
+	}
+
+	private parseClaimJournalRecord(name: string, line: Buffer, lineNumber: number, offset: number): ClaimJournalRecord {
+		let record: unknown;
+		try {
+			record = JSON.parse(line.toString("utf8"));
+		} catch (error) {
+			this.throwClaimJournalCorruption(name, lineNumber, offset, "malformed_claim_json", error);
+		}
+		if (
+			typeof record !== "object" ||
+			record === null ||
+			typeof (record as Partial<ClaimJournalRecord>).eventId !== "string" ||
+			!(["pending", "done"] as const).includes((record as Partial<ClaimJournalRecord>).state as ClaimState)
+		) {
+			this.throwClaimJournalCorruption(name, lineNumber, offset, "invalid_claim_record");
+		}
+		return record as ClaimJournalRecord;
+	}
+
+	private throwClaimJournalCorruption(
+		name: string,
+		line: number,
+		offset: number,
+		reason: ClaimJournalCorruptionError["reason"],
+		cause?: unknown,
+	): never {
+		throw new SecureFsError(
+			"read_file",
+			undefined,
+			new ClaimJournalCorruptionError(`${this.absolutePath}${sep}${name}`, line, offset, reason, cause),
+		);
 	}
 
 	private appendClaimJournalRecord(descriptor: number, cache: ClaimJournalCache, record: ClaimJournalRecord): void {
@@ -1013,18 +1087,12 @@ export class SecurePathScope {
 
 		testHook?.({ stage: "claim_journal_target_scan" });
 		let state: ClaimState | undefined;
-		for (const line of readAll(descriptor).toString("utf8").split("\n")) {
-			if (!line) continue;
-			let record: ClaimJournalRecord;
-			try {
-				record = JSON.parse(line) as ClaimJournalRecord;
-			} catch (error) {
-				throw new SecureFsError("read_file", undefined, error);
-			}
+		const size = Number(fstatSync(descriptor, { bigint: true }).size);
+		this.streamClaimJournal(cache.name, descriptor, 0, size, 1, (record) => {
 			if (record.eventId === eventId && (record.state === "pending" || record.state === "done")) {
 				state = record.state;
 			}
-		}
+		});
 		if (state === "done") {
 			cache.hotPending.delete(eventId);
 			cache.bloom.add(eventId);

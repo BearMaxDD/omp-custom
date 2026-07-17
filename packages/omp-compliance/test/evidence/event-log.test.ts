@@ -1,15 +1,19 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
 import {
+	closeSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	openSync,
 	readFileSync,
 	readdirSync,
 	renameSync,
 	rmSync,
 	statSync,
+	utimesSync,
 	writeFileSync,
+	writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -459,6 +463,28 @@ describe("EventLog", () => {
 		}
 	});
 
+	it("claim journal 超过单行上限时返回稳定损坏诊断且不按总长度分配", () => {
+		const root = temporaryRoot();
+		const path = join(root, "events.jsonl");
+		const journalPath = join(root, ".events.jsonl.claims.jsonl");
+		writeFileSync(path, "", "utf8");
+		writeFileSync(journalPath, Buffer.concat([Buffer.alloc(64 * 1024 + 1, 0x78), Buffer.from("\n")]));
+
+		try {
+			new EventLog<TestEvent>(path).append({ eventId: eventId("after-oversized-claim"), type: "blocked" });
+			expect.unreachable("超长 claim 行必须 fail-closed");
+		} catch (error) {
+			expect(error).toBeInstanceOf(EvidencePersistenceError);
+			const secureCause = (error as Error & { cause?: unknown }).cause as Error & { cause?: unknown };
+			expect(secureCause.cause).toMatchObject({
+				path: journalPath,
+				line: 1,
+				offset: 0,
+				reason: "claim_line_too_long",
+			});
+		}
+	});
+
 	it("10 万事件 claim journal 保持单文件线性审计并满足宽松冷启动预算", () => {
 		const policy = (
 			secureFsSource as typeof secureFsSource & {
@@ -466,6 +492,8 @@ describe("EventLog", () => {
 					baselineEvents: number;
 					maxBaselineBytes: number;
 					maxColdStartMs: number;
+					readChunkBytes: number;
+					maxLineBytes: number;
 					persistence: string;
 				};
 			}
@@ -489,6 +517,18 @@ describe("EventLog", () => {
 				)
 				.join(""),
 		);
+		let maxReadChunkBytes = 0;
+		let maxCarryBytes = 0;
+		setSecureFsTestHook((event) => {
+			const detail = event as unknown as {
+				stage: string;
+				maxReadChunkBytes?: number;
+				maxCarryBytes?: number;
+			};
+			if (detail.stage !== "claim_journal_stream_stats") return;
+			maxReadChunkBytes = Math.max(maxReadChunkBytes, detail.maxReadChunkBytes ?? 0);
+			maxCarryBytes = Math.max(maxCarryBytes, detail.maxCarryBytes ?? 0);
+		});
 		const startedAt = performance.now();
 		new EventLog<TestEvent>(path).append({ eventId: eventIds[0] as string, type: "capacity" });
 		const coldStartMs = performance.now() - startedAt;
@@ -496,6 +536,9 @@ describe("EventLog", () => {
 		expect(policy?.persistence).toBe("append_only_linear_audit");
 		expect(statSync(journalPath).size).toBeLessThanOrEqual(policy?.maxBaselineBytes ?? 0);
 		expect(coldStartMs).toBeLessThanOrEqual(policy?.maxColdStartMs ?? 0);
+		expect(maxReadChunkBytes).toBeGreaterThan(0);
+		expect(maxReadChunkBytes).toBeLessThanOrEqual(policy?.readChunkBytes ?? 0);
+		expect(maxCarryBytes).toBeLessThanOrEqual(policy?.maxLineBytes ?? 0);
 		expect(readdirSync(root).filter((name) => name.includes("claims"))).toEqual([".events.jsonl.claims.jsonl"]);
 	}, 30_000);
 
@@ -760,6 +803,86 @@ describe("EventLog", () => {
 		expect(firstRead[1]?.eventId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 		expect(readFileSync(path, "utf8").match(/recovery_truncated_tail/g)).toHaveLength(1);
 	});
+
+	it.each([
+		["单字节 0xE2", Buffer.from([0xe2])],
+		["截断中文多字节", Buffer.from("中").subarray(0, 2)],
+	] as const)("原始字节尾部（%s）在 readAll 与 append 路径均可恢复", (_name, tail) => {
+		const valid = Buffer.from(
+			`${JSON.stringify({ eventId: eventId(`raw-prefix-${tail.toString("hex")}`), type: "valid" })}\n`,
+		);
+		const readPath = join(temporaryRoot(), "read-events.jsonl");
+		writeFileSync(readPath, Buffer.concat([valid, tail]));
+		const readLog = new EventLog<TestEvent>(readPath);
+		const firstRead = readLog.readAll();
+		const secondRead = readLog.readAll();
+		const readRecovery = firstRead.find((event) => event.type === "recovery_truncated_tail");
+		expect(readRecovery).toMatchObject({ truncatedBytes: tail.byteLength });
+		expect(secondRead).toEqual(firstRead);
+		expect(
+			readFileSync(readPath)
+				.toString("utf8")
+				.match(/recovery_truncated_tail/g),
+		).toHaveLength(1);
+
+		const appendPath = join(temporaryRoot(), "append-events.jsonl");
+		writeFileSync(appendPath, Buffer.concat([valid, tail]));
+		const appendLog = new EventLog<TestEvent>(appendPath);
+		const appendedId = eventId(`raw-appended-${tail.toString("hex")}`);
+		appendLog.append({ eventId: appendedId, type: "appended" });
+		const appendEvents = appendLog.readAll();
+		expect(appendEvents.find((event) => event.type === "recovery_truncated_tail")).toMatchObject({
+			truncatedBytes: tail.byteLength,
+		});
+		expect(appendEvents.filter((event) => event.eventId === appendedId)).toHaveLength(1);
+		expect(
+			readFileSync(appendPath)
+				.toString("utf8")
+				.match(/recovery_truncated_tail/g),
+		).toHaveLength(1);
+	});
+
+	it("不同非法尾字节生成不同的确定性 recovery eventId", () => {
+		const ids = [0xe2, 0xe3].map((byte) => {
+			const path = join(temporaryRoot(), `events-${byte}.jsonl`);
+			writeFileSync(path, Buffer.concat([Buffer.from('{"eventId":"valid","type":"first"}\n'), Buffer.from([byte])]));
+			return new EventLog<TestEvent>(path).readAll().find((event) => event.type === "recovery_truncated_tail")?.eventId;
+		});
+		expect(ids[0]).toBeDefined();
+		expect(ids[1]).toBeDefined();
+		expect(ids[0]).not.toBe(ids[1]);
+	});
+
+	it.each(["first", "middle", "last"] as const)(
+		"已验证 %s 行同 inode 等长损坏即使恢复 mtime 仍 fail-closed",
+		(position) => {
+			const path = join(temporaryRoot(), "events.jsonl");
+			const log = new EventLog<TestEvent>(path);
+			const events = [0, 1, 2].map((index) => ({ eventId: eventId(`in-place-${index}`), type: `line-${index}` }));
+			for (const event of events) log.append(event);
+			log.readAll();
+			const lines = readFileSync(path).toString("utf8").trimEnd().split("\n");
+			const lineIndex = position === "first" ? 0 : position === "middle" ? 1 : 2;
+			const offset = lines.slice(0, lineIndex).reduce((total, line) => total + Buffer.byteLength(line) + 1, 0);
+			const before = statSync(path);
+			const descriptor = openSync(path, "r+");
+			try {
+				writeSync(descriptor, Buffer.from("!"), 0, 1, offset);
+			} finally {
+				closeSync(descriptor);
+			}
+			utimesSync(path, before.atime, before.mtime);
+
+			try {
+				log.append({ eventId: eventId(`after-in-place-${position}`), type: "blocked" });
+				expect.unreachable("已验证前缀原位损坏必须 fail-closed");
+			} catch (error) {
+				expect(error).toBeInstanceOf(EvidencePersistenceError);
+				const secureCause = (error as Error & { cause?: unknown }).cause as Error & { cause?: unknown };
+				expect(secureCause.cause).toMatchObject({ line: lineIndex + 1, offset, reason: "malformed_json" });
+			}
+		},
+	);
 
 	it("截断后不调用 readAll 直接追加时恢复尾部且保留新事件", () => {
 		const path = join(temporaryRoot(), "events.jsonl");

@@ -55,11 +55,11 @@ export function isEvidenceEventId(value: string): boolean {
 	return /^[0-9a-f]{8}-[0-9a-f]{4}-[457][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
-function recoveryEventFor(content: string, truncatedTail: string): EvidenceRecoveryEvent {
+function recoveryEventFor(content: Buffer, truncatedTail: Buffer): EvidenceRecoveryEvent {
 	return createRecoveryTruncatedTailEvent(content, truncatedTail);
 }
 
-function recoveryRecordFor(content: string, truncatedTail: string): SecureRecoveryRecord {
+function recoveryRecordFor(content: Buffer, truncatedTail: Buffer): SecureRecoveryRecord {
 	const recovery = recoveryEventFor(content, truncatedTail);
 	return { eventId: recovery.eventId, content: Buffer.from(`${JSON.stringify(recovery)}\n`) };
 }
@@ -89,32 +89,39 @@ function persistenceFailure(error: unknown, fallback: string): { path: string; c
 interface ParsedEvents<T> {
 	events: T[];
 	seen: Set<string>;
-	truncatedTail?: string;
+	truncatedTail?: Buffer;
 }
 
-function parseEvents<T extends EvidenceEvent>(content: string): ParsedEvents<T> {
+function parseEvents<T extends EvidenceEvent>(content: Buffer): ParsedEvents<T> {
 	const events: T[] = [];
 	const seen = new Set<string>();
-	let truncatedTail: string | undefined;
-	const contentBuffer = Buffer.from(content);
-	const lines = content.split("\n");
-	const finalLineIndex = lines.length - 1;
-	let offset = 0;
+	let truncatedTail: Buffer | undefined;
+	const lines: Array<{ content: Buffer; offset: number; terminated: boolean }> = [];
+	let lineStart = 0;
+	for (let index = 0; index < content.byteLength; index += 1) {
+		if (content[index] !== 0x0a) continue;
+		lines.push({ content: content.subarray(lineStart, index), offset: lineStart, terminated: true });
+		lineStart = index + 1;
+	}
+	if (lineStart < content.byteLength) {
+		lines.push({ content: content.subarray(lineStart), offset: lineStart, terminated: false });
+	}
 
 	for (const [index, line] of lines.entries()) {
-		const lineOffset = offset;
-		offset += Buffer.byteLength(line) + (index < finalLineIndex ? 1 : 0);
-		if (!line.trim()) continue;
+		const decoded = line.content.toString("utf8");
+		if (!decoded.trim()) continue;
 		try {
-			const event = JSON.parse(line) as Partial<T>;
+			const event = JSON.parse(decoded) as Partial<T>;
 			const eventId =
-				typeof event.eventId === "string" && isEvidenceEventId(event.eventId) ? event.eventId : legacyEventIdFor(line);
+				typeof event.eventId === "string" && isEvidenceEventId(event.eventId)
+					? event.eventId
+					: legacyEventIdFor(decoded);
 			if (seen.has(eventId)) continue;
 			seen.add(eventId);
 			events.push({ ...event, eventId } as T);
 		} catch (error) {
-			if (index === finalLineIndex && !content.endsWith("\n")) {
-				truncatedTail = line;
+			if (!line.terminated && index === lines.length - 1) {
+				truncatedTail = line.content;
 				continue;
 			}
 			let isAuditedTruncatedTail = false;
@@ -122,9 +129,9 @@ function parseEvents<T extends EvidenceEvent>(content: string): ParsedEvents<T> 
 			if (next !== undefined) {
 				try {
 					isAuditedTruncatedTail = isRecoveryTruncatedTailFor(
-						JSON.parse(next),
-						contentBuffer.subarray(0, lineOffset + Buffer.byteLength(line)),
-						Buffer.from(line),
+						JSON.parse(next.content.toString("utf8")),
+						content.subarray(0, line.offset + line.content.byteLength),
+						line.content,
 					);
 				} catch {
 					isAuditedTruncatedTail = false;
@@ -134,7 +141,7 @@ function parseEvents<T extends EvidenceEvent>(content: string): ParsedEvents<T> 
 				throw new SecureFsError(
 					"read_file",
 					undefined,
-					new EvidenceLogCorruptionError(index + 1, lineOffset, "malformed_json", error),
+					new EvidenceLogCorruptionError(index + 1, line.offset, "malformed_json", error),
 				);
 			}
 		}
@@ -180,7 +187,7 @@ export class EventLog<T extends EvidenceEvent = EvidenceEvent> {
 	readAll(): T[] {
 		try {
 			const result = this.scope.withLockedFile(this.fileName, { createDirectory: false, createFile: false }, (file) => {
-				const content = file.read().toString("utf8");
+				const content = file.read();
 				return { content, parsed: parseEvents<T>(content) };
 			});
 			if (result === undefined) return [];
@@ -188,7 +195,7 @@ export class EventLog<T extends EvidenceEvent = EvidenceEvent> {
 
 			const recovery = recoveryEventFor(result.content, result.parsed.truncatedTail);
 			if (!result.parsed.seen.has(recovery.eventId)) {
-				const prefix = result.content.endsWith("\n") ? "" : "\n";
+				const prefix = result.content.at(-1) === 0x0a ? Buffer.alloc(0) : Buffer.from("\n");
 				const recoveryRecord = {
 					eventId: recovery.eventId,
 					content: Buffer.from(`${JSON.stringify(recovery)}\n`),
@@ -196,7 +203,7 @@ export class EventLog<T extends EvidenceEvent = EvidenceEvent> {
 				this.scope.appendIdempotent(
 					this.fileName,
 					recovery.eventId,
-					Buffer.from(`${prefix}${JSON.stringify(recovery)}\n`),
+					Buffer.concat([prefix, Buffer.from(`${JSON.stringify(recovery)}\n`)]),
 					() => recoveryRecord,
 				);
 				return this.readAll();

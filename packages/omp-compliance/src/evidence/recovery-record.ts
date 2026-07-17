@@ -10,7 +10,11 @@ export interface RecoveryTruncatedTailEvent {
 const RECOVERY_FIELDS = ["eventId", "timestamp", "truncatedBytes", "type"] as const;
 
 export function deterministicEvidenceEventId(identity: string): string {
-	const bytes = createHash("sha256").update(identity).digest().subarray(0, 16);
+	return evidenceUuidFromDigest(createHash("sha256").update(identity).digest());
+}
+
+function evidenceUuidFromDigest(digest: Buffer): string {
+	const bytes = Buffer.from(digest.subarray(0, 16));
 	bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x50;
 	bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80;
 	const hex = bytes.toString("hex");
@@ -18,24 +22,24 @@ export function deterministicEvidenceEventId(identity: string): string {
 }
 
 export function createRecoveryTruncatedTailEvent(
-	originalContent: string | Buffer,
-	truncatedTail: string | Buffer,
+	originalContent: Buffer,
+	truncatedTail: Buffer,
 	timestamp = new Date().toISOString(),
 ): RecoveryTruncatedTailEvent {
 	return {
-		eventId: deterministicEvidenceEventId(
-			`recovery_truncated_tail\0${Buffer.isBuffer(originalContent) ? originalContent.toString("utf8") : originalContent}`,
+		eventId: evidenceUuidFromDigest(
+			createHash("sha256").update("recovery_truncated_tail\0").update(originalContent).digest(),
 		),
 		type: "recovery_truncated_tail",
 		timestamp,
-		truncatedBytes: Buffer.byteLength(truncatedTail),
+		truncatedBytes: truncatedTail.byteLength,
 	};
 }
 
 export function isRecoveryTruncatedTailFor(
 	value: unknown,
-	originalContent: string | Buffer,
-	truncatedTail: string | Buffer,
+	originalContent: Buffer,
+	truncatedTail: Buffer,
 ): value is RecoveryTruncatedTailEvent {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const record = value as Record<string, unknown>;
