@@ -36,8 +36,12 @@ export interface SecureFsTestEvent {
 		| "recovery_entries_listed"
 		| "snapshot_lock_acquired"
 		| "snapshot_temp_synced"
-		| "checkpoint_persisted"
-		| "claims_compacted";
+		| "claim_journal_full_read"
+		| "claim_journal_delta_read"
+		| "claim_journal_appended"
+		| "claim_journal_truncated"
+		| "legacy_claims_persisted"
+		| "legacy_claims_migrated";
 }
 
 let testHook: ((event: SecureFsTestEvent) => void) | undefined;
@@ -60,7 +64,8 @@ export type SecureFsSyscall =
 	| "read"
 	| "pread"
 	| "flock"
-	| "lseek";
+	| "lseek"
+	| "ftruncate";
 
 let eintrTestPlan = new Map<SecureFsSyscall, number>();
 
@@ -96,6 +101,7 @@ const posix = supportedPlatform
 			pread: { args: [FFIType.i32, FFIType.ptr, FFIType.u64, FFIType.i64], returns: FFIType.i64 },
 			flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
 			lseek: { args: [FFIType.i32, FFIType.i64, FFIType.i32], returns: FFIType.i64 },
+			ftruncate: { args: [FFIType.i32, FFIType.i64], returns: FFIType.i32 },
 			...(process.platform === "darwin"
 				? { __error: { args: [], returns: FFIType.ptr } }
 				: { __errno_location: { args: [], returns: FFIType.ptr } }),
@@ -107,6 +113,7 @@ const LOCK_UN = 8;
 const SEEK_SET = 0;
 const SEEK_END = 2;
 const EINTR = osConstants.errno.EINTR;
+const AT_REMOVEDIR = process.platform === "darwin" ? 0x80 : 0x200;
 
 function requirePosix(): NonNullable<typeof posix> {
 	if (!posix) {
@@ -261,6 +268,28 @@ function readAll(descriptor: number): Buffer {
 	return Buffer.concat(chunks);
 }
 
+function preadAll(descriptor: number, offset: number, length: number): Buffer {
+	const content = Buffer.allocUnsafe(length);
+	let bytesRead = 0;
+	while (bytesRead < length) {
+		const current = Number(
+			retryPosix("pread", () =>
+				requirePosix().pread(descriptor, ptr(content, bytesRead), length - bytesRead, offset + bytesRead),
+			),
+		);
+		if (current < 0) fail("read_file");
+		if (current === 0) break;
+		bytesRead += current;
+	}
+	return content.subarray(0, bytesRead);
+}
+
+function appendAndSync(descriptor: number, content: Buffer): void {
+	if (Number(retryPosix("lseek", () => requirePosix().lseek(descriptor, 0, SEEK_END))) < 0) fail("write_file");
+	writeAll(descriptor, content);
+	if (retryPosix("fsync", () => requirePosix().fsync(descriptor)) < 0) fail("sync_file");
+}
+
 function fileContainsEventId(descriptor: number, eventId: string): boolean {
 	const content = readAll(descriptor).toString("utf8");
 	for (const line of content.split("\n")) {
@@ -273,27 +302,6 @@ function fileContainsEventId(descriptor: number, eventId: string): boolean {
 		}
 	}
 	return false;
-}
-
-function createExclusiveAt(directory: number, name: string, content: Buffer): boolean {
-	let descriptor: number | undefined;
-	try {
-		descriptor = openAt(
-			directory,
-			name,
-			constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-			0o600,
-		);
-		if (retryPosix("fchmod", () => requirePosix().fchmod(descriptor as number, 0o600)) < 0) fail("open_file");
-		writeAll(descriptor, content);
-		if (retryPosix("fsync", () => requirePosix().fsync(descriptor as number)) < 0) fail("sync_file");
-		return true;
-	} catch (error) {
-		if (error instanceof SecureFsError && error.code === osConstants.errno.EEXIST) return false;
-		throw error;
-	} finally {
-		if (descriptor !== undefined) closeQuietly(descriptor);
-	}
 }
 
 function atomicReplaceAt(directory: number, name: string, content: Buffer, afterTemporarySync?: () => void): void {
@@ -349,20 +357,19 @@ export interface SecureRecoveryRecord {
 
 export type SecureRecoveryFactory = (content: string, truncatedTail: string) => SecureRecoveryRecord;
 
-const CLAIM_CHECKPOINT_NAME = ".checkpoint.json";
-const CLAIM_COMPACTION_THRESHOLD = 64;
+type ClaimState = "pending" | "done";
 
-interface ClaimCheckpoint {
-	version: 1;
-	eventIds: string[];
+interface ClaimJournalRecord {
+	eventId: string;
+	state: ClaimState;
 }
 
-interface ClaimCheckpointCache {
+interface ClaimJournalCache {
 	device: bigint;
 	inode: bigint;
-	size: bigint;
+	offset: number;
 	mtimeNs: bigint;
-	eventIds: Set<string>;
+	states: Map<string, ClaimState>;
 }
 
 function claimState(content: string): { state: "pending" | "done"; eventId?: string } | undefined {
@@ -399,7 +406,7 @@ export class SecurePathScope {
 	private readonly anchorDepth: number;
 	private readonly anchorDevice: bigint;
 	private readonly anchorInode: bigint;
-	private readonly checkpointCache = new Map<string, ClaimCheckpointCache>();
+	private readonly claimJournalCache = new Map<string, ClaimJournalCache>();
 
 	constructor(root: string, childDirectories: readonly string[] = []) {
 		const canonical = canonicalTrustedRoot(root);
@@ -483,80 +490,67 @@ export class SecurePathScope {
 		const directory = this.openDirectory(true);
 		if (directory === undefined) fail("open_directory");
 		testHook?.({ stage: "directory_opened" });
-		const claimDirectoryName = `.${name}.claims`;
-		const claimName = `${createHash("sha256").update(eventId).digest("hex")}.claim`;
-		let claimDirectory: number | undefined;
+		const journalName = `.${name}.claims.jsonl`;
+		const legacyDirectoryName = `.${name}.claims`;
 		let logDescriptor: number | undefined;
+		let journalDescriptor: number | undefined;
 		let directoryLocked = false;
 		let logLocked = false;
 		try {
 			if (retryPosix("flock", () => requirePosix().flock(directory, LOCK_EX)) < 0) fail("lock_file");
 			directoryLocked = true;
-			claimDirectory = this.openChildDirectory(directory, claimDirectoryName, true);
-			if (claimDirectory === undefined) fail("open_directory");
-			if (retryPosix("fsync", () => requirePosix().fsync(directory)) < 0) fail("sync_file");
-
-			const claimCreated = createExclusiveAt(claimDirectory, claimName, Buffer.from(`pending ${eventId}\n`));
-			if (claimCreated) {
-				if (retryPosix("fsync", () => requirePosix().fsync(claimDirectory as number)) < 0) fail("sync_file");
-				testHook?.({ stage: "claim_created" });
-			} else {
-				const claimDescriptor = openAt(claimDirectory, claimName, constants.O_RDONLY | constants.O_NOFOLLOW);
-				try {
-					readAll(claimDescriptor);
-				} finally {
-					closeQuietly(claimDescriptor);
-				}
-			}
-
 			logDescriptor = openOrCreateAt(directory, name);
+			journalDescriptor = openOrCreateAt(directory, journalName);
 			if (retryPosix("fsync", () => requirePosix().fsync(directory)) < 0) fail("sync_file");
 			if (retryPosix("flock", () => requirePosix().flock(logDescriptor as number, LOCK_EX)) < 0) fail("lock_file");
 			logLocked = true;
 			if (retryPosix("flock", () => requirePosix().flock(directory, LOCK_UN)) < 0) fail("lock_file");
 			directoryLocked = false;
 			testHook?.({ stage: "lock_acquired" });
-			if (this.loadClaimCheckpoint(claimDirectory).has(eventId)) {
-				if (claimCreated) this.unlinkClaim(claimDirectory, claimName);
-				else this.compactDoneClaims(claimDirectoryName, claimDirectory);
+			const journal = this.refreshClaimJournal(journalName, journalDescriptor);
+			const migratedEventIds = this.migrateLegacyClaims(
+				directory,
+				legacyDirectoryName,
+				journalDescriptor,
+				journal,
+				logDescriptor,
+			);
+
+			const initialState = journal.states.get(eventId);
+			if (initialState === "done") return;
+			if (initialState === undefined) {
+				this.appendClaimJournalRecord(journalDescriptor, journal, { eventId, state: "pending" });
+				testHook?.({ stage: "claim_created" });
+			}
+
+			this.recoverUnterminatedTail(logDescriptor, journalDescriptor, journal, recoveryFactory);
+			if (journal.states.get(eventId) === "done") return;
+			if (
+				initialState === "pending" &&
+				(migratedEventIds?.has(eventId) ?? fileContainsEventId(logDescriptor, eventId))
+			) {
+				this.appendClaimJournalRecord(journalDescriptor, journal, { eventId, state: "done" });
 				return;
 			}
-			this.recoverUnterminatedTail(logDescriptor, claimDirectory, recoveryFactory);
 
-			const currentClaim = openAt(claimDirectory, claimName, constants.O_RDONLY | constants.O_NOFOLLOW);
-			try {
-				if (claimState(readAll(currentClaim).toString("utf8"))?.state === "done") {
-					this.compactDoneClaims(claimDirectoryName, claimDirectory);
-					return;
-				}
-			} finally {
-				closeQuietly(currentClaim);
-			}
-
-			if (claimCreated || !fileContainsEventId(logDescriptor, eventId)) {
-				if (Number(retryPosix("lseek", () => requirePosix().lseek(logDescriptor as number, 0, SEEK_END))) < 0) {
-					fail("write_file");
-				}
-				writeAll(logDescriptor, content);
-				if (retryPosix("fsync", () => requirePosix().fsync(logDescriptor as number)) < 0) fail("sync_file");
-				testHook?.({ stage: "event_appended" });
-			}
-			atomicReplaceAt(claimDirectory, claimName, Buffer.from(`done ${eventId}\n`));
-			this.compactDoneClaims(claimDirectoryName, claimDirectory);
+			appendAndSync(logDescriptor, content);
+			testHook?.({ stage: "event_appended" });
+			this.appendClaimJournalRecord(journalDescriptor, journal, { eventId, state: "done" });
 		} finally {
 			if (directoryLocked) retryPosix("flock", () => requirePosix().flock(directory, LOCK_UN));
 			if (logDescriptor !== undefined) {
 				if (logLocked) retryPosix("flock", () => requirePosix().flock(logDescriptor as number, LOCK_UN));
 				closeQuietly(logDescriptor);
 			}
-			if (claimDirectory !== undefined) closeQuietly(claimDirectory);
+			if (journalDescriptor !== undefined) closeQuietly(journalDescriptor);
 			closeQuietly(directory);
 		}
 	}
 
 	private recoverUnterminatedTail(
 		logDescriptor: number,
-		claimDirectory: number,
+		journalDescriptor: number,
+		journal: ClaimJournalCache,
 		recoveryFactory: SecureRecoveryFactory,
 	): void {
 		const size = Number(retryPosix("lseek", () => requirePosix().lseek(logDescriptor, 0, SEEK_END)));
@@ -586,7 +580,8 @@ export class SecurePathScope {
 
 		const recovery = recoveryFactory(content, truncatedTail);
 		this.appendClaimedWhileLocked(
-			claimDirectory,
+			journalDescriptor,
+			journal,
 			logDescriptor,
 			recovery.eventId,
 			Buffer.concat([Buffer.from("\n"), recovery.content]),
@@ -595,150 +590,179 @@ export class SecurePathScope {
 	}
 
 	private appendClaimedWhileLocked(
-		claimDirectory: number,
+		journalDescriptor: number,
+		journal: ClaimJournalCache,
 		logDescriptor: number,
 		eventId: string,
 		content: Buffer,
 	): void {
-		const claimName = `${createHash("sha256").update(eventId).digest("hex")}.claim`;
-		const claimCreated = createExclusiveAt(claimDirectory, claimName, Buffer.from(`pending ${eventId}\n`));
-		if (this.loadClaimCheckpoint(claimDirectory).has(eventId)) {
-			if (claimCreated) this.unlinkClaim(claimDirectory, claimName);
+		const state = journal.states.get(eventId);
+		if (state === "done") return;
+		if (state === undefined) {
+			this.appendClaimJournalRecord(journalDescriptor, journal, { eventId, state: "pending" });
+		} else if (fileContainsEventId(logDescriptor, eventId)) {
+			this.appendClaimJournalRecord(journalDescriptor, journal, { eventId, state: "done" });
 			return;
 		}
-		if (claimCreated) {
-			if (retryPosix("fsync", () => requirePosix().fsync(claimDirectory)) < 0) fail("sync_file");
-		} else {
-			const claimDescriptor = openAt(claimDirectory, claimName, constants.O_RDONLY | constants.O_NOFOLLOW);
-			try {
-				if (claimState(readAll(claimDescriptor).toString("utf8"))?.state === "done") return;
-			} finally {
-				closeQuietly(claimDescriptor);
-			}
-			if (fileContainsEventId(logDescriptor, eventId)) {
-				atomicReplaceAt(claimDirectory, claimName, Buffer.from(`done ${eventId}\n`));
-				return;
-			}
-		}
 
-		if (Number(retryPosix("lseek", () => requirePosix().lseek(logDescriptor, 0, SEEK_END))) < 0) fail("write_file");
-		writeAll(logDescriptor, content);
-		if (retryPosix("fsync", () => requirePosix().fsync(logDescriptor)) < 0) fail("sync_file");
-		atomicReplaceAt(claimDirectory, claimName, Buffer.from(`done ${eventId}\n`));
+		appendAndSync(logDescriptor, content);
+		this.appendClaimJournalRecord(journalDescriptor, journal, { eventId, state: "done" });
 	}
 
-	private loadClaimCheckpoint(claimDirectory: number): Set<string> {
-		const directory = directoryIdentity(claimDirectory);
-		const cacheKey = `${directory.device}:${directory.inode}`;
-		let descriptor: number | undefined;
-		try {
-			descriptor = openAt(claimDirectory, CLAIM_CHECKPOINT_NAME, constants.O_RDONLY | constants.O_NOFOLLOW);
-		} catch (error) {
-			if (error instanceof SecureFsError && error.code === osConstants.errno.ENOENT) {
-				this.checkpointCache.delete(cacheKey);
-				return new Set();
+	private refreshClaimJournal(name: string, descriptor: number): ClaimJournalCache {
+		const status = fstatSync(descriptor, { bigint: true });
+		const existing = this.claimJournalCache.get(name);
+		const canReadDelta =
+			existing !== undefined &&
+			existing.device === status.dev &&
+			existing.inode === status.ino &&
+			status.size >= BigInt(existing.offset) &&
+			(status.size > BigInt(existing.offset) || existing.mtimeNs === status.mtimeNs);
+		const offset = canReadDelta ? (existing?.offset ?? 0) : 0;
+		const cache: ClaimJournalCache = canReadDelta
+			? (existing as ClaimJournalCache)
+			: { device: status.dev, inode: status.ino, offset: 0, mtimeNs: status.mtimeNs, states: new Map() };
+		const size = Number(status.size);
+		if (!Number.isSafeInteger(size))
+			throw new SecureFsError("read_file", undefined, new Error("Claim journal is too large"));
+		const unread = preadAll(descriptor, offset, size - offset);
+		if (offset === 0) testHook?.({ stage: "claim_journal_full_read" });
+		else if (unread.byteLength > 0) testHook?.({ stage: "claim_journal_delta_read" });
+
+		let completeLength = unread.byteLength;
+		if (unread.byteLength > 0 && unread[unread.byteLength - 1] !== 0x0a) {
+			completeLength = unread.lastIndexOf(0x0a) + 1;
+			const committedLength = offset + completeLength;
+			if (retryPosix("ftruncate", () => requirePosix().ftruncate(descriptor, committedLength)) < 0) {
+				fail("write_file");
 			}
-			throw error;
+			if (retryPosix("fsync", () => requirePosix().fsync(descriptor)) < 0) fail("sync_file");
+			testHook?.({ stage: "claim_journal_truncated" });
 		}
 
-		try {
-			const status = fstatSync(descriptor, { bigint: true });
-			const cached = this.checkpointCache.get(cacheKey);
-			if (
-				cached &&
-				cached.device === status.dev &&
-				cached.inode === status.ino &&
-				cached.size === status.size &&
-				cached.mtimeNs === status.mtimeNs
-			) {
-				return cached.eventIds;
-			}
-
-			let parsed: unknown;
+		const committed = unread.subarray(0, completeLength).toString("utf8");
+		for (const line of committed.split("\n")) {
+			if (!line) continue;
+			let record: unknown;
 			try {
-				parsed = JSON.parse(readAll(descriptor).toString("utf8"));
+				record = JSON.parse(line);
 			} catch (error) {
 				throw new SecureFsError("read_file", undefined, error);
 			}
 			if (
-				typeof parsed !== "object" ||
-				parsed === null ||
-				(parsed as Partial<ClaimCheckpoint>).version !== 1 ||
-				!Array.isArray((parsed as Partial<ClaimCheckpoint>).eventIds) ||
-				!(parsed as ClaimCheckpoint).eventIds.every((eventId) => typeof eventId === "string")
+				typeof record !== "object" ||
+				record === null ||
+				typeof (record as Partial<ClaimJournalRecord>).eventId !== "string" ||
+				!(["pending", "done"] as const).includes((record as Partial<ClaimJournalRecord>).state as ClaimState)
 			) {
-				throw new SecureFsError("read_file", undefined, new Error("Invalid claim checkpoint"));
+				throw new SecureFsError("read_file", undefined, new Error("Invalid claim journal record"));
 			}
-			const eventIds = new Set((parsed as ClaimCheckpoint).eventIds);
-			this.checkpointCache.set(cacheKey, {
-				device: status.dev,
-				inode: status.ino,
-				size: status.size,
-				mtimeNs: status.mtimeNs,
-				eventIds,
-			});
-			return eventIds;
-		} finally {
-			closeQuietly(descriptor);
+			const claim = record as ClaimJournalRecord;
+			cache.states.set(claim.eventId, claim.state);
 		}
+		cache.offset = offset + completeLength;
+		const refreshed = fstatSync(descriptor, { bigint: true });
+		cache.device = refreshed.dev;
+		cache.inode = refreshed.ino;
+		cache.mtimeNs = refreshed.mtimeNs;
+		this.claimJournalCache.set(name, cache);
+		return cache;
 	}
 
-	private unlinkClaim(claimDirectory: number, claimName: string): void {
-		const result = invokePath(claimName, (address) =>
-			retryPosix("unlinkat", () => requirePosix().unlinkat(claimDirectory, address, 0)),
+	private appendClaimJournalRecord(descriptor: number, cache: ClaimJournalCache, record: ClaimJournalRecord): void {
+		const content = Buffer.from(`${JSON.stringify(record)}\n`);
+		appendAndSync(descriptor, content);
+		cache.states.set(record.eventId, record.state);
+		cache.offset += content.byteLength;
+		cache.mtimeNs = fstatSync(descriptor, { bigint: true }).mtimeNs;
+		testHook?.({ stage: "claim_journal_appended" });
+	}
+
+	private migrateLegacyClaims(
+		directory: number,
+		legacyDirectoryName: string,
+		journalDescriptor: number,
+		journal: ClaimJournalCache,
+		logDescriptor: number,
+	): Set<string> | undefined {
+		const legacyDirectory = this.openChildDirectory(directory, legacyDirectoryName, false);
+		if (legacyDirectory === undefined) return;
+		const legacyPath = `${this.absolutePath}${sep}${legacyDirectoryName}`;
+		const entries = this.discoverEntriesAt(legacyDirectory, legacyPath);
+		const migrated = new Map<string, ClaimState>();
+		const legacyEventIds = new Map<string, string>();
+		const eventsInLog = new Set<string>();
+		for (const line of readAll(logDescriptor).toString("utf8").split("\n")) {
+			if (!line) continue;
+			try {
+				const event = JSON.parse(line) as { eventId?: unknown };
+				if (typeof event.eventId === "string") {
+					eventsInLog.add(event.eventId);
+					legacyEventIds.set(createHash("sha256").update(event.eventId).digest("hex"), event.eventId);
+				}
+			} catch {
+				// A malformed event tail is handled by the normal recovery path.
+			}
+		}
+
+		try {
+			for (const entry of entries) {
+				let descriptor: number | undefined;
+				try {
+					descriptor = openAt(legacyDirectory, entry, constants.O_RDONLY | constants.O_NOFOLLOW);
+					const content = readAll(descriptor).toString("utf8");
+					if (entry === ".checkpoint.json") {
+						const checkpoint = JSON.parse(content) as { version?: unknown; eventIds?: unknown };
+						if (checkpoint.version !== 1 || !Array.isArray(checkpoint.eventIds)) {
+							throw new Error("Invalid legacy checkpoint");
+						}
+						for (const eventId of checkpoint.eventIds) {
+							if (typeof eventId !== "string") throw new Error("Invalid legacy checkpoint eventId");
+							migrated.set(eventId, "done");
+						}
+						continue;
+					}
+					const match = /^([0-9a-f]{64})\.claim$/.exec(entry);
+					const state = claimState(content);
+					if (!match || !state) throw new Error("Invalid legacy claim");
+					const legacyEventId = state.eventId ?? legacyEventIds.get(match[1] as string);
+					if (!legacyEventId) throw new Error("Legacy claim eventId cannot be recovered");
+					if (state.state === "done" || migrated.get(legacyEventId) !== "done") {
+						migrated.set(legacyEventId, state.state);
+					}
+				} finally {
+					if (descriptor !== undefined) closeQuietly(descriptor);
+				}
+			}
+
+			for (const [legacyEventId, state] of migrated) {
+				const current = journal.states.get(legacyEventId);
+				if (current === "done" || current === state) continue;
+				this.appendClaimJournalRecord(journalDescriptor, journal, { eventId: legacyEventId, state });
+			}
+			testHook?.({ stage: "legacy_claims_persisted" });
+
+			for (const entry of entries) {
+				const result = invokePath(entry, (address) =>
+					retryPosix("unlinkat", () => requirePosix().unlinkat(legacyDirectory, address, 0)),
+				);
+				if (result < 0 && errno() !== osConstants.errno.ENOENT) fail("unlink_file");
+			}
+			if (retryPosix("fsync", () => requirePosix().fsync(legacyDirectory)) < 0) fail("sync_file");
+		} catch (error) {
+			if (error instanceof SecureFsError) throw error;
+			throw new SecureFsError("read_file", undefined, error);
+		} finally {
+			closeQuietly(legacyDirectory);
+		}
+
+		const result = invokePath(legacyDirectoryName, (address) =>
+			retryPosix("unlinkat", () => requirePosix().unlinkat(directory, address, AT_REMOVEDIR)),
 		);
 		if (result < 0 && errno() !== osConstants.errno.ENOENT) fail("unlink_file");
-		if (retryPosix("fsync", () => requirePosix().fsync(claimDirectory)) < 0) fail("sync_file");
-	}
-
-	private compactDoneClaims(claimDirectoryName: string, claimDirectory: number): void {
-		const claimPath = `${this.absolutePath}${sep}${claimDirectoryName}`;
-		const doneClaims: Array<{ name: string; eventId: string }> = [];
-		let claimNames: string[];
-		try {
-			claimNames = this.discoverEntriesAt(claimDirectory, claimPath);
-		} catch (error) {
-			if (error instanceof SecureFsError && error.operation === "list_directory") return;
-			throw error;
-		}
-		const candidateNames = claimNames.filter((name) => /^[0-9a-f]{64}\.claim$/.test(name));
-		if (candidateNames.length <= CLAIM_COMPACTION_THRESHOLD) return;
-		for (const name of candidateNames) {
-			let descriptor: number | undefined;
-			try {
-				descriptor = openAt(claimDirectory, name, constants.O_RDONLY | constants.O_NOFOLLOW);
-				const state = claimState(readAll(descriptor).toString("utf8"));
-				if (state?.state === "done" && state.eventId) doneClaims.push({ name, eventId: state.eventId });
-			} catch (error) {
-				if (
-					error instanceof SecureFsError &&
-					(error.code === osConstants.errno.ENOENT || error.code === osConstants.errno.ELOOP)
-				) {
-					continue;
-				}
-				throw error;
-			} finally {
-				if (descriptor !== undefined) closeQuietly(descriptor);
-			}
-		}
-		if (doneClaims.length <= CLAIM_COMPACTION_THRESHOLD) return;
-
-		const eventIds = new Set(this.loadClaimCheckpoint(claimDirectory));
-		for (const claim of doneClaims) eventIds.add(claim.eventId);
-		const checkpoint: ClaimCheckpoint = { version: 1, eventIds: [...eventIds].sort() };
-		atomicReplaceAt(claimDirectory, CLAIM_CHECKPOINT_NAME, Buffer.from(`${JSON.stringify(checkpoint)}\n`));
-		const identity = directoryIdentity(claimDirectory);
-		this.checkpointCache.delete(`${identity.device}:${identity.inode}`);
-		testHook?.({ stage: "checkpoint_persisted" });
-
-		for (const claim of doneClaims) {
-			const result = invokePath(claim.name, (address) =>
-				retryPosix("unlinkat", () => requirePosix().unlinkat(claimDirectory, address, 0)),
-			);
-			if (result < 0 && errno() !== osConstants.errno.ENOENT) fail("unlink_file");
-		}
-		if (retryPosix("fsync", () => requirePosix().fsync(claimDirectory)) < 0) fail("sync_file");
-		testHook?.({ stage: "claims_compacted" });
+		if (retryPosix("fsync", () => requirePosix().fsync(directory)) < 0) fail("sync_file");
+		testHook?.({ stage: "legacy_claims_migrated" });
+		return eventsInLog;
 	}
 
 	atomicWrite(name: string, content: Buffer): void {

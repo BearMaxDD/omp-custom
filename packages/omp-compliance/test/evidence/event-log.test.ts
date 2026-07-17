@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
@@ -12,7 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventLog, EvidencePersistenceError, deterministicEvidenceEventId } from "../../src/evidence/event-log";
-import type { SecurePathScope } from "../../src/evidence/secure-fs";
+import { type SecurePathScope, setSecureFsTestHook } from "../../src/evidence/secure-fs";
 
 interface TestEvent {
 	eventId: string;
@@ -48,6 +49,7 @@ async function runConcurrentChildren(script: string, args: string[], count = 12)
 }
 
 afterEach(() => {
+	setSecureFsTestHook(undefined);
 	for (const root of roots.splice(0)) {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -124,54 +126,213 @@ describe("EventLog", () => {
 		expect(readFileSync(path, "utf8").trim().split("\n")).toHaveLength(1);
 	});
 
-	it("claim 文件名只使用 eventId 的 SHA-256 摘要", () => {
-		const root = temporaryRoot();
-		const path = join(root, "events.jsonl");
-		new EventLog<TestEvent>(path).append({ eventId: eventId("claim-name"), type: "completion" });
-
-		const claims = readdirSync(join(root, ".events.jsonl.claims"));
-		expect(claims).toHaveLength(1);
-		expect(claims[0]).toMatch(/^[a-f0-9]{64}\.claim$/);
-		expect(claims[0]).not.toContain("-");
-	});
-
-	it.each([200, 1_000])("追加 %d 个事件后 done claim 数量保持在压缩阈值内", (count) => {
+	it("1000 个正常事件只使用单一追加式 claim journal 且不重写历史", () => {
 		const root = temporaryRoot();
 		const path = join(root, "events.jsonl");
 		const log = new EventLog<TestEvent>(path);
-		const eventIds = Array.from({ length: count }, (_, index) => eventId(`checkpoint-${count}-${index}`));
-		for (const currentEventId of eventIds) log.append({ eventId: currentEventId, type: "checkpoint" });
+		const journalPath = join(root, ".events.jsonl.claims.jsonl");
+		let fullReads = 0;
+		let deltaReads = 0;
+		let journalAppends = 0;
+		setSecureFsTestHook((event) => {
+			if (event.stage === "claim_journal_full_read") fullReads += 1;
+			if (event.stage === "claim_journal_delta_read") deltaReads += 1;
+			if (event.stage === "claim_journal_appended") journalAppends += 1;
+		});
 
-		const claimDirectory = join(root, ".events.jsonl.claims");
-		const doneClaims = readdirSync(claimDirectory).filter((name) => name.endsWith(".claim"));
-		expect(doneClaims.length).toBeLessThanOrEqual(64);
-		expect(existsSync(join(claimDirectory, ".checkpoint.json"))).toBeTrue();
-		const reopened = new EventLog<TestEvent>(path);
-		reopened.append({ eventId: eventIds[0] as string, type: "checkpoint" });
-		const physical = readFileSync(path, "utf8");
-		expect(physical.match(new RegExp(eventIds[0] as string, "g"))).toHaveLength(1);
+		const eventIds = Array.from({ length: 1_000 }, (_, index) => eventId(`journal-${index}`));
+		log.append({ eventId: eventIds[0] as string, type: "journal" });
+		const journalInode = statSync(journalPath).ino;
+		for (const currentEventId of eventIds.slice(1)) log.append({ eventId: currentEventId, type: "journal" });
+
+		const journalLines = readFileSync(journalPath, "utf8").trim().split("\n");
+		expect(statSync(journalPath).ino).toBe(journalInode);
+		expect(journalLines).toHaveLength(2_000);
+		expect(journalLines.filter((line) => JSON.parse(line).state === "pending")).toHaveLength(1_000);
+		expect(journalLines.filter((line) => JSON.parse(line).state === "done")).toHaveLength(1_000);
+		expect(readdirSync(root).filter((name) => name.includes("claims"))).toEqual([".events.jsonl.claims.jsonl"]);
+		expect({ fullReads, deltaReads, journalAppends }).toEqual({ fullReads: 1, deltaReads: 0, journalAppends: 2_000 });
 	});
 
-	it.each(["checkpoint_persisted", "claims_compacted"] as const)(
-		"%s 阶段进程崩溃后仍可恢复且重复事件不重写",
+	it.each([200, 1_000])(
+		"%d 次 pending 中断恢复后 claim inode 保持常数且事件不丢不重",
+		(count) => {
+			const root = temporaryRoot();
+			const path = join(root, "events.jsonl");
+			const log = new EventLog<TestEvent>(path);
+			const eventIds = Array.from({ length: count }, (_, index) => eventId(`pending-recovery-${count}-${index}`));
+
+			for (const currentEventId of eventIds) {
+				setSecureFsTestHook((event) => {
+					if (event.stage === "claim_created") throw new Error("simulated crash after pending");
+				});
+				expect(() => log.append({ eventId: currentEventId, type: "pending-recovery" })).toThrow();
+				setSecureFsTestHook(undefined);
+				log.append({ eventId: currentEventId, type: "pending-recovery" });
+			}
+
+			const physicalLines = readFileSync(path, "utf8").trim().split("\n");
+			expect(physicalLines).toHaveLength(count);
+			expect(new Set(physicalLines.map((line) => JSON.parse(line).eventId)).size).toBe(count);
+			expect(readdirSync(root).filter((name) => name.includes("claims"))).toEqual([".events.jsonl.claims.jsonl"]);
+		},
+		30_000,
+	);
+
+	it("重开进程重复首尾 eventId 时物理日志不重复", () => {
+		const root = temporaryRoot();
+		const path = join(root, "events.jsonl");
+		const eventIds = Array.from({ length: 1_000 }, (_, index) => eventId(`reopen-${index}`));
+		const first = new EventLog<TestEvent>(path);
+		for (const currentEventId of eventIds) first.append({ eventId: currentEventId, type: "reopen" });
+
+		const reopened = new EventLog<TestEvent>(path);
+		reopened.append({ eventId: eventIds[0] as string, type: "reopen" });
+		reopened.append({ eventId: eventIds.at(-1) as string, type: "reopen" });
+
+		const physicalLines = readFileSync(path, "utf8").trim().split("\n");
+		expect(physicalLines).toHaveLength(1_000);
+		expect(physicalLines.filter((line) => line.includes(eventIds[0] as string))).toHaveLength(1);
+		expect(physicalLines.filter((line) => line.includes(eventIds.at(-1) as string))).toHaveLength(1);
+	});
+
+	it("其他进程追加后仅 pread journal 增量尾部而不重读历史", async () => {
+		const root = temporaryRoot();
+		const path = join(root, "events.jsonl");
+		const barrier = join(root, "child-start");
+		const firstEventId = eventId("delta-first");
+		const childEventId = eventId("delta-child");
+		const finalEventId = eventId("delta-final");
+		const log = new EventLog<TestEvent>(path);
+		let fullReads = 0;
+		let deltaReads = 0;
+		setSecureFsTestHook((event) => {
+			if (event.stage === "claim_journal_full_read") fullReads += 1;
+			if (event.stage === "claim_journal_delta_read") deltaReads += 1;
+		});
+		log.append({ eventId: firstEventId, type: "delta" });
+		const script = `
+			import { existsSync } from "node:fs";
+			import { EventLog } from ${JSON.stringify(eventLogModule)};
+			while (!existsSync(process.argv[2])) await Bun.sleep(2);
+			new EventLog(process.argv[1]).append({ eventId: ${JSON.stringify(childEventId)}, type: "delta" });
+		`;
+		const child = Bun.spawn([process.execPath, "-e", script, path, barrier], { stderr: "pipe" });
+		writeFileSync(barrier, "start", "utf8");
+		const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+		expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+
+		log.append({ eventId: finalEventId, type: "delta" });
+
+		expect({ fullReads, deltaReads }).toEqual({ fullReads: 1, deltaReads: 1 });
+		expect(log.readAll().map((event) => event.eventId)).toEqual([firstEventId, childEventId, finalEventId]);
+	});
+
+	it("claim journal 截断尾部在锁内回退到完整换行后继续追加", () => {
+		const root = temporaryRoot();
+		const path = join(root, "events.jsonl");
+		const journalPath = join(root, ".events.jsonl.claims.jsonl");
+		const log = new EventLog<TestEvent>(path);
+		const firstEventId = eventId("journal-truncated-first");
+		const secondEventId = eventId("journal-truncated-second");
+		log.append({ eventId: firstEventId, type: "journal" });
+		writeFileSync(journalPath, `${readFileSync(journalPath, "utf8")}{"eventId":"broken`, "utf8");
+
+		log.append({ eventId: secondEventId, type: "journal" });
+
+		const journalLines = readFileSync(journalPath, "utf8").trim().split("\n");
+		expect(() => journalLines.map((line) => JSON.parse(line))).not.toThrow();
+		expect(journalLines.filter((line) => line.includes(secondEventId))).toHaveLength(2);
+		expect(log.readAll().map((event) => event.eventId)).toEqual([firstEventId, secondEventId]);
+	});
+
+	it("旧 claim/checkpoint 在日志锁内迁移到 journal 后删除旧目录且保持幂等", () => {
+		const root = temporaryRoot();
+		const path = join(root, "events.jsonl");
+		const oldDirectory = join(root, ".events.jsonl.claims");
+		mkdirSync(oldDirectory);
+		const doneEventId = eventId("legacy-done");
+		const pendingEventId = eventId("legacy-pending");
+		writeFileSync(path, `${JSON.stringify({ eventId: doneEventId, type: "legacy" })}\n`, "utf8");
+		writeFileSync(
+			join(oldDirectory, ".checkpoint.json"),
+			`${JSON.stringify({ version: 1, eventIds: [doneEventId] })}\n`,
+		);
+		writeFileSync(
+			join(oldDirectory, `${createHash("sha256").update(pendingEventId).digest("hex")}.claim`),
+			`pending ${pendingEventId}\n`,
+		);
+
+		const log = new EventLog<TestEvent>(path);
+		log.append({ eventId: doneEventId, type: "legacy" });
+		log.append({ eventId: pendingEventId, type: "legacy" });
+
+		expect(existsSync(oldDirectory)).toBeFalse();
+		expect(existsSync(join(root, ".events.jsonl.claims.jsonl"))).toBeTrue();
+		const physicalLines = readFileSync(path, "utf8").trim().split("\n");
+		expect(physicalLines).toHaveLength(2);
+		expect(physicalLines.filter((line) => line.includes(doneEventId))).toHaveLength(1);
+		expect(physicalLines.filter((line) => line.includes(pendingEventId))).toHaveLength(1);
+	});
+
+	it("旧状态写入 journal 后迁移进程崩溃，重启只完成旧目录清理", async () => {
+		const root = temporaryRoot();
+		const path = join(root, "events.jsonl");
+		const oldDirectory = join(root, ".events.jsonl.claims");
+		const ready = join(root, "migration-ready");
+		const migratedEventId = eventId("legacy-migration-crash");
+		mkdirSync(oldDirectory);
+		writeFileSync(path, `${JSON.stringify({ eventId: migratedEventId, type: "legacy" })}\n`, "utf8");
+		writeFileSync(
+			join(oldDirectory, ".checkpoint.json"),
+			`${JSON.stringify({ version: 1, eventIds: [migratedEventId] })}\n`,
+		);
+		const secureFsModule = new URL("../../src/evidence/secure-fs.ts", import.meta.url).href;
+		const script = `
+			import { writeFileSync } from "node:fs";
+			import { EventLog } from ${JSON.stringify(eventLogModule)};
+			import { setSecureFsTestHook } from ${JSON.stringify(secureFsModule)};
+			setSecureFsTestHook((event) => {
+				if (event.stage !== "legacy_claims_persisted") return;
+				writeFileSync(process.argv[2], "ready");
+				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+			});
+			new EventLog(process.argv[1]).append({ eventId: ${JSON.stringify(migratedEventId)}, type: "legacy" });
+		`;
+		const child = Bun.spawn([process.execPath, "-e", script, path, ready], { stderr: "pipe" });
+		const deadline = Date.now() + 5_000;
+		while (!existsSync(ready) && Date.now() < deadline) await Bun.sleep(10);
+		expect(existsSync(ready)).toBeTrue();
+		child.kill("SIGKILL");
+		await child.exited;
+		expect(existsSync(oldDirectory)).toBeTrue();
+
+		new EventLog<TestEvent>(path).append({ eventId: migratedEventId, type: "legacy" });
+
+		expect(existsSync(oldDirectory)).toBeFalse();
+		expect(readFileSync(path, "utf8").trim().split("\n")).toHaveLength(1);
+		const journalLines = readFileSync(join(root, ".events.jsonl.claims.jsonl"), "utf8").trim().split("\n");
+		expect(journalLines.filter((line) => line.includes(migratedEventId))).toHaveLength(1);
+	}, 10_000);
+
+	it.each(["claim_created", "event_appended"] as const)(
+		"journal %s 崩溃窗口恢复后事件不丢不重",
 		async (crashStage) => {
 			const root = temporaryRoot();
 			const path = join(root, "events.jsonl");
 			const ready = join(root, "ready");
-			const eventIds = Array.from({ length: 65 }, (_, index) => eventId(`checkpoint-crash-${index}`));
+			const crashEventId = eventId(`journal-${crashStage}`);
 			const secureFsModule = new URL("../../src/evidence/secure-fs.ts", import.meta.url).href;
 			const script = `
 			import { writeFileSync } from "node:fs";
 			import { EventLog } from ${JSON.stringify(eventLogModule)};
 			import { setSecureFsTestHook } from ${JSON.stringify(secureFsModule)};
-			const ids = ${JSON.stringify(eventIds)};
 			setSecureFsTestHook((event) => {
 				if (event.stage !== ${JSON.stringify(crashStage)}) return;
 				writeFileSync(process.argv[2], "ready");
 				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
 			});
-			const log = new EventLog(process.argv[1]);
-			for (const eventId of ids) log.append({ eventId, type: "checkpoint" });
+			new EventLog(process.argv[1]).append({ eventId: ${JSON.stringify(crashEventId)}, type: "journal" });
 		`;
 			const child = Bun.spawn([process.execPath, "-e", script, path, ready], { stderr: "pipe" });
 			const deadline = Date.now() + 10_000;
@@ -181,15 +342,10 @@ describe("EventLog", () => {
 			await child.exited;
 
 			const reopened = new EventLog<TestEvent>(path);
-			for (const currentEventId of eventIds) reopened.append({ eventId: currentEventId, type: "checkpoint" });
+			reopened.append({ eventId: crashEventId, type: "journal" });
 			const physicalLines = readFileSync(path, "utf8").trim().split("\n");
-			expect(physicalLines).toHaveLength(65);
-			for (const currentEventId of eventIds) {
-				expect(physicalLines.filter((line) => line.includes(currentEventId))).toHaveLength(1);
-			}
-			expect(
-				readdirSync(join(root, ".events.jsonl.claims")).filter((name) => name.endsWith(".claim")).length,
-			).toBeLessThanOrEqual(64);
+			expect(physicalLines).toHaveLength(1);
+			expect(physicalLines.filter((line) => line.includes(crashEventId))).toHaveLength(1);
 		},
 		20_000,
 	);

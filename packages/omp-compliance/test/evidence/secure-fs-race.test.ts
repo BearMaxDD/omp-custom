@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { EventLog, deterministicEvidenceEventId } from "../../src/evidence/event-log";
 import { EvidenceTaskRepository } from "../../src/evidence/evidence-repository";
 import {
+	SecurePathScope,
 	getSecureFsEintrTestRemaining,
 	setSecureFsEintrTestPlan,
 	setSecureFsTestHook,
@@ -207,8 +208,10 @@ describe.skipIf(process.platform === "win32")("Evidence secure filesystem", () =
 			pread: 1,
 			flock: 3,
 			lseek: 2,
+			ftruncate: 2,
 		});
 
+		new SecurePathScope(root).ensureDirectory("eintr-directory");
 		const snapshot = new SnapshotStore(snapshotPath);
 		snapshot.write({ value: 1 });
 		expect(snapshot.read()).toEqual({ value: 1 });
@@ -217,6 +220,8 @@ describe.skipIf(process.platform === "win32")("Evidence secure filesystem", () =
 		const firstId = deterministicEvidenceEventId("eintr-first");
 		const secondId = deterministicEvidenceEventId("eintr-second");
 		log.append({ eventId: firstId, type: "test" });
+		const journalPath = join(root, ".events.jsonl.claims.jsonl");
+		writeFileSync(journalPath, `${readFileSync(journalPath, "utf8")}{"eventId":"broken`, "utf8");
 		log.append({ eventId: secondId, type: "test" });
 		expect(log.readAll().map((event) => event.eventId)).toEqual([firstId, secondId]);
 		expect(getSecureFsEintrTestRemaining()).toEqual({});
