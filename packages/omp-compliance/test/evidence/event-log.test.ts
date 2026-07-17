@@ -11,11 +11,26 @@ interface TestEvent {
 }
 
 const roots: string[] = [];
+const eventLogModule = new URL("../../src/evidence/event-log.ts", import.meta.url).href;
 
 function temporaryRoot(): string {
 	const root = mkdtempSync(join(tmpdir(), "omp-event-log-"));
 	roots.push(root);
 	return root;
+}
+
+async function runConcurrentChildren(script: string, args: string[], count = 12): Promise<void> {
+	const barrier = join(temporaryRoot(), "start");
+	const children = Array.from({ length: count }, () =>
+		Bun.spawn([process.execPath, "-e", script, ...args, barrier], { stderr: "pipe" }),
+	);
+	writeFileSync(barrier, "start", "utf8");
+
+	for (const child of children) {
+		const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+		expect(stderr).toBe("");
+		expect(exitCode).toBe(0);
+	}
 }
 
 afterEach(() => {
@@ -99,5 +114,40 @@ describe("EventLog", () => {
 		expect(() => new EventLog<TestEvent>(path).append({ eventId: "event-1", type: "completion" })).toThrow(
 			EvidencePersistenceError,
 		);
+	});
+
+	it("多进程并发恢复截断日志只物理追加一条 recovery", async () => {
+		const path = join(temporaryRoot(), "events.jsonl");
+		writeFileSync(path, '{"eventId":"valid","type":"first"}\n{"eventId":"broken', "utf8");
+		const script = `
+			import { existsSync } from "node:fs";
+			import { EventLog } from ${JSON.stringify(eventLogModule)};
+			while (!existsSync(process.argv[2])) await Bun.sleep(2);
+			new EventLog(process.argv[1]).readAll();
+		`;
+
+		await runConcurrentChildren(script, [path]);
+
+		const physicalRecoveries = readFileSync(path, "utf8")
+			.split("\n")
+			.filter((line) => line.includes('"type":"evidence_log_recovered"'));
+		expect(physicalRecoveries).toHaveLength(1);
+	});
+
+	it("多进程并发追加相同 eventId 只产生一条物理记录", async () => {
+		const path = join(temporaryRoot(), "events.jsonl");
+		const script = `
+			import { existsSync } from "node:fs";
+			import { EventLog } from ${JSON.stringify(eventLogModule)};
+			while (!existsSync(process.argv[2])) await Bun.sleep(2);
+			new EventLog(process.argv[1]).append({ eventId: "shared-event", type: "completion" });
+		`;
+
+		await runConcurrentChildren(script, [path]);
+
+		const physicalEvents = readFileSync(path, "utf8")
+			.split("\n")
+			.filter((line) => line.includes('"eventId":"shared-event"'));
+		expect(physicalEvents).toHaveLength(1);
 	});
 });
