@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { appendFileSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync } from "node:fs";
+import { constants, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 
 export interface EvidenceEvent {
@@ -22,7 +22,18 @@ export type EvidencePersistenceOperation =
 	| "read_snapshot"
 	| "parse_snapshot"
 	| "write_snapshot"
+	| "validate_evidence_path"
 	| "ensure_artifact_directory";
+
+export interface EvidenceWriteLease {
+	readonly path: string;
+}
+
+export interface EvidenceWriteBoundary {
+	prepareFileWrite(path: string): EvidenceWriteLease;
+	verifyFileWrite(lease: EvidenceWriteLease): void;
+	ensureDirectory(path: string): void;
+}
 
 export class EvidencePersistenceError extends Error {
 	readonly operation: EvidencePersistenceOperation;
@@ -53,6 +64,17 @@ function flushDirectory(path: string): void {
 	}
 }
 
+function appendDurably(path: string, content: string): void {
+	const flags = constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY | constants.O_NOFOLLOW;
+	const descriptor = openSync(path, flags, 0o600);
+	try {
+		writeSync(descriptor, content, undefined, "utf8");
+		fsyncSync(descriptor);
+	} finally {
+		closeSync(descriptor);
+	}
+}
+
 function recoveryEventFor(content: string, truncatedTail: string): EvidenceRecoveryEvent {
 	const digest = createHash("sha256").update(content).digest("hex");
 	return {
@@ -71,7 +93,10 @@ function legacyEventIdFor(line: string): string {
 export class EventLog<T extends EvidenceEvent = EvidenceEvent> {
 	private readonly appendedEventIds = new Set<string>();
 
-	constructor(readonly path: string) {}
+	constructor(
+		readonly path: string,
+		private readonly writeBoundary?: EvidenceWriteBoundary,
+	) {}
 
 	append(event: T): void {
 		if (this.appendedEventIds.has(event.eventId)) {
@@ -135,10 +160,19 @@ export class EventLog<T extends EvidenceEvent = EvidenceEvent> {
 	private appendSerialized(serialized: string, operation: "append_event" | "recover_event_log"): void {
 		try {
 			const parent = dirname(this.path);
-			mkdirSync(parent, { recursive: true });
-			appendFileSync(this.path, serialized, { encoding: "utf8", flush: true });
+			const lease = this.writeBoundary?.prepareFileWrite(this.path);
+			if (!lease) {
+				mkdirSync(parent, { recursive: true });
+			}
+			appendDurably(this.path, serialized);
+			if (lease) {
+				this.writeBoundary?.verifyFileWrite(lease);
+			}
 			flushDirectory(parent);
 		} catch (error) {
+			if (error instanceof EvidencePersistenceError) {
+				throw error;
+			}
 			throw new EvidencePersistenceError(operation, this.path, error);
 		}
 	}

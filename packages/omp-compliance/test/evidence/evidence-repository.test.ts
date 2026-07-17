@@ -1,9 +1,13 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { EvidencePersistenceError } from "../../src/evidence/event-log";
-import { EvidenceRepository, type EvidenceTaskState } from "../../src/evidence/evidence-repository";
+import {
+	EvidenceRepository,
+	EvidenceTaskRepository,
+	type EvidenceTaskState,
+} from "../../src/evidence/evidence-repository";
 import { SnapshotStore } from "../../src/evidence/snapshot-store";
 
 const roots: string[] = [];
@@ -48,6 +52,55 @@ describe("EvidenceRepository", () => {
 	it.each(["../escape", "task/child", "/absolute", "", ".", "..", "task\\child"])("拒绝不安全 taskId：%s", (taskId) => {
 		const repository = new EvidenceRepository(temporaryRoot());
 		expect(() => repository.task(taskId)).toThrow("Invalid evidence taskId");
+	});
+
+	it.each(["../escape", "../../escape", "task/child", "task\\child", "/absolute"])(
+		"公开任务仓库构造函数自身拒绝不安全 taskId：%s",
+		(taskId) => {
+			const root = join(temporaryRoot(), "repository");
+			const candidate = taskId === "/absolute" ? resolve(root, "..", "absolute") : taskId;
+
+			expect(() => new EvidenceTaskRepository(root, candidate)).toThrow("Invalid evidence taskId");
+			expect(existsSync(root)).toBe(false);
+		},
+	);
+
+	it.each(["state", "events", "reviews"] as const)("构造后 tasks 被替换为外部 symlink 时拒绝 %s 写入", (target) => {
+		const sandbox = temporaryRoot();
+		const root = join(sandbox, "repository");
+		const outside = join(sandbox, "outside");
+		const task = new EvidenceTaskRepository(root, "task-1");
+		mkdirSync(root, { recursive: true });
+		mkdirSync(outside);
+		symlinkSync(outside, join(root, "tasks"), "dir");
+
+		const write = () => {
+			if (target === "state") task.state.write({ status: "active", attempt: 1 });
+			if (target === "events") task.events.append({ eventId: "event-1", type: "task_started" });
+			if (target === "reviews") task.ensureArtifactDirectory("reviews");
+		};
+
+		expect(write).toThrow(EvidencePersistenceError);
+		expect(existsSync(join(outside, "task-1"))).toBe(false);
+	});
+
+	it.each(["state", "events", "reviews"] as const)("构造后 task 目录被替换为外部 symlink 时拒绝 %s 写入", (target) => {
+		const sandbox = temporaryRoot();
+		const root = join(sandbox, "repository");
+		const outside = join(sandbox, "outside");
+		const task = new EvidenceTaskRepository(root, "task-1");
+		mkdirSync(join(root, "tasks"), { recursive: true });
+		mkdirSync(outside);
+		symlinkSync(outside, join(root, "tasks", "task-1"), "dir");
+
+		const write = () => {
+			if (target === "state") task.state.write({ status: "active", attempt: 1 });
+			if (target === "events") task.events.append({ eventId: "event-1", type: "task_started" });
+			if (target === "reviews") task.ensureArtifactDirectory("reviews");
+		};
+
+		expect(write).toThrow(EvidencePersistenceError);
+		expect(readdirSync(outside)).toEqual([]);
 	});
 
 	it("仅在请求制品目录时创建指定目录", () => {
