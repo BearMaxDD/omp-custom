@@ -61,6 +61,20 @@ const BINDING_KEYS = new Set([
 	"createdAt",
 	"reboundAt",
 ]);
+const REDIRECTING_GIT_ENVIRONMENT_KEYS = new Set([
+	"GIT_DIR",
+	"GIT_WORK_TREE",
+	"GIT_COMMON_DIR",
+	"GIT_INDEX_FILE",
+	"GIT_OBJECT_DIRECTORY",
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+	"GIT_NAMESPACE",
+	"GIT_CEILING_DIRECTORIES",
+	"GIT_DISCOVERY_ACROSS_FILESYSTEM",
+	"GIT_PREFIX",
+	"GIT_QUARANTINE_PATH",
+	"GIT_CONFIG_COUNT",
+]);
 
 interface LockOwner {
 	readonly token: string;
@@ -115,7 +129,7 @@ export class ProjectIdentityStore {
 			const observedRemote = gitRoot === undefined ? undefined : readGitRemoteIdentity(gitRoot);
 			const filePath = join(observedRoot, ".omp", "compliance", "project.json");
 			assertStoragePathSafe(observedRoot);
-			const existing = readProjectBindingIfPresent(filePath);
+			const existing = readPublishedBindingIfPresent(filePath);
 			const binding = existing ?? createBindingAtomically(filePath, observedRoot, observedRemote, codebaseProjectId);
 
 			const result = Object.freeze({
@@ -131,6 +145,11 @@ export class ProjectIdentityStore {
 			throw new Error(PROJECT_IDENTITY_INVALID_ERROR, { cause: error });
 		}
 	}
+}
+
+function readPublishedBindingIfPresent(filePath: string): Readonly<ProjectBinding> | undefined {
+	const lockPath = join(dirname(filePath), ".project.lock");
+	return isPublicationComplete(lockPath, filePath) ? readProjectBindingIfPresent(filePath) : undefined;
 }
 
 function isProjectIdentityError(error: unknown): error is Error {
@@ -166,7 +185,7 @@ function resolveGitExecutable(): string {
 
 function executeGit(cwd: string, args: string[]): GitCommandResult {
 	const executable = resolveGitExecutable();
-	const env = { ...process.env, LANG: "C", LC_ALL: "C" };
+	const env = createGitEnvironment();
 	const probe = spawnSync(executable, ["--version"], { encoding: "utf8", env });
 	if (probe.error || probe.status !== 0 || !probe.stdout.startsWith("git version ")) {
 		throw new Error(PROJECT_IDENTITY_INVALID_ERROR, { cause: probe.error });
@@ -176,6 +195,16 @@ function executeGit(cwd: string, args: string[]): GitCommandResult {
 		throw new Error(PROJECT_IDENTITY_INVALID_ERROR, { cause: result.error });
 	}
 	return Object.freeze({ status: result.status, stdout: result.stdout.trim(), stderr: result.stderr.trim() });
+}
+
+function createGitEnvironment(): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = { ...process.env, LANG: "C", LC_ALL: "C" };
+	for (const key of Object.keys(env)) {
+		if (REDIRECTING_GIT_ENVIRONMENT_KEYS.has(key) || /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(key)) {
+			delete env[key];
+		}
+	}
+	return env;
 }
 
 function runGit(cwd: string, args: string[]): string | undefined {
@@ -387,6 +416,7 @@ function acquireLock(
 	while (true) {
 		assertStorageIdentity(storageIdentity);
 		assertStoragePathSafe(canonicalRoot);
+		if (isPublicationComplete(lockPath, filePath)) return undefined;
 		const owner = Object.freeze({ token: randomUUID(), pid: process.pid, createdAt: new Date().toISOString() });
 		let createdLock = false;
 		try {
@@ -399,6 +429,10 @@ function acquireLock(
 				closeSync(fd);
 			}
 			assertStorageIdentity(storageIdentity);
+			if (bindingFileExists(filePath)) {
+				removeLockIfOwned(lockPath, owner.token);
+				return undefined;
+			}
 			return owner;
 		} catch (error) {
 			if (createdLock) {
@@ -406,7 +440,6 @@ function acquireLock(
 				throw error;
 			}
 			if (!isAlreadyExists(error)) throw error;
-			if (existsSync(filePath)) return undefined;
 			const snapshot = readLockSnapshot(lockPath);
 			if (snapshot) {
 				const ageMs = Date.now() - nanosecondsToMilliseconds(snapshot.mtimeNs);
@@ -422,6 +455,40 @@ function acquireLock(
 			if (Date.now() >= deadline) throw new Error("Timed out acquiring OMP project identity lock");
 			Atomics.wait(SLEEP_BUFFER, 0, 0, 10);
 		}
+	}
+}
+
+function isPublicationComplete(lockPath: string, filePath: string): boolean {
+	if (pathExists(lockPath)) return false;
+	let identity: FileIdentity;
+	try {
+		identity = captureExistingRegularFileIdentity(filePath);
+	} catch (error) {
+		if (isNotFound(error)) return false;
+		throw error;
+	}
+	if (pathExists(lockPath)) return false;
+	assertRegularFileIdentity(filePath, identity);
+	return true;
+}
+
+function bindingFileExists(filePath: string): boolean {
+	try {
+		captureExistingRegularFileIdentity(filePath);
+		return true;
+	} catch (error) {
+		if (isNotFound(error)) return false;
+		throw error;
+	}
+}
+
+function pathExists(path: string): boolean {
+	try {
+		lstatSync(path);
+		return true;
+	} catch (error) {
+		if (isNotFound(error)) return false;
+		throw error;
 	}
 }
 

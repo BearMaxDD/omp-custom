@@ -12,6 +12,7 @@ import {
 	rmSync,
 	statSync,
 	symlinkSync,
+	unlinkSync,
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
@@ -194,21 +195,48 @@ describe("ProjectIdentityStore", () => {
 		expect(existsSync(bindingPath(root))).toBe(false);
 	});
 
-	it("fails closed in a real repository when the git probe fails", () => {
-		const root = initGit();
-		const nested = join(root, "packages", "app");
-		mkdirSync(nested, { recursive: true });
+	it("ignores Git environment variables that redirect repository A to repository B", () => {
+		const rootA = initGit("https://git.example.com/team/a.git");
+		const rootB = initGit("https://git.example.com/team/b.git");
 		const originalGitDir = process.env.GIT_DIR;
+		const originalGitWorkTree = process.env.GIT_WORK_TREE;
 		try {
-			process.env.GIT_DIR = join(root, "missing-git-dir");
-			expect(() => ProjectIdentityStore.open(nested)).toThrow(PROJECT_IDENTITY_INVALID_ERROR);
+			process.env.GIT_DIR = join(rootB, ".git");
+			process.env.GIT_WORK_TREE = rootB;
+			const result = ProjectIdentityStore.open(rootA);
+			expect(result.binding.canonicalRoot).toBe(realpathSync(rootA));
+			expect(result.binding.gitRemoteIdentity).toBe("git.example.com/team/a");
 		} finally {
 			if (originalGitDir === undefined) Reflect.deleteProperty(process.env, "GIT_DIR");
 			else process.env.GIT_DIR = originalGitDir;
+			if (originalGitWorkTree === undefined) Reflect.deleteProperty(process.env, "GIT_WORK_TREE");
+			else process.env.GIT_WORK_TREE = originalGitWorkTree;
 		}
 
-		expect(existsSync(bindingPath(nested))).toBe(false);
-		expect(existsSync(bindingPath(root))).toBe(false);
+		expect(existsSync(bindingPath(rootA))).toBe(true);
+		expect(existsSync(bindingPath(rootB))).toBe(false);
+	});
+
+	it("does not redirect a non-Git project A into Git repository B", () => {
+		const rootA = tempProject();
+		const rootB = initGit("https://git.example.com/team/b.git");
+		const originalGitDir = process.env.GIT_DIR;
+		const originalGitWorkTree = process.env.GIT_WORK_TREE;
+		try {
+			process.env.GIT_DIR = join(rootB, ".git");
+			process.env.GIT_WORK_TREE = rootB;
+			const result = ProjectIdentityStore.open(rootA);
+			expect(result.binding.canonicalRoot).toBe(realpathSync(rootA));
+			expect(result.binding.gitRemoteIdentity).toBeUndefined();
+		} finally {
+			if (originalGitDir === undefined) Reflect.deleteProperty(process.env, "GIT_DIR");
+			else process.env.GIT_DIR = originalGitDir;
+			if (originalGitWorkTree === undefined) Reflect.deleteProperty(process.env, "GIT_WORK_TREE");
+			else process.env.GIT_WORK_TREE = originalGitWorkTree;
+		}
+
+		expect(existsSync(bindingPath(rootA))).toBe(true);
+		expect(existsSync(bindingPath(rootB))).toBe(false);
 	});
 
 	it("does not infer identity after moving a project without a remote", () => {
@@ -234,30 +262,36 @@ describe("ProjectIdentityStore", () => {
 		},
 	);
 
-	it("creates exactly one identity under concurrent first open", async () => {
-		const root = initGit("https://github.com/acme/widget.git");
+	it("creates exactly one identity in 20 concurrent first-open rounds", async () => {
 		const modulePath = join(import.meta.dir, "../../src/project/project-identity.ts");
-		const script = `import { ProjectIdentityStore } from ${JSON.stringify(modulePath)}; console.log(ProjectIdentityStore.open(${JSON.stringify(root)}).binding.projectId);`;
-		const processes = Array.from({ length: 8 }, () =>
-			Bun.spawn([process.execPath, "-e", script], { stderr: "pipe", stdout: "pipe" }),
-		);
-
-		const ids = new Set(
-			await Promise.all(
+		for (let round = 0; round < 20; round += 1) {
+			const root = initGit("https://github.com/acme/widget.git");
+			const script = `import { ProjectIdentityStore } from ${JSON.stringify(modulePath)}; console.log(ProjectIdentityStore.open(${JSON.stringify(root)}).binding.projectId);`;
+			const processes = Array.from({ length: 8 }, () =>
+				Bun.spawn([process.execPath, "-e", script], { stderr: "pipe", stdout: "pipe" }),
+			);
+			const results = await Promise.all(
 				processes.map(async (process) => {
-					const output = await new Response(process.stdout).text();
-					expect(await process.exited).toBe(0);
-					return output.trim();
+					const [stdout, stderr, exitCode] = await Promise.all([
+						new Response(process.stdout).text(),
+						new Response(process.stderr).text(),
+						process.exited,
+					]);
+					return { exitCode, stderr, stdout: stdout.trim() };
 				}),
-			),
-		);
-		const leftovers = readdirSync(join(root, ".omp", "compliance")).map((name) =>
-			join(root, ".omp", "compliance", name),
-		);
+			);
+			const ids = new Set(results.map((result) => result.stdout));
+			const leftovers = readdirSync(join(root, ".omp", "compliance")).map((name) =>
+				join(root, ".omp", "compliance", name),
+			);
 
-		expect(ids.size).toBe(1);
-		expect(leftovers).toEqual([bindingPath(root)]);
-		expect(ids.has(readBinding(root).projectId)).toBe(true);
+			expect(results.map(({ exitCode, stderr }) => ({ exitCode, stderr }))).toEqual(
+				Array.from({ length: 8 }, () => ({ exitCode: 0, stderr: "" })),
+			);
+			expect(ids.size).toBe(1);
+			expect(leftovers).toEqual([bindingPath(root)]);
+			expect(ids.has(readBinding(root).projectId)).toBe(true);
+		}
 	});
 
 	it("fails closed for corrupted identity JSON", () => {
@@ -545,12 +579,13 @@ describe("ProjectIdentityStore", () => {
 		const child = Bun.spawn([process.execPath, "-e", script], { stderr: "pipe", stdout: "pipe" });
 		await Bun.sleep(100);
 		writeFileSync(bindingPath(root), `${JSON.stringify(expected)}\n`);
+		unlinkSync(lockPath);
 		const stdout = await new Response(child.stdout).text();
 
 		expect(await child.exited).toBe(0);
 		expect(stdout.trim()).toBe(expected.projectId);
 		expect(readBinding(root)).toEqual(expected);
-		expect(existsSync(lockPath)).toBe(true);
+		expect(existsSync(lockPath)).toBe(false);
 	});
 
 	it("fails closed when project.json is replaced after its fd is opened", () => {
