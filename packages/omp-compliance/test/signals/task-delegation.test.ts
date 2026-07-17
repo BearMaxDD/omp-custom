@@ -131,6 +131,28 @@ describe("task-delegation v17 details 领域归一化", () => {
 		]);
 	});
 
+	it("results 非空时忽略 async.running 并逐项保留真实状态", () => {
+		const collector = new ToolEventCollector();
+		collector.recordCall(taskCall({ task: "混合运行任务" }, "mixed-running"));
+		collector.recordResult(
+			taskResult(
+				"mixed-running",
+				taskDetails({
+					results: [
+						singleResult({ id: "running-completed", assignment: "已完成项" }),
+						singleResult({ index: 1, id: "running-aborted", assignment: "已终止项", exitCode: 2 }),
+					],
+					async: { state: "running", jobId: "job-running", type: "task" },
+				}),
+			),
+		);
+
+		expect(collector.snapshot().subagentDelegations).toEqual([
+			expect.objectContaining({ agentId: "running-completed", taskSummary: "已完成项", status: "completed" }),
+			expect.objectContaining({ agentId: "running-aborted", taskSummary: "已终止项", status: "aborted" }),
+		]);
+	});
+
 	it("async.failed 映射为 aborted", () => {
 		const collector = new ToolEventCollector();
 		collector.recordCall(taskCall({ task: "后台失败" }, "async-failed"));
@@ -141,6 +163,33 @@ describe("task-delegation v17 details 领域归一化", () => {
 			),
 		);
 		expect(collector.snapshot().subagentDelegations[0]?.status).toBe("aborted");
+	});
+
+	it("results 非空时忽略 async.failed 并逐项保留真实状态", () => {
+		const collector = new ToolEventCollector();
+		collector.recordCall(taskCall({ task: "混合失败任务" }, "mixed-failed"));
+		collector.recordResult(
+			taskResult(
+				"mixed-failed",
+				taskDetails({
+					results: [
+						singleResult({ id: "failed-completed", assignment: "已完成项" }),
+						singleResult({
+							index: 1,
+							id: "failed-aborted",
+							assignment: "已终止项",
+							error: "provider failed",
+						}),
+					],
+					async: { state: "failed", jobId: "job-failed", type: "task" },
+				}),
+			),
+		);
+
+		expect(collector.snapshot().subagentDelegations).toEqual([
+			expect.objectContaining({ agentId: "failed-completed", taskSummary: "已完成项", status: "completed" }),
+			expect.objectContaining({ agentId: "failed-aborted", taskSummary: "已终止项", status: "aborted" }),
+		]);
 	});
 
 	it("async.completed 解析 results[]", () => {
@@ -160,6 +209,18 @@ describe("task-delegation v17 details 领域归一化", () => {
 			taskSummary: "真实结果",
 			status: "completed",
 		});
+	});
+
+	it("async.completed 但 results 为空时仍为 insufficient", () => {
+		const collector = new ToolEventCollector();
+		collector.recordCall(taskCall({ task: "后台空完成" }, "async-completed-empty"));
+		collector.recordResult(
+			taskResult(
+				"async-completed-empty",
+				taskDetails({ results: [], async: { state: "completed", jobId: "job-empty", type: "task" } }),
+			),
+		);
+		expect(collector.snapshot().subagentDelegations[0]?.status).toBe("insufficient");
 	});
 
 	it("同步成功但 results 为空时仍为 insufficient", () => {

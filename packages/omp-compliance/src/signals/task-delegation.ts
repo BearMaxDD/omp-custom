@@ -61,14 +61,9 @@ export function normalizeTaskDelegation(
 		// Structured v17 details are authoritative; resultRef is only a text fallback.
 		const details = { ...parseResultDetails(result.resultRef), ...result.details };
 		if (isTaskToolDetails(details)) {
-			const asyncState = readRecord(details.async)?.state;
-			if (asyncState === "running" || asyncState === "failed") {
-				results.push(emptyEvidence(call, asyncState === "failed" ? "aborted" : "insufficient"));
-				continue;
-			}
-
 			if (details.results.length === 0) {
-				results.push(emptyEvidence(call, "insufficient"));
+				const asyncState = readRecord(details.async)?.state;
+				results.push(emptyEvidence(call, asyncState === "failed" ? "aborted" : "insufficient"));
 				continue;
 			}
 
