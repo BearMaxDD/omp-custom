@@ -1,7 +1,8 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
 	constants,
+	accessSync,
 	closeSync,
 	existsSync,
 	fstatSync,
@@ -15,7 +16,7 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, normalize, sep } from "node:path";
+import { delimiter, dirname, isAbsolute, join, normalize, sep } from "node:path";
 
 export const PROJECT_IDENTITY_INVALID_ERROR = "OMP project identity is invalid; compliance activation refused";
 
@@ -95,6 +96,12 @@ interface StorageIdentity {
 	readonly compliance: DirectoryIdentity;
 }
 
+interface GitCommandResult {
+	readonly status: number;
+	readonly stdout: string;
+	readonly stderr: string;
+}
+
 // biome-ignore lint/complexity/noStaticOnlyClass: The plan specifies a named ProjectIdentityStore.open boundary.
 export class ProjectIdentityStore {
 	static open(cwd: string, options: ProjectIdentityOpenOptions = {}): ProjectIdentityResult {
@@ -127,23 +134,50 @@ function canonicalPath(path: string): string {
 	return normalize(realpathSync(path)).split(sep).join("/");
 }
 
-function runGit(cwd: string, args: string[]): string | undefined {
-	try {
-		return execFileSync("git", ["-C", cwd, ...args], {
-			encoding: "utf8",
-			env: process.env,
-			stdio: ["ignore", "pipe", "ignore"],
-		}).trim();
-	} catch {
-		return undefined;
+function resolveGitExecutable(): string {
+	const path = process.env.PATH;
+	if (!path) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
+	const extensions = process.platform === "win32" ? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT").split(delimiter) : [""];
+	for (const directory of path.split(delimiter)) {
+		const base = directory.replace(/^"|"$/g, "") || process.cwd();
+		for (const extension of extensions) {
+			const candidate = join(base, `git${extension.toLowerCase()}`);
+			try {
+				accessSync(candidate, constants.X_OK);
+				return candidate;
+			} catch {
+				// Keep searching PATH for an executable Git candidate.
+			}
+		}
 	}
+	throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
+}
+
+function executeGit(cwd: string, args: string[]): GitCommandResult {
+	const executable = resolveGitExecutable();
+	const env = { ...process.env, LANG: "C", LC_ALL: "C" };
+	const probe = spawnSync(executable, ["--version"], { encoding: "utf8", env });
+	if (probe.error || probe.status !== 0 || !probe.stdout.startsWith("git version ")) {
+		throw new Error(PROJECT_IDENTITY_INVALID_ERROR, { cause: probe.error });
+	}
+	const result = spawnSync(executable, ["-C", cwd, ...args], { encoding: "utf8", env });
+	if (result.error || result.status === null) {
+		throw new Error(PROJECT_IDENTITY_INVALID_ERROR, { cause: result.error });
+	}
+	return Object.freeze({ status: result.status, stdout: result.stdout.trim(), stderr: result.stderr.trim() });
+}
+
+function runGit(cwd: string, args: string[]): string | undefined {
+	const result = executeGit(cwd, args);
+	return result.status === 0 ? result.stdout : undefined;
 }
 
 function findGitRoot(cwd: string): string | undefined {
-	const root = runGit(cwd, ["rev-parse", "--show-toplevel"]);
-	if (root) return canonicalPath(root);
+	const result = executeGit(cwd, ["rev-parse", "--show-toplevel"]);
+	if (result.status === 0 && result.stdout) return canonicalPath(result.stdout);
 	if (hasGitMarker(cwd)) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
-	return undefined;
+	if (/^fatal: not a git repository \(or any of the parent directories\): \.git$/.test(result.stderr)) return undefined;
+	throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
 }
 
 function hasGitMarker(cwd: string): boolean {

@@ -126,6 +126,20 @@ describe("ProjectIdentityStore", () => {
 		expect(second.binding.projectId).toBe(first.binding.projectId);
 	});
 
+	it("fails closed in a non-Git directory when the Git CLI is unavailable", () => {
+		const root = tempProject();
+		const originalPath = process.env.PATH;
+		try {
+			process.env.PATH = root;
+			expect(() => ProjectIdentityStore.open(root)).toThrow(PROJECT_IDENTITY_INVALID_ERROR);
+		} finally {
+			if (originalPath === undefined) Reflect.deleteProperty(process.env, "PATH");
+			else process.env.PATH = originalPath;
+		}
+
+		expect(existsSync(bindingPath(root))).toBe(false);
+	});
+
 	it("fails closed below a repository with a corrupted .git marker", () => {
 		const root = initGit();
 		const nested = join(root, "packages", "app");
