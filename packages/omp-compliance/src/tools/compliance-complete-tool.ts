@@ -27,12 +27,20 @@ export interface ValidationError {
 	message: string;
 }
 
+export type CompletionValidationResult =
+	| { readonly ok: true; readonly value: CompletionToolParams }
+	| { readonly ok: false; readonly errors: ValidationError[] };
+
+function isStringArray(value: unknown): value is string[] {
+	return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
 /**
  * Validate compliance_complete tool parameters.
  *
- * Returns an array of ValidationError. Empty array = valid.
+ * Returns either typed completion parameters or validation errors.
  */
-export function validateCompletionParams(raw: Record<string, unknown>): ValidationError[] {
+export function validateCompletionParams(raw: Record<string, unknown>): CompletionValidationResult {
 	const errors: ValidationError[] = [];
 
 	if (raw.summary === undefined || raw.summary === null) {
@@ -66,7 +74,14 @@ export function validateCompletionParams(raw: Record<string, unknown>): Validati
 		}
 	}
 
-	return errors;
+	if (errors.length > 0) return { ok: false, errors };
+	return {
+		ok: true,
+		value: {
+			summary: typeof raw.summary === "string" ? raw.summary : "",
+			claimed_verification: isStringArray(raw.claimed_verification) ? raw.claimed_verification : undefined,
+		},
+	};
 }
 
 // ─── Tool registration ──────────────────────────────────────────────
@@ -116,19 +131,19 @@ export function registerComplianceCompleteTool(
 			_toolCallId,
 			params: Record<string, unknown>,
 		): Promise<AgentToolResult<Record<string, unknown>>> => {
-			const errors = validateCompletionParams(params);
-			if (errors.length > 0) {
+			const validation = validateCompletionParams(params);
+			if (!validation.ok) {
 				return toToolResult(
 					{
 						success: false,
 						error: "Validation failed",
-						validationErrors: errors,
+						validationErrors: validation.errors,
 					},
 					true,
 				);
 			}
 
-			const { summary, claimed_verification } = params as unknown as CompletionToolParams;
+			const { summary, claimed_verification } = validation.value;
 
 			try {
 				const result = await runtime.requestCompletion({

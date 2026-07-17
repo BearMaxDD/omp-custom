@@ -14,10 +14,39 @@
  *   producing the snapshot. Orphan results are stored but flagged.
  */
 
+import type { ToolCallEvent, ToolResultEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { normalizeCodebaseMemory } from "./codebase-memory";
 import { normalizeTaskDelegation } from "./task-delegation";
 import type { EvidenceSnapshot, ToolCallRecord, ToolResultRecord } from "./types";
 import { collectVerifications } from "./verification";
+
+interface LegacySyntheticToolCallEvent {
+	toolName?: unknown;
+	toolCallId?: unknown;
+	serverName?: unknown;
+	params?: Record<string, unknown>;
+	timestamp?: unknown;
+}
+
+interface LegacySyntheticToolResultEvent {
+	toolCallId?: unknown;
+	isError?: unknown;
+	error?: unknown;
+	success?: unknown;
+	resultRef?: unknown;
+	content?: unknown;
+	output?: unknown;
+	result?: unknown;
+	timestamp?: unknown;
+}
+
+function isOfficialToolCallEvent(event: ToolCallEvent | LegacySyntheticToolCallEvent): event is ToolCallEvent {
+	return "type" in event && event.type === "tool_call";
+}
+
+function isOfficialToolResultEvent(event: ToolResultEvent | LegacySyntheticToolResultEvent): event is ToolResultEvent {
+	return "type" in event && event.type === "tool_result";
+}
 
 export class ToolEventCollector {
 	private calls: Map<string, ToolCallRecord> = new Map();
@@ -32,17 +61,28 @@ export class ToolEventCollector {
 	 * indicators) to keep the evidence log compact and avoid leaking
 	 * large prompts.
 	 */
-	recordCall(event: Record<string, unknown>): void {
-		const toolName = String(event.toolName ?? event.name ?? "");
-		const toolCallId = String(event.toolCallId ?? event.id ?? `${toolName}-${Date.now()}`);
-		const serverName = event.serverName ? String(event.serverName) : undefined;
-		const rawParams = (event.params ?? event.arguments ?? {}) as Record<string, unknown>;
+	recordCall(event: ToolCallEvent | LegacySyntheticToolCallEvent): void {
+		let toolName: string;
+		let toolCallId: string;
+		let serverName: string | undefined;
+		let input: object;
+		if (isOfficialToolCallEvent(event)) {
+			toolName = event.toolName;
+			toolCallId = event.toolCallId;
+			input = event.input;
+		} else {
+			// Legacy synthetic events are isolated to internal fixtures and verification recording.
+			toolName = String(event.toolName ?? "");
+			toolCallId = String(event.toolCallId ?? `${toolName}-${Date.now()}`);
+			serverName = event.serverName ? String(event.serverName) : undefined;
+			input = event.params ?? {};
+		}
 
 		this.calls.set(toolCallId, {
 			toolName,
 			toolCallId,
 			serverName,
-			params: this.truncateParams(rawParams),
+			params: this.truncateParams(input),
 			timestamp: new Date().toISOString(),
 		});
 	}
@@ -54,10 +94,17 @@ export class ToolEventCollector {
 	 * indicator, and a result reference string (truncated to avoid storing
 	 * large blobs in memory).
 	 */
-	recordResult(event: Record<string, unknown>): void {
+	recordResult(event: ToolResultEvent | LegacySyntheticToolResultEvent): void {
 		const ref = this.extractResultRef(event);
-		const toolCallId = String(event.toolCallId ?? event.id ?? "");
-		const isError = event.isError === true || event.error != null;
+		let toolCallId: string;
+		let isError: boolean;
+		if (isOfficialToolResultEvent(event)) {
+			toolCallId = event.toolCallId;
+			isError = event.isError;
+		} else {
+			toolCallId = String(event.toolCallId ?? "");
+			isError = event.isError === true || event.success === false;
+		}
 
 		this.results.set(toolCallId, {
 			toolCallId,
@@ -110,7 +157,7 @@ export class ToolEventCollector {
 	 * Array values are counted. Object values are flattened to their key
 	 * count. Primitives pass through unchanged.
 	 */
-	private truncateParams(params: Record<string, unknown>): Record<string, unknown> {
+	private truncateParams(params: object): Record<string, unknown> {
 		const result: Record<string, unknown> = {};
 		for (const [key, value] of Object.entries(params)) {
 			result[key] = this.truncateValue(value);
@@ -138,7 +185,16 @@ export class ToolEventCollector {
 	 * Prefers explicit fields like resultRef / content / output, then
 	 * truncates the full result as JSON.
 	 */
-	private extractResultRef(event: Record<string, unknown>): string {
+	private extractResultRef(event: ToolResultEvent | LegacySyntheticToolResultEvent): string {
+		if (isOfficialToolResultEvent(event)) {
+			const text = event.content
+				.filter((item) => item.type === "text")
+				.map((item) => item.text)
+				.join("\n");
+			if (text) return text.length > 200 ? `${text.slice(0, 200)}…` : text;
+			const json = JSON.stringify(event.details ?? event);
+			return json.length > 200 ? `${json.slice(0, 200)}…` : json;
+		}
 		if (typeof event.resultRef === "string") return event.resultRef;
 		if (typeof event.content === "string") {
 			return event.content.length > 200 ? `${event.content.slice(0, 200)}…` : event.content;
@@ -147,7 +203,7 @@ export class ToolEventCollector {
 			return event.output.length > 200 ? `${event.output.slice(0, 200)}…` : event.output;
 		}
 		try {
-			const json = JSON.stringify(event.result ?? event);
+			const json = JSON.stringify(event.result ?? event) ?? "[undefined]";
 			return json.length > 200 ? `${json.slice(0, 200)}…` : json;
 		} catch {
 			return "[unserializable]";

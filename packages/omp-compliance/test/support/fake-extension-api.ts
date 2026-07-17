@@ -8,7 +8,9 @@ import type {
 import type {
 	ExtensionContext,
 	RegisteredCommand,
+	ToolCallEvent,
 	ToolDefinition,
+	ToolResultEvent,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { CustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
 import type { ComplianceExtensionHost } from "../../src/extension";
@@ -45,10 +47,29 @@ export class FakeExtensionAPI {
 		this.commands.push(name);
 	}
 
-	on(event: string, handler: (event: unknown) => unknown): void {
+	on(event: string, handler: (event: unknown, context?: ExtensionContext) => unknown): void {
 		const handlers = this.eventHandlers.get(event) ?? [];
 		handlers.push(handler);
 		this.eventHandlers.set(event, handlers);
+	}
+
+	private createContext(): ExtensionContext {
+		return {
+			ui: {} as ExtensionContext["ui"],
+			getContextUsage: () => undefined,
+			compact: async () => {},
+			hasUI: false,
+			cwd: process.cwd(),
+			sessionManager: { getSessionId: () => "test-session" } as ExtensionContext["sessionManager"],
+			modelRegistry: {} as ExtensionContext["modelRegistry"],
+			model: undefined,
+			models: {} as ExtensionContext["models"],
+			isIdle: () => true,
+			abort: () => {},
+			hasPendingMessages: () => false,
+			shutdown: () => {},
+			getSystemPrompt: () => [],
+		};
 	}
 
 	sendMessage<T = unknown>(
@@ -106,12 +127,18 @@ export class FakeExtensionAPI {
 	}
 
 	/** Simulate a tool_call event through all bound handlers and return collected results. */
-	async fireToolCall(toolName: string): Promise<{ block: boolean; reasons: string[] }> {
+	async fireToolCall(
+		toolName: string,
+		input: Record<string, unknown> = {},
+		toolCallId = `test-${toolName}`,
+	): Promise<{ block: boolean; reasons: string[] }> {
 		const handlers = this.eventHandlers.get("tool_call") ?? [];
 		const results: { block?: boolean; reason?: string }[] = [];
+		const event: ToolCallEvent = { type: "tool_call", toolName, toolCallId, input };
+		const context = this.createContext();
 
 		for (const handler of handlers) {
-			const result = await handler({ tool_name: toolName });
+			const result = await handler(event, context);
 			if (result && typeof result === "object" && "block" in (result as Record<string, unknown>)) {
 				results.push(result as { block?: boolean; reason?: string });
 			}
@@ -123,6 +150,13 @@ export class FakeExtensionAPI {
 		};
 	}
 
+	async fireToolResult(event: Omit<ToolResultEvent, "type">): Promise<void> {
+		const handlers = this.eventHandlers.get("tool_result") ?? [];
+		const fullEvent = { type: "tool_result", ...event } as ToolResultEvent;
+		const context = this.createContext();
+		for (const handler of handlers) await handler(fullEvent, context);
+	}
+
 	/** Return which tool names would be blocked by handlers (for compliance assertions). */
 	async getBlockedToolCalls(): Promise<string[]> {
 		const blocked: string[] = [];
@@ -132,9 +166,15 @@ export class FakeExtensionAPI {
 		// Test a representative set of built-in tools
 		const toolNames = ["executeBash", "read", "grep", "edit", "write", "glob", "task"];
 		for (const name of toolNames) {
-			const event = { tool_name: name };
+			const event: ToolCallEvent = {
+				type: "tool_call",
+				toolName: name,
+				toolCallId: `blocked-check-${name}`,
+				input: {},
+			};
+			const context = this.createContext();
 			for (const handler of handlerSet) {
-				const result = await handler(event);
+				const result = await handler(event, context);
 				if (result && typeof result === "object" && (result as Record<string, unknown>)?.block === true) {
 					blocked.push(name);
 					break;

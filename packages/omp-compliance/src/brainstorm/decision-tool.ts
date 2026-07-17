@@ -26,15 +26,33 @@ export interface DecisionValidationError {
 
 const VALID_DECISIONS = new Set(["accept_candidate", "accept_alternative", "reopen", "park"]);
 
+type Decision = "accept_candidate" | "accept_alternative" | "reopen" | "park";
+
+export interface DecisionToolInput {
+	readonly topic_id: string;
+	readonly decision: Decision;
+	readonly selected_alternative?: string;
+	readonly rationale?: string;
+	readonly user_confirmed: true;
+}
+
+export type DecisionValidationResult =
+	| { readonly ok: true; readonly value: DecisionToolInput }
+	| { readonly ok: false; readonly errors: DecisionValidationError[] };
+
+function isDecision(value: unknown): value is Decision {
+	return typeof value === "string" && VALID_DECISIONS.has(value);
+}
+
 // ─── Validation ──────────────────────────────────────────────────────
 
 /**
  * Validate brainstorm_decision tool parameters.
  *
- * Returns an array of ValidationError. Empty array = valid.
- * Enforces user_confirmed: true at the validation layer.
+ * Returns either typed input or validation errors and enforces
+ * user_confirmed: true at the validation layer.
  */
-export function validateDecisionInput(raw: Record<string, unknown>): DecisionValidationError[] {
+export function validateDecisionInput(raw: Record<string, unknown>): DecisionValidationResult {
 	const errors: DecisionValidationError[] = [];
 
 	// topic_id — required, non-empty string
@@ -43,7 +61,7 @@ export function validateDecisionInput(raw: Record<string, unknown>): DecisionVal
 	}
 
 	// decision — required, valid enum value
-	if (typeof raw.decision !== "string" || !VALID_DECISIONS.has(raw.decision)) {
+	if (!isDecision(raw.decision)) {
 		errors.push({
 			field: "decision",
 			message: "decision must be one of: accept_candidate, accept_alternative, reopen, park",
@@ -74,7 +92,18 @@ export function validateDecisionInput(raw: Record<string, unknown>): DecisionVal
 		}
 	}
 
-	return errors;
+	if (errors.length > 0) return { ok: false, errors };
+
+	return {
+		ok: true,
+		value: {
+			topic_id: typeof raw.topic_id === "string" ? raw.topic_id : "",
+			decision: isDecision(raw.decision) ? raw.decision : "park",
+			selected_alternative: typeof raw.selected_alternative === "string" ? raw.selected_alternative : undefined,
+			rationale: typeof raw.rationale === "string" ? raw.rationale : undefined,
+			user_confirmed: true,
+		},
+	};
 }
 
 // ─── Tool Dependencies ───────────────────────────────────────────────
@@ -134,16 +163,13 @@ export function createDecisionTool(deps: DecisionToolDependencies): ToolDefiniti
 			_toolCallId,
 			params: Record<string, unknown>,
 		): Promise<AgentToolResult<Record<string, unknown>>> => {
-			const errors = validateDecisionInput(params);
-			if (errors.length > 0) {
-				return toToolResult({ ok: false, errors }, true);
+			const validation = validateDecisionInput(params);
+			if (!validation.ok) {
+				return toToolResult({ ok: false, errors: validation.errors }, true);
 			}
 
 			try {
-				const topicId = params.topic_id as string;
-				const decision = params.decision as "accept_candidate" | "accept_alternative" | "reopen" | "park";
-				const selectedAlternative = params.selected_alternative as string | undefined;
-				const rationale = params.rationale as string | undefined;
+				const { topic_id: topicId, decision, selected_alternative: selectedAlternative, rationale } = validation.value;
 
 				await deps.coordinator.recordDecision(topicId, {
 					topic_id: topicId,
@@ -158,7 +184,7 @@ export function createDecisionTool(deps: DecisionToolDependencies): ToolDefiniti
 				return toToolResult(
 					{
 						ok: false,
-						errors: [{ field: "_handler", message: `recordDecision failed: ${(err as Error).message}` }],
+						errors: [{ field: "_handler", message: `recordDecision failed: ${String(err)}` }],
 					},
 					true,
 				);

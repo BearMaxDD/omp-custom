@@ -5,13 +5,21 @@
 
 import { describe, expect, it } from "bun:test";
 import type { BrainstormRuntime } from "../../src/brainstorm/brainstorm-runtime";
-import { createTopicReadyTool, validateTopicReadyInput } from "../../src/brainstorm/topic-ready-tool";
+import {
+	createTopicReadyTool,
+	validateTopicReadyInput as validateTopicReady,
+} from "../../src/brainstorm/topic-ready-tool";
+
+const validateTopicReadyInput = (raw: Record<string, unknown>) => {
+	const validation = validateTopicReady(raw);
+	return validation.ok ? [] : validation.errors;
+};
 
 // ─── validateTopicReadyInput ───────────────────────────────────────────
 
 describe("validateTopicReadyInput", () => {
 	it("accepts a valid full input", () => {
-		const errors = validateTopicReadyInput({
+		const validation = validateTopicReady({
 			topic_kind: "architecture",
 			title: "Advisor wiring approach",
 			candidate_decision: "Reuse advisor_before_run with dedicated context.",
@@ -21,7 +29,30 @@ describe("validateTopicReadyInput", () => {
 			discussion_summary: "We discussed the approach and it converged.",
 			unresolved_questions: ["How to handle timeouts?"],
 		});
-		expect(errors).toEqual([]);
+		expect(validation).toEqual({
+			ok: true,
+			value: {
+				topic_kind: "architecture",
+				title: "Advisor wiring approach",
+				candidate_decision: "Reuse advisor_before_run with dedicated context.",
+				constraints: ["User decides", "Read-only advisor"],
+				success_criteria: ["Structured review", "Zero side effects on close"],
+				codebase_relevance: "required",
+				discussion_summary: "We discussed the approach and it converged.",
+				unresolved_questions: ["How to handle timeouts?"],
+			},
+		});
+	});
+
+	it("rejects non-string codebase_relevance", () => {
+		const validation = validateTopicReady({
+			topic_kind: "architecture",
+			title: "Test title",
+			candidate_decision: "Test decision.",
+			codebase_relevance: 42,
+		});
+		expect(validation.ok).toBe(false);
+		if (!validation.ok) expect(validation.errors.some((error) => error.field === "codebase_relevance")).toBe(true);
 	});
 
 	it("accepts minimal required fields only", () => {
@@ -170,5 +201,29 @@ describe("createTopicReadyTool", () => {
 		expect(result.details).toHaveProperty("errors");
 		expect((result.details as { errors: unknown[] }).errors.length).toBeGreaterThan(0);
 		expect(result.isError).toBe(true);
+	});
+
+	it("stringifies non-Error submit failures", async () => {
+		const tool = createTopicReadyTool({
+			runtime: {
+				submitTopic: async () => {
+					throw "topic exploded";
+				},
+			} as unknown as BrainstormRuntime,
+			sessionId: () => "session-1",
+		});
+
+		const result = await tool.execute(
+			"topic-ready-test",
+			{
+				topic_kind: "risk",
+				title: "Failure",
+				candidate_decision: "Exercise error handling.",
+			},
+			undefined,
+			undefined,
+			{} as never,
+		);
+		expect(JSON.stringify(result.details)).toContain("topic exploded");
 	});
 });

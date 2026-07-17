@@ -1,10 +1,15 @@
 import { describe, expect, it } from "bun:test";
-import { validateCompletionParams } from "../../src/tools/compliance-complete-tool";
+import { validateCompletionParams as validateCompletion } from "../../src/tools/compliance-complete-tool";
+
+const validateCompletionParams = (raw: Record<string, unknown>) => {
+	const validation = validateCompletion(raw);
+	return validation.ok ? [] : validation.errors;
+};
 
 describe("ComplianceCompleteTool — parameter validation", () => {
 	it("should accept valid params with just summary", () => {
-		const errors = validateCompletionParams({ summary: "Done with the task" });
-		expect(errors).toHaveLength(0);
+		const validation = validateCompletion({ summary: "Done with the task" });
+		expect(validation).toEqual({ ok: true, value: { summary: "Done with the task" } });
 	});
 
 	it("should accept valid params with summary and claimed_verification", () => {

@@ -70,6 +70,11 @@ export interface ComplianceExtensionHost {
 	requestAdvisorReview?(request: AdvisorReviewRequest): Promise<AdvisorReviewReceipt>;
 }
 
+export function bindCollectorEvents(api: ComplianceExtensionHost, collector: CollectorRuntime): void {
+	api.on("tool_call", (event) => collector.recordToolCall(event));
+	api.on("tool_result", (event) => collector.recordToolResult(event));
+}
+
 /**
  * Create a memoized EvidenceStore factory.
  * Only instantiates the store (and creates the directory) when first called.
@@ -233,8 +238,7 @@ export default function activate(api: ComplianceExtensionHost): void {
 	);
 
 	// ── Passive event handlers ──
-	api.on("tool_call", (event) => collector.recordToolCall({ ...event }));
-	api.on("tool_result", (event) => collector.recordToolResult({ ...event }));
+	bindCollectorEvents(api, collector);
 	api.on("turn_end", (event) => collector.recordTurnEnd({ ...event }));
 	api.on("agent_end", () => collector.refreshPresentation());
 }

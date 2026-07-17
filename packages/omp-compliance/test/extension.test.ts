@@ -5,9 +5,39 @@ import { join } from "node:path";
 import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "@oh-my-pi/pi-coding-agent/advisor/index";
 import { ComplianceReviewRegistry } from "../src/advisor/review-envelope";
 import { EvidenceStore } from "../src/evidence/evidence-store";
+import { bindCollectorEvents } from "../src/extension";
 import { ComplianceRuntime } from "../src/runtime/compliance-runtime";
 import { CollectorRuntime } from "../src/signals/collector-runtime";
 import { FakeExtensionAPI } from "./support/fake-extension-api";
+
+describe("extension v17 tool event wiring", () => {
+	it("preserves official input and correlates the result through the fake host", async () => {
+		const api = new FakeExtensionAPI();
+		const collector = new CollectorRuntime();
+		let contextCwd: string | undefined;
+
+		bindCollectorEvents(api.toAPI(), collector);
+		api.on("tool_call", (_event, context) => {
+			contextCwd = context?.cwd;
+		});
+
+		await api.fireToolCall("search_graph", { name_pattern: ".*TaskTool.*" }, "v17-call-1");
+		await api.fireToolResult({
+			toolName: "search_graph",
+			toolCallId: "v17-call-1",
+			input: { name_pattern: ".*TaskTool.*" },
+			content: [{ type: "text", text: "packages/task-tool.ts" }],
+			isError: false,
+			details: { matches: 1 },
+		});
+
+		const snapshot = collector.collector.snapshot();
+		expect(contextCwd).toBe(process.cwd());
+		expect(snapshot.calls[0]?.params).toEqual({ name_pattern: ".*TaskTool.*" });
+		expect(snapshot.results[0]?.toolCallId).toBe("v17-call-1");
+		expect(snapshot.results[0]?.resultRef).toContain("packages/task-tool.ts");
+	});
+});
 
 /** Minimal TDD fixture for start tests. */
 const TDD_FIXTURE = [

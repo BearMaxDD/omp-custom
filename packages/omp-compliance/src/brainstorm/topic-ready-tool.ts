@@ -12,7 +12,7 @@
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { BrainstormRuntime } from "./brainstorm-runtime";
-import type { BrainstormTopicReadyInput } from "./types";
+import type { BrainstormTopicKind, BrainstormTopicReadyInput } from "./types";
 
 // ─── Validation ────────────────────────────────────────────────────────
 
@@ -24,17 +24,32 @@ export interface TopicReadyValidationError {
 const VALID_TOPIC_KINDS = new Set(["architecture", "scope", "contract", "migration", "risk", "implementation_route"]);
 const VALID_RELEVANCE = new Set(["required", "optional", "none"]);
 
+export type TopicReadyValidationResult =
+	| { readonly ok: true; readonly value: BrainstormTopicReadyInput }
+	| { readonly ok: false; readonly errors: TopicReadyValidationError[] };
+
+function isTopicKind(value: unknown): value is BrainstormTopicKind {
+	return typeof value === "string" && VALID_TOPIC_KINDS.has(value);
+}
+
+function isCodebaseRelevance(value: unknown): value is BrainstormTopicReadyInput["codebase_relevance"] {
+	return typeof value === "string" && VALID_RELEVANCE.has(value);
+}
+
+function isStringArray(value: unknown): value is string[] {
+	return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
 /**
  * Validate brainstorm_topic_ready tool parameters.
  *
- * Returns an array of ValidationError. Empty array = valid.
- * Validates field presence, types, and length constraints.
+ * Returns either typed input or validation errors.
  */
-export function validateTopicReadyInput(raw: Record<string, unknown>): TopicReadyValidationError[] {
+export function validateTopicReadyInput(raw: Record<string, unknown>): TopicReadyValidationResult {
 	const errors: TopicReadyValidationError[] = [];
 
 	// topic_kind — required, must be valid enum
-	if (typeof raw.topic_kind !== "string" || !VALID_TOPIC_KINDS.has(raw.topic_kind)) {
+	if (!isTopicKind(raw.topic_kind)) {
 		errors.push({
 			field: "topic_kind",
 			message: `topic_kind must be one of: ${[...VALID_TOPIC_KINDS].join(" | ")}`,
@@ -89,13 +104,11 @@ export function validateTopicReadyInput(raw: Record<string, unknown>): TopicRead
 	}
 
 	// codebase_relevance — optional (defaults to "none"), must be valid enum
-	if (raw.codebase_relevance !== undefined && typeof raw.codebase_relevance === "string") {
-		if (!VALID_RELEVANCE.has(raw.codebase_relevance)) {
-			errors.push({
-				field: "codebase_relevance",
-				message: `codebase_relevance must be one of: ${[...VALID_RELEVANCE].join(" | ")}`,
-			});
-		}
+	if (raw.codebase_relevance !== undefined && !isCodebaseRelevance(raw.codebase_relevance)) {
+		errors.push({
+			field: "codebase_relevance",
+			message: `codebase_relevance must be one of: ${[...VALID_RELEVANCE].join(" | ")}`,
+		});
 	}
 
 	// discussion_summary — optional, string, max 8,000 chars
@@ -107,7 +120,21 @@ export function validateTopicReadyInput(raw: Record<string, unknown>): TopicRead
 		}
 	}
 
-	return errors;
+	if (errors.length > 0) return { ok: false, errors };
+
+	return {
+		ok: true,
+		value: {
+			topic_kind: isTopicKind(raw.topic_kind) ? raw.topic_kind : "risk",
+			title: typeof raw.title === "string" ? raw.title : "",
+			candidate_decision: typeof raw.candidate_decision === "string" ? raw.candidate_decision : "",
+			constraints: isStringArray(raw.constraints) ? raw.constraints : [],
+			success_criteria: isStringArray(raw.success_criteria) ? raw.success_criteria : [],
+			unresolved_questions: isStringArray(raw.unresolved_questions) ? raw.unresolved_questions : undefined,
+			codebase_relevance: isCodebaseRelevance(raw.codebase_relevance) ? raw.codebase_relevance : "none",
+			discussion_summary: typeof raw.discussion_summary === "string" ? raw.discussion_summary : "",
+		},
+	};
 }
 
 // ─── Tool factory ──────────────────────────────────────────────────────
@@ -189,20 +216,19 @@ export function createTopicReadyTool(deps: TopicReadyToolDependencies): ToolDefi
 			_toolCallId,
 			params: Record<string, unknown>,
 		): Promise<AgentToolResult<Record<string, unknown>>> => {
-			const errors = validateTopicReadyInput(params);
-			if (errors.length > 0) {
-				return toToolResult({ ok: false, errors }, true);
+			const validation = validateTopicReadyInput(params);
+			if (!validation.ok) {
+				return toToolResult({ ok: false, errors: validation.errors }, true);
 			}
 
 			try {
-				const input = params as unknown as BrainstormTopicReadyInput;
-				const result = await deps.runtime.submitTopic(input);
+				const result = await deps.runtime.submitTopic(validation.value);
 				return toToolResult({ ok: true, result });
 			} catch (err) {
 				return toToolResult(
 					{
 						ok: false,
-						errors: [{ field: "_handler", message: `submitTopic failed: ${(err as Error).message}` }],
+						errors: [{ field: "_handler", message: `submitTopic failed: ${String(err)}` }],
 					},
 					true,
 				);

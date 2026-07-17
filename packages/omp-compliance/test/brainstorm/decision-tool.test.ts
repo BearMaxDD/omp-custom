@@ -12,10 +12,15 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createDecisionTool, validateDecisionInput } from "../../src/brainstorm/decision-tool";
+import { createDecisionTool, validateDecisionInput as validateDecision } from "../../src/brainstorm/decision-tool";
 import { TopicCoordinator } from "../../src/brainstorm/topic-coordinator";
 import { TopicStore } from "../../src/brainstorm/topic-store";
 import { fullCodebaseSnapshot, validReview, validTopicInput } from "./fixtures";
+
+const validateDecisionInput = (raw: Record<string, unknown>) => {
+	const validation = validateDecision(raw);
+	return validation.ok ? [] : validation.errors;
+};
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -41,12 +46,15 @@ async function fixtureCoordinatorWithReview(): Promise<TopicCoordinator> {
 
 describe("validateDecisionInput", () => {
 	it("accepts valid input with user_confirmed true", () => {
-		const errors = validateDecisionInput({
+		const validation = validateDecision({
 			topic_id: "topic-01",
 			decision: "accept_candidate",
 			user_confirmed: true,
 		});
-		expect(errors).toHaveLength(0);
+		expect(validation).toEqual({
+			ok: true,
+			value: { topic_id: "topic-01", decision: "accept_candidate", user_confirmed: true },
+		});
 	});
 
 	it("accepts accept_alternative with selected_alternative", () => {
@@ -165,6 +173,22 @@ describe("createDecisionTool", () => {
 		const r = result as Record<string, unknown>;
 		expect(r.ok).toBe(false);
 		expect(Array.isArray(r.errors)).toBe(true);
+	});
+
+	it("stringifies non-Error decision failures", async () => {
+		const tool = createDecisionTool({
+			coordinator: {
+				recordDecision: async () => {
+					throw "decision exploded";
+				},
+			} as unknown as TopicCoordinator,
+		});
+		const result = await execute(tool, {
+			topic_id: "topic-01",
+			decision: "park",
+			user_confirmed: true,
+		});
+		expect(JSON.stringify(result)).toContain("decision exploded");
 	});
 
 	it("records only an explicit user decision and cannot decide from advisor support", async () => {
