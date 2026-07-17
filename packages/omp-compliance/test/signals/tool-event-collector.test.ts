@@ -111,4 +111,89 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 		const snap = collector.snapshot();
 		expect(snap.codebaseMemory.references).toHaveLength(0);
 	});
+
+	it("在入口展开 xd 调用并向下游暴露规范 server、tool 和 args", () => {
+		collector.recordCall(makeCall("write", { path: "xd://search_graph", content: '{"query":"collector"}' }, "xd-1"));
+		collector.recordResult({
+			type: "tool_result",
+			toolName: "write",
+			toolCallId: "xd-1",
+			input: { path: "xd://search_graph", content: '{"query":"collector"}' },
+			isError: false,
+			content: [{ type: "text", text: "packages/omp-compliance/src/signals/tool-event-collector.ts" }],
+			details: { xdev: { tool: "search_graph", mode: "execute", args: { query: "collector" } } },
+		} as ToolResultEvent);
+
+		const snap = collector.snapshot();
+		expect(snap.calls).toHaveLength(1);
+		expect(snap.calls[0]).toMatchObject({
+			toolCallId: "xd-1",
+			serverName: "codebase-memory",
+			toolName: "search_graph",
+			params: { query: "collector" },
+		});
+		expect(snap.codebaseMemory.queries).toEqual(["search_graph"]);
+		expect(snap.codebaseMemory.references).toEqual(["packages/omp-compliance/src/signals/tool-event-collector.ts"]);
+	});
+
+	it("外层 xd 与同 id 内层事件按 canonical identity 去重且结果保持关联", () => {
+		collector.recordCall(makeCall("write", { path: "xd://search_graph", content: '{"query":"same"}' }, "shared"));
+		collector.recordCall(makeCall("mcp__codebase_memory_mcp__search_graph", { query: "same" }, "shared"));
+		collector.recordResult(makeResult("shared", "packages/omp-compliance/src/signals/types.ts"));
+
+		const snap = collector.snapshot();
+		expect(snap.calls).toHaveLength(1);
+		expect(snap.results).toHaveLength(1);
+		expect(snap.results[0].toolCallId).toBe(snap.calls[0].toolCallId);
+		expect(snap.codebaseMemory.references).toEqual(["packages/omp-compliance/src/signals/types.ts"]);
+	});
+
+	it("外层与内层 id 不同时按 parent 关联去重并重关联结果", () => {
+		collector.recordCall(makeCall("write", { path: "xd://search_graph", content: '{"query":"parented"}' }, "outer"));
+		collector.recordCall({
+			toolName: "mcp__codebase_memory_mcp__search_graph",
+			toolCallId: "inner",
+			parentToolCallId: "outer",
+			params: { query: "parented" },
+		});
+		collector.recordResult({
+			toolCallId: "inner",
+			success: true,
+			resultRef: "packages/omp-compliance/src/signals/codebase-memory.ts",
+		});
+
+		const snap = collector.snapshot();
+		expect(snap.calls).toHaveLength(1);
+		expect(snap.results).toHaveLength(1);
+		expect(snap.calls[0].toolCallId).toBe("outer");
+		expect(snap.results[0].toolCallId).toBe("outer");
+		expect(snap.codebaseMemory.references).toEqual(["packages/omp-compliance/src/signals/codebase-memory.ts"]);
+	});
+
+	it("相同 canonical 工具的两个独立调用不会误去重", () => {
+		collector.recordCall(makeCall("write", { path: "xd://search_graph", content: '{"query":"one"}' }, "xd-a"));
+		collector.recordCall(makeCall("write", { path: "xd://search_graph", content: '{"query":"two"}' }, "xd-b"));
+
+		const snap = collector.snapshot();
+		expect(snap.calls).toHaveLength(2);
+		expect(snap.calls.map((call) => call.toolCallId)).toEqual(["xd-a", "xd-b"]);
+	});
+
+	it("help、畸形 xd 和未知工具不会进入 Evidence", () => {
+		collector.recordCall(makeCall("write", { path: "xd://search_graph", content: "help" }, "help"));
+		collector.recordCall(makeCall("write", { path: "xd://search_graph?x=1", content: "{}" }, "query"));
+		collector.recordCall(makeCall("write", { path: "xd://unknown", content: "{}" }, "unknown"));
+
+		const snap = collector.snapshot();
+		expect(snap.calls).toHaveLength(0);
+		expect(snap.codebaseMemory).toEqual({ indexReady: false, queries: [], references: [] });
+	});
+
+	it("reset 清空去重关联，后续相同 id 可重新记录", () => {
+		const event = makeCall("write", { path: "xd://search_graph", content: '{"query":"again"}' }, "reset-id");
+		collector.recordCall(event);
+		collector.reset();
+		collector.recordCall(event);
+		expect(collector.snapshot().calls).toHaveLength(1);
+	});
 });

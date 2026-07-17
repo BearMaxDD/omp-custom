@@ -19,6 +19,7 @@ import type {
 	ToolCallEvent,
 	ToolResultEvent,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import { unwrapToolCallEvent, unwrapToolResultEvent } from "../xdev/event-unwrapper";
 import { normalizeCodebaseMemory } from "./codebase-memory";
 import { normalizeTaskDelegation } from "./task-delegation";
 import type { EvidenceSnapshot, ToolCallRecord, ToolResultRecord } from "./types";
@@ -30,6 +31,8 @@ interface LegacySyntheticToolCallEvent {
 	serverName?: unknown;
 	params?: Record<string, unknown>;
 	timestamp?: unknown;
+	parentToolCallId?: unknown;
+	outerToolCallId?: unknown;
 }
 
 interface LegacySyntheticToolResultEvent {
@@ -53,8 +56,11 @@ function isOfficialToolResultEvent(event: ToolResultEvent | LegacySyntheticToolR
 }
 
 export class ToolEventCollector {
+	private static readonly CORRELATION_CACHE_LIMIT = 2048;
 	private calls: Map<string, ToolCallRecord> = new Map();
 	private results: Map<string, ToolResultRecord> = new Map();
+	private canonicalCallIds: Map<string, string> = new Map();
+	private callAliases: Map<string, string> = new Map();
 
 	/**
 	 * Record a tool_call event.
@@ -80,6 +86,41 @@ export class ToolEventCollector {
 			toolCallId = String(event.toolCallId ?? `${toolName}-${Date.now()}`);
 			serverName = event.serverName ? String(event.serverName) : undefined;
 			input = event.params ?? {};
+		}
+
+		const isXdevCandidate =
+			toolName === "write" &&
+			typeof (input as Record<string, unknown>).path === "string" &&
+			((input as Record<string, unknown>).path as string).trim().toLowerCase().startsWith("xd://");
+		const unwrapped = unwrapToolCallEvent(event);
+		if (isXdevCandidate && !unwrapped) return;
+		if (unwrapped) {
+			const dedupeKey = `${unwrapped.correlationId}\u0000${unwrapped.identity.qualifiedName}`;
+			const existingId = this.canonicalCallIds.get(dedupeKey);
+			if (existingId) {
+				this.setBounded(this.callAliases, toolCallId, existingId);
+				return;
+			}
+			// An FQN is an identity hint, not standalone server provenance. It may
+			// dedupe against a previously validated xd outer event, but cannot create
+			// trusted Evidence without explicit server metadata of its own.
+			if (unwrapped.identity.transport === "mcp" && serverName === undefined) {
+				this.calls.set(toolCallId, {
+					toolName,
+					toolCallId,
+					params: this.truncateParams(input),
+					cwd: context?.cwd,
+					sessionId: context?.sessionManager.getSessionId(),
+					timestamp: new Date().toISOString(),
+				});
+				return;
+			}
+			toolCallId = unwrapped.correlationId;
+			toolName = unwrapped.identity.toolName;
+			serverName = "codebase-memory";
+			input = unwrapped.identity.args;
+			this.setBounded(this.canonicalCallIds, dedupeKey, toolCallId);
+			this.setBounded(this.callAliases, unwrapped.toolCallId, toolCallId);
 		}
 
 		this.calls.set(toolCallId, {
@@ -112,6 +153,22 @@ export class ToolEventCollector {
 			toolCallId = String(event.toolCallId ?? "");
 			isError = event.isError === true || event.success === false;
 		}
+
+		const input = isOfficialToolResultEvent(event) ? event.input : undefined;
+		const isXdevCandidate =
+			(isOfficialToolResultEvent(event) ? event.toolName : undefined) === "write" &&
+			typeof input?.path === "string" &&
+			input.path.trim().toLowerCase().startsWith("xd://");
+		if (isXdevCandidate) {
+			const canonicalId = this.callAliases.get(toolCallId) ?? toolCallId;
+			const expectedCall = this.calls.get(canonicalId);
+			const unwrapped = unwrapToolResultEvent(
+				event,
+				expectedCall ? `codebase-memory-mcp.${expectedCall.toolName}` : undefined,
+			);
+			if (!unwrapped) return;
+		}
+		toolCallId = this.callAliases.get(toolCallId) ?? toolCallId;
 
 		this.results.set(toolCallId, {
 			toolCallId,
@@ -154,9 +211,18 @@ export class ToolEventCollector {
 	reset(): void {
 		this.calls.clear();
 		this.results.clear();
+		this.canonicalCallIds.clear();
+		this.callAliases.clear();
 	}
 
 	// ─── Private helpers ────────────────────────────────────────
+
+	private setBounded(map: Map<string, string>, key: string, value: string): void {
+		map.set(key, value);
+		if (map.size <= ToolEventCollector.CORRELATION_CACHE_LIMIT) return;
+		const oldest = map.keys().next().value;
+		if (oldest !== undefined) map.delete(oldest);
+	}
 
 	/**
 	 * Truncate parameter values to a safe summary.
