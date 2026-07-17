@@ -1,4 +1,6 @@
-import { isAbsolute, normalize, sep } from "node:path";
+import { realpathSync } from "node:fs";
+import { isAbsolute, normalize, relative, sep } from "node:path";
+import { type ProjectBinding, validateProjectBinding } from "./project-identity";
 
 export interface ProjectContext {
 	readonly projectId: string;
@@ -12,41 +14,53 @@ export interface ProjectContext {
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const PROJECT_CONTEXT_INVALID_ERROR = "OMP project context is invalid";
 
-export function createProjectContext(context: ProjectContext): Readonly<ProjectContext> {
-	if (
-		!isRecord(context) ||
-		!isUuid(context.projectId) ||
-		!isValidPath(context.root) ||
-		(context.remote !== undefined && !isNonEmptyString(context.remote)) ||
-		(context.codebaseProject !== undefined && !isNonEmptyString(context.codebaseProject)) ||
-		!isUuid(context.sessionId) ||
-		!isValidPath(context.cwd)
-	) {
+export function createProjectContext(
+	binding: Readonly<ProjectBinding>,
+	sessionId: string,
+	cwd: string,
+): Readonly<ProjectContext> {
+	let canonicalCwd: string;
+	let validatedBinding: Readonly<ProjectBinding>;
+	try {
+		canonicalCwd = canonicalPath(cwd);
+		validatedBinding = validateProjectBinding(binding);
+		if (
+			!isUuid(sessionId) ||
+			canonicalPath(validatedBinding.canonicalRoot) !== validatedBinding.canonicalRoot ||
+			!isPathWithin(validatedBinding.canonicalRoot, canonicalCwd)
+		) {
+			throw new Error(PROJECT_CONTEXT_INVALID_ERROR);
+		}
+	} catch {
 		throw new Error(PROJECT_CONTEXT_INVALID_ERROR);
 	}
 
 	return Object.freeze({
-		projectId: context.projectId,
-		root: context.root,
-		...(context.remote === undefined ? {} : { remote: context.remote }),
-		...(context.codebaseProject === undefined ? {} : { codebaseProject: context.codebaseProject }),
-		sessionId: context.sessionId,
-		cwd: context.cwd,
+		projectId: validatedBinding.projectId,
+		root: validatedBinding.canonicalRoot,
+		...(validatedBinding.gitRemoteIdentity === undefined ? {} : { remote: validatedBinding.gitRemoteIdentity }),
+		...(validatedBinding.codebaseProjectId === undefined
+			? {}
+			: { codebaseProject: validatedBinding.codebaseProjectId }),
+		sessionId,
+		cwd: canonicalCwd,
 	});
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isNonEmptyString(value: unknown): value is string {
-	return typeof value === "string" && value.trim().length > 0 && !value.includes("\0");
 }
 
 function isUuid(value: unknown): value is string {
 	return typeof value === "string" && UUID_V4.test(value);
 }
 
-function isValidPath(value: unknown): value is string {
-	return isNonEmptyString(value) && isAbsolute(value) && normalize(value).split(sep).join("/") === value;
+function canonicalPath(value: unknown): string {
+	if (typeof value !== "string" || !isAbsolute(value) || normalize(value).split(sep).join("/") !== value) {
+		throw new Error(PROJECT_CONTEXT_INVALID_ERROR);
+	}
+	return normalize(realpathSync(value)).split(sep).join("/");
+}
+
+function isPathWithin(root: string, cwd: string): boolean {
+	const pathFromRoot = relative(root, cwd);
+	return (
+		pathFromRoot === "" || (!pathFromRoot.startsWith(`..${sep}`) && pathFromRoot !== ".." && !isAbsolute(pathFromRoot))
+	);
 }

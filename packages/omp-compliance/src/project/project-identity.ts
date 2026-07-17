@@ -67,8 +67,9 @@ export class ProjectIdentityStore {
 	static open(cwd: string, options: ProjectIdentityOpenOptions = {}): ProjectIdentityResult {
 		const codebaseProjectId = readCodebaseProjectId(options);
 		const canonicalCwd = canonicalPath(cwd);
-		const observedRoot = findGitRoot(canonicalCwd) ?? canonicalCwd;
-		const observedRemote = readGitRemoteIdentity(observedRoot);
+		const gitRoot = findGitRoot(canonicalCwd);
+		const observedRoot = gitRoot ?? canonicalCwd;
+		const observedRemote = gitRoot === undefined ? undefined : readGitRemoteIdentity(gitRoot);
 		const filePath = join(observedRoot, ".omp", "compliance", "project.json");
 		assertStoragePathSafe(observedRoot);
 		const existing = readBindingIfPresent(filePath);
@@ -104,38 +105,51 @@ function findGitRoot(cwd: string): string | undefined {
 }
 
 function readGitRemoteIdentity(root: string): string | undefined {
-	const names = runGit(root, ["remote"])
-		?.split("\n")
+	const remoteNames = runGit(root, ["remote"]);
+	if (remoteNames === undefined) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
+	const names = remoteNames
+		.split("\n")
 		.map((name) => name.trim())
 		.filter(Boolean)
 		.sort();
-	if (!names?.length) return undefined;
+	if (!names.length) return undefined;
 	const remoteName = names.includes("origin") ? "origin" : names[0];
 	const remoteUrl = remoteName ? runGit(root, ["remote", "get-url", remoteName]) : undefined;
-	return remoteUrl ? normalizeRemoteIdentity(remoteUrl) : undefined;
+	const identity = remoteUrl ? normalizeRemoteIdentity(remoteUrl) : undefined;
+	if (!identity) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
+	return identity;
 }
 
 export function normalizeRemoteIdentity(remoteUrl: string): string | undefined {
 	if (typeof remoteUrl !== "string") return undefined;
 	const trimmed = remoteUrl.trim();
-	if (!trimmed || /[\0\s]/.test(trimmed) || /%(?:2f|5c)/i.test(trimmed)) return undefined;
+	if (!trimmed || /[\0\s]/.test(trimmed) || /%(?:25|2f|5c)/i.test(trimmed)) return undefined;
 
 	let host: string;
 	let path: string;
-	try {
-		const parsed = new URL(trimmed);
-		if (!(["https:", "http:", "ssh:", "git:"] as const).includes(parsed.protocol as never)) return undefined;
-		if (parsed.password || (parsed.username && parsed.protocol !== "ssh:")) return undefined;
-		host = parsed.hostname.toLowerCase();
-		if (!host) return undefined;
-		const defaultPort = parsed.protocol === "ssh:" ? "22" : undefined;
-		if (parsed.port && parsed.port !== defaultPort) host = `${host}:${parsed.port}`;
-		path = parsed.pathname;
-	} catch {
+	const canonical = trimmed.match(/^(\[[0-9A-Fa-f:.]+\](?::\d+)?|[A-Za-z0-9.-]+(?::\d+)?)\/(.+)$/);
+	if (canonical?.[1] && canonical[2]) {
+		host = canonical[1].toLowerCase();
+		path = canonical[2];
+	} else if (!trimmed.includes("://")) {
 		const scpLike = trimmed.match(/^(?:[A-Za-z0-9._-]+@)?(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):([^?#]+)$/);
-		if (!scpLike?.[1] || !scpLike[2]) return undefined;
+		if (!scpLike?.[1] || !scpLike[2] || scpLike[2].includes("@")) return undefined;
 		host = scpLike[1].toLowerCase();
 		path = scpLike[2];
+	} else {
+		try {
+			const parsed = new URL(trimmed);
+			if (!(["https:", "http:", "ssh:", "git:"] as const).includes(parsed.protocol as never)) return undefined;
+			if (parsed.password || (parsed.username && parsed.protocol !== "ssh:") || parsed.search || parsed.hash)
+				return undefined;
+			host = parsed.hostname.toLowerCase();
+			if (!host) return undefined;
+			const defaultPort = parsed.protocol === "ssh:" ? "22" : undefined;
+			if (parsed.port && parsed.port !== defaultPort) host = `${host}:${parsed.port}`;
+			path = parsed.pathname;
+		} catch {
+			return undefined;
+		}
 	}
 
 	try {
@@ -145,7 +159,7 @@ export function normalizeRemoteIdentity(remoteUrl: string): string | undefined {
 			.map((segment) => decodeURIComponent(segment));
 		if (
 			segments.length < 2 ||
-			segments.some((segment) => !segment || segment === "." || segment === ".." || /[\0/\\]/.test(segment))
+			segments.some((segment) => !segment || segment === "." || segment === ".." || /[\0/\\\s?#]/.test(segment))
 		) {
 			return undefined;
 		}
@@ -263,30 +277,7 @@ function readFileNoFollow(filePath: string): string {
 
 function parseBinding(content: string): Readonly<ProjectBinding> {
 	try {
-		const value = JSON.parse(content) as unknown;
-		if (
-			!isRecord(value) ||
-			Object.keys(value).some((key) => !BINDING_KEYS.has(key)) ||
-			value.schemaVersion !== 1 ||
-			typeof value.projectId !== "string" ||
-			!UUID_V4.test(value.projectId) ||
-			!isCanonicalRoot(value.canonicalRoot) ||
-			!isIsoTimestamp(value.createdAt) ||
-			(value.gitRemoteIdentity !== undefined && !isCanonicalRemoteIdentity(value.gitRemoteIdentity)) ||
-			(value.codebaseProjectId !== undefined && !isNonEmptyString(value.codebaseProjectId)) ||
-			(value.reboundAt !== undefined && !isIsoTimestamp(value.reboundAt))
-		) {
-			throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
-		}
-		return freezeBinding({
-			schemaVersion: 1,
-			projectId: value.projectId,
-			canonicalRoot: value.canonicalRoot,
-			...(value.gitRemoteIdentity === undefined ? {} : { gitRemoteIdentity: value.gitRemoteIdentity }),
-			...(value.codebaseProjectId === undefined ? {} : { codebaseProjectId: value.codebaseProjectId }),
-			createdAt: value.createdAt,
-			...(value.reboundAt === undefined ? {} : { reboundAt: value.reboundAt }),
-		});
+		return validateProjectBinding(JSON.parse(content) as unknown);
 	} catch (error) {
 		if (error instanceof Error && error.message === PROJECT_IDENTITY_INVALID_ERROR) throw error;
 		throw new Error(PROJECT_IDENTITY_INVALID_ERROR, { cause: error });
@@ -435,7 +426,48 @@ function isCanonicalRoot(value: unknown): value is string {
 }
 
 function isCanonicalRemoteIdentity(value: unknown): value is string {
-	return isNonEmptyString(value) && normalizeRemoteIdentity(`ssh://${value}`) === value;
+	return isNonEmptyString(value) && normalizeRemoteIdentity(value) === value;
+}
+
+export function validateProjectBinding(value: unknown): Readonly<ProjectBinding> {
+	try {
+		if (!isRecord(value)) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
+		const descriptors = Object.getOwnPropertyDescriptors(value);
+		const snapshot: Record<string, unknown> = {};
+		for (const key of Reflect.ownKeys(descriptors)) {
+			const descriptor = descriptors[key as keyof typeof descriptors];
+			if (typeof key !== "string" || !BINDING_KEYS.has(key) || !descriptor?.enumerable || !("value" in descriptor)) {
+				throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
+			}
+			snapshot[key] = descriptor.value;
+		}
+
+		if (
+			snapshot.schemaVersion !== 1 ||
+			typeof snapshot.projectId !== "string" ||
+			!UUID_V4.test(snapshot.projectId) ||
+			!isCanonicalRoot(snapshot.canonicalRoot) ||
+			!isIsoTimestamp(snapshot.createdAt) ||
+			(snapshot.gitRemoteIdentity !== undefined && !isCanonicalRemoteIdentity(snapshot.gitRemoteIdentity)) ||
+			(snapshot.codebaseProjectId !== undefined && !isNonEmptyString(snapshot.codebaseProjectId)) ||
+			(snapshot.reboundAt !== undefined && !isIsoTimestamp(snapshot.reboundAt))
+		) {
+			throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
+		}
+
+		return freezeBinding({
+			schemaVersion: 1,
+			projectId: snapshot.projectId,
+			canonicalRoot: snapshot.canonicalRoot,
+			...(snapshot.gitRemoteIdentity === undefined ? {} : { gitRemoteIdentity: snapshot.gitRemoteIdentity }),
+			...(snapshot.codebaseProjectId === undefined ? {} : { codebaseProjectId: snapshot.codebaseProjectId }),
+			createdAt: snapshot.createdAt,
+			...(snapshot.reboundAt === undefined ? {} : { reboundAt: snapshot.reboundAt }),
+		});
+	} catch (error) {
+		if (error instanceof Error && error.message === PROJECT_IDENTITY_INVALID_ERROR) throw error;
+		throw new Error(PROJECT_IDENTITY_INVALID_ERROR, { cause: error });
+	}
 }
 
 function isNotFound(error: unknown): boolean {

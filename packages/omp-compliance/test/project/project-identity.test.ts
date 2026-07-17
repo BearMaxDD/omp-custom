@@ -124,6 +124,16 @@ describe("ProjectIdentityStore", () => {
 		expect(reopened.binding.projectId).toBe(initial.binding.projectId);
 	});
 
+	it.each(["not-a-remote", "https://host.example/org/%ZZrepo.git", "https://host.example/org/%252Frepo.git"])(
+		"refuses a configured remote that cannot form a canonical identity: %s",
+		(remote) => {
+			const root = initGit(remote);
+
+			expect(() => ProjectIdentityStore.open(root)).toThrow(PROJECT_IDENTITY_INVALID_ERROR);
+			expect(existsSync(bindingPath(root))).toBe(false);
+		},
+	);
+
 	it("creates exactly one identity under concurrent first open", async () => {
 		const root = initGit("https://github.com/acme/widget.git");
 		const modulePath = join(import.meta.dir, "../../src/project/project-identity.ts");
@@ -258,7 +268,10 @@ describe("normalizeRemoteIdentity", () => {
 		["ssh://git@[2001:db8::1]:2222/acme/widget.git", "[2001:db8::1]:2222/acme/widget"],
 		["https://GitHub.COM/acme/%77idget.git", "github.com/acme/widget"],
 	])("normalizes %s", (remote, expected) => {
-		expect(normalizeRemoteIdentity(remote)).toBe(expected);
+		const canonical = normalizeRemoteIdentity(remote);
+
+		expect(canonical).toBe(expected);
+		expect(normalizeRemoteIdentity(canonical as string)).toBe(canonical);
 	});
 
 	it("keeps host, port, and the full namespace collision-resistant", () => {
@@ -277,6 +290,9 @@ describe("normalizeRemoteIdentity", () => {
 		"https://user:password@host.example/org/repo.git",
 		"user:password@host.example:org/repo.git",
 		"https://host.example/org/%2Frepo.git",
+		"https://host.example/org/%252Frepo.git",
+		"https://host.example/org/%25252Frepo.git",
+		"https://host.example/org/%255Crepo.git",
 		"https://host.example/org/%ZZrepo.git",
 		"https://host.example/org/../repo.git",
 		"host.example:repo.git",
@@ -285,61 +301,122 @@ describe("normalizeRemoteIdentity", () => {
 		expect(normalizeRemoteIdentity(remote)).toBeUndefined();
 	});
 
-	it("never persists credentials from an unsafe remote", () => {
+	it("refuses an unsafe credential-bearing remote without persisting an identity", () => {
 		const root = initGit("https://token-user:secret-token@github.com/acme/widget.git");
-		const result = ProjectIdentityStore.open(root);
-		const persisted = readFileSync(bindingPath(root), "utf8");
 
-		expect(result.binding.gitRemoteIdentity).toBeUndefined();
-		expect(persisted).not.toContain("token-user");
-		expect(persisted).not.toContain("secret-token");
+		expect(() => ProjectIdentityStore.open(root)).toThrow(PROJECT_IDENTITY_INVALID_ERROR);
+		expect(existsSync(bindingPath(root))).toBe(false);
 	});
 });
 
 describe("createProjectContext", () => {
-	it("returns an immutable narrow context with explicit project and session identity", () => {
-		const context = createProjectContext({
+	it("derives an immutable narrow context from a validated binding", () => {
+		const root = realpathSync(tempProject());
+		const binding: ProjectBinding = {
+			schemaVersion: 1,
 			projectId: randomUUID(),
-			root: "/repo",
-			remote: "acme/widget",
-			codebaseProject: "codebase-acme-widget",
-			sessionId: randomUUID(),
-			cwd: "/repo/packages/app",
-		});
+			canonicalRoot: root,
+			gitRemoteIdentity: "github.com/acme/widget",
+			codebaseProjectId: "codebase-acme-widget",
+			createdAt: new Date().toISOString(),
+		};
+		const cwd = join(root, "packages", "app");
+		const sessionId = randomUUID();
+		mkdirSync(cwd, { recursive: true });
+
+		const context = createProjectContext(binding, sessionId, cwd);
 
 		expect(context).toEqual({
-			projectId: expect.any(String),
-			root: "/repo",
-			remote: "acme/widget",
+			projectId: binding.projectId,
+			root,
+			remote: "github.com/acme/widget",
 			codebaseProject: "codebase-acme-widget",
-			sessionId: expect.any(String),
-			cwd: "/repo/packages/app",
+			sessionId,
+			cwd,
 		});
 		expect(Object.isFrozen(context)).toBe(true);
 		expect("switchProject" in context).toBe(false);
 	});
 
 	it.each([
-		["projectId", {}],
 		["projectId", "not-a-uuid"],
-		["root", "relative/path"],
-		["root", ""],
-		["remote", ""],
-		["remote", {}],
-		["codebaseProject", ""],
-		["sessionId", "not-a-uuid"],
-		["cwd", "relative/path"],
-	])("rejects invalid runtime field %s", (field, value) => {
-		expect(() =>
-			createProjectContext({
-				projectId: randomUUID(),
-				root: "/repo",
-				remote: "github.com/acme/widget",
-				codebaseProject: "codebase-acme-widget",
-				sessionId: randomUUID(),
-				cwd: "/repo/app",
-				[field]: value,
-			} as never),
-		).toThrow("OMP project context is invalid");
+		["canonicalRoot", "relative/path"],
+		["gitRemoteIdentity", "https://user:secret@github.com/acme/widget.git"],
+		["gitRemoteIdentity", "github.com/acme/%252Fwidget"],
+		["codebaseProjectId", ""],
+		["createdAt", "yesterday"],
+	])("rejects an invalid binding field %s", (field, value) => {
+		const root = realpathSync(tempProject());
+		const binding = {
+			schemaVersion: 1,
+			projectId: randomUUID(),
+			canonicalRoot: root,
+			gitRemoteIdentity: "github.com/acme/widget",
+			codebaseProjectId: "codebase-acme-widget",
+			createdAt: new Date().toISOString(),
+			[field]: value,
+		} as never;
+
+		expect(() => createProjectContext(binding, randomUUID(), root)).toThrow("OMP project context is invalid");
+	});
+
+	it("rejects a cwd outside the binding root", () => {
+		const root = realpathSync(tempProject());
+		const outside = realpathSync(tempProject());
+		const binding: ProjectBinding = {
+			schemaVersion: 1,
+			projectId: randomUUID(),
+			canonicalRoot: root,
+			createdAt: new Date().toISOString(),
+		};
+
+		expect(() => createProjectContext(binding, randomUUID(), outside)).toThrow("OMP project context is invalid");
+	});
+
+	it("rejects a cwd symlink that escapes the binding root", () => {
+		const root = realpathSync(tempProject());
+		const outside = realpathSync(tempProject());
+		const escaped = join(root, "escaped");
+		symlinkSync(outside, escaped, process.platform === "win32" ? "junction" : "dir");
+		const binding: ProjectBinding = {
+			schemaVersion: 1,
+			projectId: randomUUID(),
+			canonicalRoot: root,
+			createdAt: new Date().toISOString(),
+		};
+
+		expect(() => createProjectContext(binding, randomUUID(), escaped)).toThrow("OMP project context is invalid");
+	});
+
+	it.each(["not-a-uuid", {}])("rejects an invalid session id", (sessionId) => {
+		const root = realpathSync(tempProject());
+		const binding: ProjectBinding = {
+			schemaVersion: 1,
+			projectId: randomUUID(),
+			canonicalRoot: root,
+			createdAt: new Date().toISOString(),
+		};
+
+		expect(() => createProjectContext(binding, sessionId as never, root)).toThrow("OMP project context is invalid");
+	});
+
+	it("rejects a binding whose identity is supplied by an accessor", () => {
+		const root = realpathSync(tempProject());
+		const binding = {
+			schemaVersion: 1,
+			get projectId() {
+				return randomUUID();
+			},
+			canonicalRoot: root,
+			createdAt: new Date().toISOString(),
+		} as ProjectBinding;
+
+		expect(() => createProjectContext(binding, randomUUID(), root)).toThrow("OMP project context is invalid");
+	});
+
+	it("does not expose Task 9 internals from the package root", async () => {
+		const rootApi = await import("../../src/index");
+
+		expect(Object.keys(rootApi)).toEqual(["activate"]);
 	});
 });
