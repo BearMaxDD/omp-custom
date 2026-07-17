@@ -22,6 +22,10 @@ export interface ToolCallRecord {
 	toolCallId: string;
 	/** The server name, if this was an MCP tool call. */
 	serverName?: string;
+	/** Canonical server-qualified tool identity, when the call was recognized. */
+	qualifiedName?: string;
+	/** Fingerprint of the full canonical arguments before parameter truncation. */
+	argsFingerprint?: `sha256:${string}`;
 	/** A redacted / limited parameter summary (keys preserved, values truncated). */
 	params: Record<string, unknown>;
 	/** Working directory supplied by the extension context. */
@@ -40,7 +44,7 @@ export interface ToolResultRecord {
 	success: boolean;
 	/** A reference or truncated representation of the result payload. */
 	resultRef: string;
-	/** Serializable structured result details, preserved without text truncation. */
+	/** Bounded JSON-safe structured result details retained for downstream normalizers. */
 	details?: Record<string, unknown>;
 	/** ISO timestamp of the result. */
 	timestamp: string;

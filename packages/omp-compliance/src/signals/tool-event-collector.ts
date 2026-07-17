@@ -56,13 +56,166 @@ function isOfficialToolResultEvent(event: ToolResultEvent | LegacySyntheticToolR
 	return "type" in event && event.type === "tool_result";
 }
 
+class RetiredCallBloom {
+	private static readonly BYTE_SIZE = 1024 * 1024;
+	private static readonly HASH_COUNT = 7;
+	private readonly bits = new Uint8Array(RetiredCallBloom.BYTE_SIZE);
+
+	add(value: string): void {
+		for (const bit of this.hashes(value)) this.bits[bit >>> 3] |= 1 << (bit & 7);
+	}
+
+	has(value: string): boolean {
+		for (const bit of this.hashes(value)) {
+			if ((this.bits[bit >>> 3] & (1 << (bit & 7))) === 0) return false;
+		}
+		return true;
+	}
+
+	private hashes(value: string): number[] {
+		let first = 0x811c9dc5;
+		let second = 0x9e3779b9;
+		for (let index = 0; index < value.length; index++) {
+			const code = value.charCodeAt(index);
+			first = Math.imul(first ^ code, 0x01000193) >>> 0;
+			second = Math.imul(second ^ code, 0x85ebca6b) >>> 0;
+		}
+		second |= 1;
+		const bitCount = RetiredCallBloom.BYTE_SIZE * 8;
+		return Array.from(
+			{ length: RetiredCallBloom.HASH_COUNT },
+			(_, index) => (first + Math.imul(index, second)) >>> 0,
+		).map((hash) => hash % bitCount);
+	}
+}
+
+const DETAILS_MAX_BYTES = 16 * 1024;
+const DETAILS_MAX_DEPTH = 4;
+const DETAILS_MAX_KEYS = 64;
+const DETAILS_MAX_ARRAY = 32;
+const DETAILS_MAX_STRING = 2 * 1024;
+const DETAILS_PRIORITY_KEYS = [
+	"results",
+	"async",
+	"id",
+	"agentId",
+	"agent",
+	"task",
+	"assignment",
+	"description",
+	"exitCode",
+	"exit",
+	"code",
+	"aborted",
+	"cancelled",
+	"durationMs",
+	"duration",
+	"artifacts",
+	"outputs",
+	"output",
+	"outputPath",
+	"patchPath",
+	"branchName",
+];
+
+function utf8Length(value: string): number {
+	return new TextEncoder().encode(value).byteLength;
+}
+
+function boundedJsonString(value: string, maxBytes: number): string | null {
+	const capped = value.slice(0, DETAILS_MAX_STRING);
+	let serialized = JSON.stringify(capped);
+	if (utf8Length(serialized) <= maxBytes) return serialized;
+	let low = 0;
+	let high = capped.length;
+	while (low < high) {
+		const middle = Math.ceil((low + high) / 2);
+		const candidate = JSON.stringify(capped.slice(0, middle));
+		if (utf8Length(candidate) <= maxBytes) low = middle;
+		else high = middle - 1;
+	}
+	serialized = JSON.stringify(capped.slice(0, low));
+	return utf8Length(serialized) <= maxBytes ? serialized : null;
+}
+
+function orderedDetailKeys(value: object): string[] {
+	const keys = Object.keys(value);
+	const priority = new Map(DETAILS_PRIORITY_KEYS.map((key, index) => [key, index]));
+	return keys
+		.sort(
+			(left, right) =>
+				(priority.get(left) ?? Number.MAX_SAFE_INTEGER) - (priority.get(right) ?? Number.MAX_SAFE_INTEGER),
+		)
+		.slice(0, DETAILS_MAX_KEYS);
+}
+
+function sanitizeDetailJson(value: unknown, depth: number, ancestors: Set<object>, maxBytes: number): string | null {
+	if (value === null) return maxBytes >= 4 ? "null" : null;
+	if (typeof value === "string") return boundedJsonString(value, maxBytes);
+	if (typeof value === "boolean") {
+		const serialized = String(value);
+		return utf8Length(serialized) <= maxBytes ? serialized : null;
+	}
+	if (typeof value === "number") {
+		const serialized = Number.isFinite(value) ? String(value) : JSON.stringify("[Unsupported:number]");
+		return utf8Length(serialized) <= maxBytes ? serialized : null;
+	}
+	if (typeof value !== "object") return boundedJsonString(`[Unsupported:${typeof value}]`, maxBytes);
+	if (ancestors.has(value)) return boundedJsonString("[Circular]", maxBytes);
+	if (depth >= DETAILS_MAX_DEPTH) return boundedJsonString("[MaxDepth]", maxBytes);
+
+	ancestors.add(value);
+	try {
+		if (Array.isArray(value)) {
+			if (maxBytes < 2) return null;
+			const parts: string[] = [];
+			let used = 2;
+			for (const item of value.slice(0, DETAILS_MAX_ARRAY)) {
+				const separatorBytes = parts.length === 0 ? 0 : 1;
+				const child = sanitizeDetailJson(item, depth + 1, ancestors, maxBytes - used - separatorBytes);
+				if (child === null) break;
+				parts.push(child);
+				used += separatorBytes + utf8Length(child);
+			}
+			return `[${parts.join(",")}]`;
+		}
+
+		if (maxBytes < 2) return null;
+		const parts: string[] = [];
+		let used = 2;
+		for (const key of orderedDetailKeys(value)) {
+			const keyJson = JSON.stringify(key);
+			const separatorBytes = parts.length === 0 ? 0 : 1;
+			const overhead = separatorBytes + utf8Length(keyJson) + 1;
+			if (used + overhead >= maxBytes) break;
+			let child: string | null;
+			try {
+				child = sanitizeDetailJson(
+					(value as Record<string, unknown>)[key],
+					depth + 1,
+					ancestors,
+					maxBytes - used - overhead,
+				);
+			} catch {
+				child = boundedJsonString("[Unreadable]", maxBytes - used - overhead);
+			}
+			if (child === null) continue;
+			parts.push(`${keyJson}:${child}`);
+			used += overhead + utf8Length(child);
+		}
+		return `{${parts.join(",")}}`;
+	} finally {
+		ancestors.delete(value);
+	}
+}
+
 export class ToolEventCollector {
 	private static readonly MAX_RECORDS = 2048;
 	private calls: Map<string, ToolCallRecord> = new Map();
 	private results: Map<string, ToolResultRecord> = new Map();
 	private canonicalCallIds: Map<string, string> = new Map();
 	private callAliases: Map<string, string> = new Map();
-	private tombstones: Set<string> = new Set();
+	private retired = new RetiredCallBloom();
 
 	/**
 	 * Record a tool_call event.
@@ -78,6 +231,7 @@ export class ToolEventCollector {
 		let toolCallId: string;
 		let serverName: string | undefined;
 		let input: object;
+		let canonicalIdentity: CanonicalToolIdentity | undefined;
 		if (isOfficialToolCallEvent(event)) {
 			toolName = event.toolName;
 			toolCallId = event.toolCallId;
@@ -99,10 +253,7 @@ export class ToolEventCollector {
 			const unwrapped = classified.event;
 			const dedupeKey = this.dedupeKey(unwrapped.correlationId, unwrapped.identity);
 			const aliasKey = this.aliasKey(unwrapped.toolCallId, unwrapped.identity);
-			if (
-				this.tombstones.has(this.retiredDedupeKey(dedupeKey)) ||
-				this.tombstones.has(this.retiredAliasKey(aliasKey))
-			) {
+			if (this.retired.has(this.retiredDedupeKey(dedupeKey)) || this.retired.has(this.retiredAliasKey(aliasKey))) {
 				return;
 			}
 			const existingId = this.canonicalCallIds.get(dedupeKey);
@@ -115,6 +266,7 @@ export class ToolEventCollector {
 			toolName = unwrapped.identity.toolName;
 			serverName = "codebase-memory";
 			input = unwrapped.identity.args;
+			canonicalIdentity = unwrapped.identity;
 			this.canonicalCallIds.set(dedupeKey, toolCallId);
 			this.setAlias(aliasKey, toolCallId);
 			if (unwrapped.toolCallId !== toolCallId) this.setRawAlias(unwrapped.toolCallId, toolCallId);
@@ -126,6 +278,8 @@ export class ToolEventCollector {
 			toolName,
 			toolCallId,
 			serverName,
+			qualifiedName: canonicalIdentity?.qualifiedName,
+			argsFingerprint: canonicalIdentity?.argsFingerprint,
 			params: this.truncateParams(input),
 			cwd: context?.cwd,
 			sessionId: context?.sessionManager.getSessionId(),
@@ -151,33 +305,46 @@ export class ToolEventCollector {
 			toolCallId = String(event.toolCallId ?? "");
 			isError = event.isError === true || event.success === false;
 		}
+		const existingStorageId = this.findExistingStorageId(toolCallId);
+		if (
+			!existingStorageId &&
+			(this.retired.has(this.retiredIdKey(toolCallId)) ||
+				this.retired.has(this.retiredAliasKey(this.rawAliasKey(toolCallId))))
+		) {
+			return;
+		}
+		const expectedCall = existingStorageId ? this.calls.get(existingStorageId) : undefined;
 
 		let identity: CanonicalToolIdentity | undefined;
 		if (isOfficialToolResultEvent(event) && this.isXdevCandidate(event.toolName, event.input)) {
-			const classified = classifyToolResultEvent(event);
+			const classified = classifyToolResultEvent(event, expectedCall?.qualifiedName);
 			if (classified.kind === "invalid_xdev") {
-				const callClassified = classifyToolCallEvent({ ...event, type: "tool_call" });
-				const existingId =
-					callClassified.kind === "valid"
-						? this.resolveStorageId(toolCallId, callClassified.event.identity)
-						: (this.callAliases.get(this.rawAliasKey(toolCallId)) ??
-							(this.calls.has(toolCallId) ? toolCallId : undefined));
-				this.recordInvalidXdev(toolCallId, classified.reason, undefined, existingId);
+				this.recordInvalidXdev(toolCallId, classified.reason, undefined, existingStorageId);
 				return;
 			}
 			if (classified.kind === "ignored") return;
 			identity = classified.event.identity;
+			if (expectedCall?.qualifiedName && identity.qualifiedName !== expectedCall.qualifiedName) {
+				this.recordInvalidXdev(toolCallId, "tool_mismatch", undefined, existingStorageId);
+				return;
+			}
+			if (expectedCall?.argsFingerprint && identity.argsFingerprint !== expectedCall.argsFingerprint) {
+				this.recordInvalidXdev(toolCallId, "args_mismatch", undefined, existingStorageId);
+				return;
+			}
 		} else if (isOfficialToolResultEvent(event)) {
 			const classified = classifyToolCallEvent({ ...event, type: "tool_call" });
 			if (classified.kind === "valid") identity = classified.event.identity;
 		}
 
-		const resolvedId = identity
-			? this.resolveStorageId(toolCallId, identity)
-			: (this.callAliases.get(this.rawAliasKey(toolCallId)) ?? toolCallId);
+		const resolvedId =
+			existingStorageId ??
+			(identity
+				? this.resolveStorageId(toolCallId, identity)
+				: (this.callAliases.get(this.rawAliasKey(toolCallId)) ?? toolCallId));
 		if (
-			this.tombstones.has(this.retiredIdKey(resolvedId)) ||
-			this.tombstones.has(this.retiredAliasKey(this.rawAliasKey(toolCallId)))
+			this.retired.has(this.retiredIdKey(resolvedId)) ||
+			this.retired.has(this.retiredAliasKey(this.rawAliasKey(toolCallId)))
 		) {
 			return;
 		}
@@ -229,7 +396,7 @@ export class ToolEventCollector {
 		this.results.clear();
 		this.canonicalCallIds.clear();
 		this.callAliases.clear();
-		this.tombstones.clear();
+		this.retired = new RetiredCallBloom();
 	}
 
 	// ─── Private helpers ────────────────────────────────────────
@@ -285,6 +452,12 @@ export class ToolEventCollector {
 		);
 	}
 
+	private findExistingStorageId(toolCallId: string): string | undefined {
+		const aliased = this.callAliases.get(this.rawAliasKey(toolCallId));
+		if (aliased && this.calls.has(aliased)) return aliased;
+		return this.calls.has(toolCallId) ? toolCallId : undefined;
+	}
+
 	private setAlias(key: string, storageId: string): void {
 		this.callAliases.set(key, storageId);
 		while (this.callAliases.size > ToolEventCollector.MAX_RECORDS) {
@@ -295,7 +468,7 @@ export class ToolEventCollector {
 				this.evictCall(oldestStorageId);
 			} else {
 				this.callAliases.delete(oldest);
-				this.addTombstone(this.retiredAliasKey(oldest));
+				this.retired.add(this.retiredAliasKey(oldest));
 			}
 		}
 	}
@@ -310,27 +483,18 @@ export class ToolEventCollector {
 		this.setAlias(key, storageId);
 	}
 
-	private addTombstone(key: string): void {
-		this.tombstones.add(key);
-		while (this.tombstones.size > ToolEventCollector.MAX_RECORDS) {
-			const oldest = this.tombstones.values().next().value;
-			if (oldest === undefined) break;
-			this.tombstones.delete(oldest);
-		}
-	}
-
 	private removeIndexesForStorage(storageId: string, retire: boolean): void {
 		for (const [key, value] of this.canonicalCallIds) {
 			if (value !== storageId) continue;
 			this.canonicalCallIds.delete(key);
-			if (retire) this.addTombstone(this.retiredDedupeKey(key));
+			if (retire) this.retired.add(this.retiredDedupeKey(key));
 		}
 		for (const [key, value] of this.callAliases) {
 			if (value !== storageId) continue;
 			this.callAliases.delete(key);
-			if (retire) this.addTombstone(this.retiredAliasKey(key));
+			if (retire) this.retired.add(this.retiredAliasKey(key));
 		}
-		if (retire) this.addTombstone(this.retiredIdKey(storageId));
+		if (retire) this.retired.add(this.retiredIdKey(storageId));
 	}
 
 	private evictCall(storageId: string): void {
@@ -424,8 +588,12 @@ export class ToolEventCollector {
 				.map((item) => item.text)
 				.join("\n");
 			if (text) return text.length > 200 ? `${text.slice(0, 200)}…` : text;
-			const json = JSON.stringify(event.details ?? event);
-			return json.length > 200 ? `${json.slice(0, 200)}…` : json;
+			try {
+				const json = JSON.stringify(event.details ?? event) ?? "[undefined]";
+				return json.length > 200 ? `${json.slice(0, 200)}…` : json;
+			} catch {
+				return "[unserializable]";
+			}
 		}
 		if (typeof event.resultRef === "string") return event.resultRef;
 		if (typeof event.content === "string") {
@@ -448,7 +616,7 @@ export class ToolEventCollector {
 		const value = isOfficialToolResultEvent(event) ? event.details : event.result;
 		if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
 		try {
-			const serialized = JSON.stringify(value);
+			const serialized = sanitizeDetailJson(value, 0, new Set(), DETAILS_MAX_BYTES);
 			if (!serialized) return undefined;
 			const parsed: unknown = JSON.parse(serialized);
 			return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)

@@ -147,6 +147,41 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 		expect(snap.codebaseMemory.references).toEqual(["packages/omp-compliance/src/signals/types.ts"]);
 	});
 
+	it.each([
+		[
+			"args_mismatch",
+			{ path: "xd://search_graph", content: '{"query":"tampered"}' },
+			{ tool: "search_graph", mode: "execute", args: { query: "tampered" } },
+		],
+		[
+			"tool_mismatch",
+			{ path: "xd://trace_path", content: '{"query":"original"}' },
+			{ tool: "trace_path", mode: "execute", args: { query: "original" } },
+		],
+	])("xd result 自洽但与原始 call 不一致时记录 %s", (reason, input, xdev) => {
+		collector.recordCall(
+			makeCall("write", { path: "xd://search_graph", content: '{"query":"original"}' }, `tampered-${reason}`),
+		);
+		collector.recordResult({
+			type: "tool_result",
+			toolName: "write",
+			toolCallId: `tampered-${reason}`,
+			input,
+			content: [{ type: "text", text: "packages/should-not-count.ts" }],
+			isError: false,
+			details: { xdev },
+		} as ToolResultEvent);
+
+		const snap = collector.snapshot();
+		expect(snap.calls).toHaveLength(1);
+		expect(snap.calls[0]).toMatchObject({
+			toolName: "invalid_xdev_event",
+			params: { reason },
+		});
+		expect(snap.results[0]).toMatchObject({ success: false, toolCallId: `tampered-${reason}` });
+		expect(snap.codebaseMemory).toEqual({ indexReady: false, queries: [], references: [] });
+	});
+
 	it("同一关联 id 和工具但参数不同的外层与内层调用不会合并", () => {
 		collector.recordCall(makeCall("write", { path: "xd://search_graph", content: '{"query":"outer"}' }, "same-id"));
 		collector.recordCall(makeCall("mcp__codebase_memory_mcp__search_graph", { query: "inner" }, "same-id"));
@@ -287,6 +322,115 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 			params: { query: "new" },
 		});
 		expect(collector.snapshot().calls.some((call) => call.toolCallId === "independent-new")).toBe(true);
+	});
+
+	it("一万次调用后仍拒绝最早 retired id，reset 后允许新会话复用", () => {
+		const firstCall = makeCall(
+			"write",
+			{ path: "xd://search_graph", content: '{"query":"long-session-0"}' },
+			"long-session-0",
+		);
+		for (let index = 0; index < 10_000; index++) {
+			collector.recordCall(
+				makeCall(
+					"write",
+					{ path: "xd://search_graph", content: JSON.stringify({ query: `long-session-${index}` }) },
+					`long-session-${index}`,
+				),
+			);
+		}
+
+		collector.recordCall(firstCall);
+		collector.recordResult({
+			type: "tool_result",
+			toolName: "write",
+			toolCallId: "long-session-0",
+			input: firstCall.input,
+			content: [{ type: "text", text: "packages/late-long-session.ts" }],
+			isError: false,
+			details: { xdev: { tool: "search_graph", mode: "execute", args: { query: "long-session-0" } } },
+		} as ToolResultEvent);
+
+		let snap = collector.snapshot();
+		expect(snap.calls.length).toBeLessThanOrEqual(2048);
+		expect(snap.results.length).toBeLessThanOrEqual(2048);
+		expect(snap.calls.some((call) => call.toolCallId === "long-session-0")).toBe(false);
+		expect(snap.results.some((result) => result.toolCallId === "long-session-0")).toBe(false);
+		expect(snap.codebaseMemory.references).not.toContain("packages/late-long-session.ts");
+		const internals = collector as unknown as {
+			canonicalCallIds: Map<string, string>;
+			callAliases: Map<string, string>;
+		};
+		expect(internals.canonicalCallIds.size).toBeLessThanOrEqual(2048);
+		expect(internals.callAliases.size).toBeLessThanOrEqual(2048);
+
+		collector.reset();
+		collector.recordCall(firstCall);
+		collector.recordResult({
+			type: "tool_result",
+			toolName: "write",
+			toolCallId: "long-session-0",
+			input: firstCall.input,
+			content: [{ type: "text", text: "packages/new-session.ts" }],
+			isError: false,
+			details: { xdev: { tool: "search_graph", mode: "execute", args: { query: "long-session-0" } } },
+		} as ToolResultEvent);
+		snap = collector.snapshot();
+		expect(snap.calls.some((call) => call.toolCallId === "long-session-0")).toBe(true);
+		expect(snap.codebaseMemory.references).toContain("packages/new-session.ts");
+	});
+
+	it("details 有界清洗且保留 task normalizer 所需字段", () => {
+		const cyclic: Record<string, unknown> = {};
+		cyclic.self = cyclic;
+		const details = {
+			results: [
+				{
+					id: "bounded-agent",
+					agent: "implementer",
+					task: "Bound structured details",
+					exitCode: 0,
+					durationMs: 12,
+					output: "packages/omp-compliance/src/signals/tool-event-collector.ts",
+				},
+			],
+			huge: "x".repeat(10 * 1024 * 1024),
+			deep: { a: { b: { c: { d: { e: "too deep" } } } } },
+			wide: Array.from({ length: 1_000 }, (_, index) => index),
+			manyKeys: Object.fromEntries(Array.from({ length: 100 }, (_, index) => [`key-${index}`, index])),
+			cyclic,
+			big: 1n,
+		};
+		collector.recordCall(makeCall("task", { task: "Bound structured details" }, "bounded-details"));
+		expect(() =>
+			collector.recordResult({
+				type: "tool_result",
+				toolName: "task",
+				toolCallId: "bounded-details",
+				input: { task: "Bound structured details" },
+				content: [{ type: "text", text: "completed" }],
+				isError: false,
+				details,
+			} as ToolResultEvent),
+		).not.toThrow();
+
+		const snap = collector.snapshot();
+		const stored = snap.results[0].details;
+		expect(stored).toBeDefined();
+		expect(new TextEncoder().encode(JSON.stringify(stored)).byteLength).toBeLessThanOrEqual(16 * 1024);
+		expect(String(stored?.huge).length).toBeLessThanOrEqual(2 * 1024);
+		expect(stored?.wide).toBeArray();
+		expect(stored?.wide as unknown[]).toHaveLength(32);
+		expect(Object.keys(stored?.manyKeys as object)).toHaveLength(64);
+		expect(JSON.stringify(stored?.deep)).not.toContain("too deep");
+		expect(snap.subagentDelegations[0]).toMatchObject({
+			agentId: "bounded-agent",
+			agent: "implementer",
+			status: "completed",
+			exitCode: 0,
+			durationMs: 12,
+			codebaseRefs: ["packages/omp-compliance/src/signals/tool-event-collector.ts"],
+		});
 	});
 
 	it("reset 清空去重关联，后续相同 id 可重新记录", () => {
