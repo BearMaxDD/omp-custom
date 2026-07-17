@@ -92,7 +92,7 @@ describe("extension v17 tool event wiring", () => {
 		});
 	});
 
-	it("keeps async running incomplete and reads codebase references from structured details", async () => {
+	it("keeps async running incomplete and rejects untrusted codebase FQNs", async () => {
 		const api = new FakeExtensionAPI();
 		const collector = new CollectorRuntime();
 
@@ -132,8 +132,7 @@ describe("extension v17 tool event wiring", () => {
 
 		const snapshot = collector.collector.snapshot();
 		expect(snapshot.subagentDelegations[0]?.status).toBe("insufficient");
-		expect(snapshot.codebaseMemory.indexReady).toBe(true);
-		expect(snapshot.codebaseMemory.references).toContain("packages/omp-compliance/src/signals/codebase-memory.ts");
+		expect(snapshot.codebaseMemory).toEqual({ indexReady: false, queries: [], references: [] });
 	});
 
 	it("records cwd and sessionId from the extension context on calls", async () => {

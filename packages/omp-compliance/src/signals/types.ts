@@ -58,8 +58,6 @@ export interface CodebaseMemoryEvidence {
 	params: Record<string, unknown>;
 	/** A reference to the original result artifact. */
 	resultRef: string;
-	/** Serializable structured result details from the v17 host event. */
-	details?: Record<string, unknown>;
 }
 
 /** Normalized evidence for one task (subagent) delegation. */

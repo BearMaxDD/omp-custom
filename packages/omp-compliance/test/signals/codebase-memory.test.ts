@@ -1,14 +1,14 @@
 import { describe, expect, it, test } from "bun:test";
-import type { ToolCallEvent, ToolResultEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { ToolResultEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { codebaseIndexReady, normalizeCodebaseMemory } from "../../src/signals/codebase-memory";
 import { ToolEventCollector } from "../../src/signals/tool-event-collector";
 
-function mcpCall(shortName: string, input: Record<string, unknown>, toolCallId: string): ToolCallEvent {
+function mcpCall(shortName: string, input: Record<string, unknown>, toolCallId: string) {
 	return {
-		type: "tool_call",
-		toolName: `mcp__codebase_memory_mcp__${shortName}`,
+		toolName: shortName,
 		toolCallId,
-		input,
+		serverName: "codebase-memory",
+		params: input,
 	};
 }
 
@@ -30,22 +30,41 @@ function mcpResult(
 	};
 }
 
-describe("codebase-memory v17 structured details 归一化", () => {
-	it.each(["index_repository", "index_status"])("%s 的 details.status=ready 可令 indexReady=true", (toolName) => {
+describe("codebase-memory Task 8 可信 server 边界", () => {
+	it.each(["mcp__codebase_memory_mcp__search_graph", "search_graph"])(
+		"无可信 server 元数据时 %s 不得建立 Codebase Memory Evidence",
+		(toolName) => {
+			const collector = new ToolEventCollector();
+			collector.recordCall({ type: "tool_call", toolName, toolCallId: toolName, input: { query: "spoofed" } });
+			collector.recordResult({
+				type: "tool_result",
+				toolName,
+				toolCallId: toolName,
+				input: {},
+				content: [{ type: "text", text: "packages/omp-compliance/src/extension.ts" }],
+				isError: false,
+				details: { file_path: "packages/omp-compliance/src/extension.ts" },
+			});
+
+			expect(collector.snapshot().codebaseMemory).toEqual({ indexReady: false, queries: [], references: [] });
+		},
+	);
+
+	it.each(["index_repository", "index_status"])("明确 serverName 的 %s 结果可令 indexReady=true", (toolName) => {
 		const collector = new ToolEventCollector();
 		collector.recordCall(mcpCall(toolName, {}, `ready-${toolName}`));
-		collector.recordResult(mcpResult(`ready-${toolName}`, toolName, { status: "ready" }, "ordinary content"));
+		collector.recordResult(mcpResult(`ready-${toolName}`, toolName, { status: "ignored" }, '{"status":"ready"}'));
 		expect(collector.snapshot().codebaseMemory.indexReady).toBe(true);
 	});
 
-	it("失败的 index_status 即使 details ready 也不设 ready", () => {
+	it("失败的 index_status 即使文本状态 ready 也不设 ready", () => {
 		const collector = new ToolEventCollector();
 		collector.recordCall(mcpCall("index_status", {}, "failed-ready"));
-		collector.recordResult(mcpResult("failed-ready", "index_status", { status: "ready" }, "ordinary", true));
+		collector.recordResult(mcpResult("failed-ready", "index_status", undefined, '{"status":"ready"}', true));
 		expect(collector.snapshot().codebaseMemory.indexReady).toBe(false);
 	});
 
-	it("search/snippet 的 structured references 与 content 合并并稳定去重", () => {
+	it("仅从文本结果提取 references，忽略 structured details", () => {
 		const collector = new ToolEventCollector();
 		collector.recordCall(mcpCall("search_graph", { query: "TaskTool" }, "search-1"));
 		collector.recordResult(
@@ -74,11 +93,7 @@ describe("codebase-memory v17 structured details 归一化", () => {
 		expect(collector.snapshot().codebaseMemory).toEqual({
 			indexReady: false,
 			queries: ["search_graph", "get_code_snippet"],
-			references: [
-				"packages/omp-compliance/src/extension.ts",
-				"packages/omp-compliance/src/signals/task-delegation.ts",
-				"packages/omp-compliance/src/signals/codebase-memory.ts",
-			],
+			references: ["packages/omp-compliance/src/extension.ts"],
 		});
 	});
 
@@ -125,7 +140,7 @@ describe("codebaseIndexReady matrix", () => {
 	it("保留直接 normalizer 契约", () => {
 		expect(
 			normalizeCodebaseMemory({
-				toolName: "mcp__codebase_memory_mcp__index_repository",
+				toolName: "index_repository",
 				result: { success: true, status: "indexed" },
 			}),
 		).toEqual({ indexReady: true, queries: [], references: [] });

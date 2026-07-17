@@ -29,7 +29,6 @@ const RECOGNIZED_TOOLS: ReadonlySet<string> = new Set([
 
 /** The MCP server name expected for codebase-memory tools. */
 const EXPECTED_SERVER = "codebase-memory";
-const EXPECTED_FQN_PREFIX = "mcp__codebase_memory_mcp__";
 
 /**
  * Input types accepted by normalizeCodebaseMemory.
@@ -107,7 +106,7 @@ export function normalizeCodebaseMemory(paired: PairedInput | SingleInput): {
 		const serverName = call.serverName ?? "";
 		const shortName = shortToolName(toolName);
 
-		if (!isCodebaseMemoryTool(toolName, serverName)) continue;
+		if (serverName !== EXPECTED_SERVER) continue;
 
 		// Extract the short tool name (strip server prefix if FQN)
 		if (!RECOGNIZED_TOOLS.has(shortName)) continue;
@@ -116,7 +115,7 @@ export function normalizeCodebaseMemory(paired: PairedInput | SingleInput): {
 
 		// Extract references from result text for search / snippet tools
 		if (result && shortName !== "index_repository" && shortName !== "index_status") {
-			const refs = [...extractReferences(result.resultRef), ...extractStructuredReferences(result.details)];
+			const refs = extractReferences(result.resultRef);
 			allRefs.push(...refs);
 		}
 
@@ -135,14 +134,13 @@ export function normalizeCodebaseMemory(paired: PairedInput | SingleInput): {
 			success,
 			params: call.params,
 			resultRef: result?.resultRef ?? "",
-			details: result?.details,
 		});
 	}
 
 	// Determine indexReady: match on tool name and result status.
 	let isIndexReady = false;
 	for (const ev of evidences) {
-		const status = readString(ev.details?.status) ?? parseStatusFromRef(ev.resultRef);
+		const status = parseStatusFromRef(ev.resultRef);
 		if (codebaseIndexReady(ev.toolName, { success: ev.success, status })) {
 			isIndexReady = true;
 			break;
@@ -154,18 +152,6 @@ export function normalizeCodebaseMemory(paired: PairedInput | SingleInput): {
 		queries: [...new Set(queryNames)],
 		references: [...new Set(allRefs)],
 	};
-}
-
-function isCodebaseMemoryTool(toolName: string, serverName: string): boolean {
-	return (
-		serverName === EXPECTED_SERVER ||
-		toolName.startsWith(EXPECTED_FQN_PREFIX) ||
-		(serverName === "" && RECOGNIZED_TOOLS.has(toolName))
-	);
-}
-
-function readString(value: unknown): string | undefined {
-	return typeof value === "string" ? value : undefined;
 }
 
 // ─── Helpers ────────────────────────────────────────────────────
@@ -183,25 +169,4 @@ function extractReferences(text: string): string[] {
 		refs.push(match[1]);
 	}
 	return refs;
-}
-
-function extractStructuredReferences(details: Record<string, unknown> | undefined): string[] {
-	if (!details) return [];
-	const refs: string[] = [];
-	const pending: unknown[] = [details];
-	const seen = new Set<object>();
-	let visited = 0;
-	while (pending.length > 0 && visited < 10_000) {
-		const value = pending.pop();
-		visited++;
-		if (typeof value === "string") {
-			refs.push(...extractReferences(value));
-			continue;
-		}
-		if (typeof value !== "object" || value === null || seen.has(value)) continue;
-		seen.add(value);
-		if (Array.isArray(value)) pending.push(...value);
-		else pending.push(...Object.values(value));
-	}
-	return [...new Set(refs)];
 }

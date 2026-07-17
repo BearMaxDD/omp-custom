@@ -81,14 +81,24 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 	});
 
 	it("没有 result 的 call 在 codebaseMemory 中正常出现，但无结果引用", () => {
-		collector.recordCall(makeCall("search_code", { query: "find" }, "c4"));
+		collector.recordCall({
+			toolName: "search_code",
+			toolCallId: "c4",
+			serverName: "codebase-memory",
+			params: { query: "find" },
+		});
 		const snap = collector.snapshot();
 		// Should appear in queries even without a result
 		expect(snap.codebaseMemory.queries).toContain("search_code");
 	});
 
 	it("空 resultRef 不产生 codebase 引用", () => {
-		collector.recordCall(makeCall("search_code", { query: "find" }, "c5"));
+		collector.recordCall({
+			toolName: "search_code",
+			toolCallId: "c5",
+			serverName: "codebase-memory",
+			params: { query: "find" },
+		});
 		collector.recordResult({
 			type: "tool_result",
 			toolName: "search_code",
