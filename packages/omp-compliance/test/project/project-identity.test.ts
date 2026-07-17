@@ -870,7 +870,7 @@ describe("createProjectContext", () => {
 		const root = initGit("https://github.com/acme/widget.git");
 		const identity = ProjectIdentityStore.open(root, { codebaseProjectId: "codebase-acme-widget" });
 		const cwd = join(identity.binding.canonicalRoot, "packages", "app");
-		const sessionId = randomUUID();
+		const sessionId = Bun.randomUUIDv7();
 		mkdirSync(cwd, { recursive: true });
 
 		const context = createProjectContext(identity, sessionId, cwd, "codebase-acme-widget");
@@ -896,7 +896,7 @@ describe("createProjectContext", () => {
 			createdAt: new Date().toISOString(),
 		};
 
-		expect(() => createProjectContext(binding as never, randomUUID(), root, undefined)).toThrow(
+		expect(() => createProjectContext(binding as never, Bun.randomUUIDv7(), root, undefined)).toThrow(
 			"OMP project context is invalid",
 		);
 	});
@@ -905,7 +905,7 @@ describe("createProjectContext", () => {
 		const root = initGit();
 		const identity = ProjectIdentityStore.open(root);
 
-		expect(() => createProjectContext({ ...identity }, randomUUID(), identity.observedRoot, undefined)).toThrow(
+		expect(() => createProjectContext({ ...identity }, Bun.randomUUIDv7(), identity.observedRoot, undefined)).toThrow(
 			"OMP project context is invalid",
 		);
 	});
@@ -919,7 +919,7 @@ describe("createProjectContext", () => {
 		const identity = ProjectIdentityStore.open(moved);
 
 		expect(identity.status).toBe("rebind_required");
-		expect(() => createProjectContext(identity, randomUUID(), moved, undefined)).toThrow(
+		expect(() => createProjectContext(identity, Bun.randomUUIDv7(), moved, undefined)).toThrow(
 			"OMP project context is invalid",
 		);
 	});
@@ -931,7 +931,7 @@ describe("createProjectContext", () => {
 		const identity = ProjectIdentityStore.open(root);
 
 		expect(identity.status).toBe("project_mismatch");
-		expect(() => createProjectContext(identity, randomUUID(), root, undefined)).toThrow(
+		expect(() => createProjectContext(identity, Bun.randomUUIDv7(), root, undefined)).toThrow(
 			"OMP project context is invalid",
 		);
 	});
@@ -942,7 +942,7 @@ describe("createProjectContext", () => {
 		git(root, "remote", "set-url", "origin", "https://github.com/acme/other.git");
 
 		expect(ProjectIdentityStore.open(root).status).toBe("project_mismatch");
-		expect(() => createProjectContext(staleBound, randomUUID(), root, undefined)).toThrow(
+		expect(() => createProjectContext(staleBound, Bun.randomUUIDv7(), root, undefined)).toThrow(
 			"OMP project context is invalid",
 		);
 	});
@@ -952,7 +952,7 @@ describe("createProjectContext", () => {
 		const olderBound = ProjectIdentityStore.open(root, { codebaseProjectId: "codebase-widget" });
 
 		expect(ProjectIdentityStore.open(root, { codebaseProjectId: "codebase-widget" }).status).toBe("bound");
-		expect(createProjectContext(olderBound, randomUUID(), root, "codebase-widget").projectId).toBe(
+		expect(createProjectContext(olderBound, Bun.randomUUIDv7(), root, "codebase-widget").projectId).toBe(
 			olderBound.binding.projectId,
 		);
 	});
@@ -961,17 +961,17 @@ describe("createProjectContext", () => {
 		const root = initGit();
 		const codebaseA = ProjectIdentityStore.open(root, { codebaseProjectId: "codebase-A" });
 
-		expect(() => createProjectContext(codebaseA, randomUUID(), root, "codebase-B")).toThrow(
+		expect(() => createProjectContext(codebaseA, Bun.randomUUIDv7(), root, "codebase-B")).toThrow(
 			"OMP project context is invalid",
 		);
-		expect(createProjectContext(codebaseA, randomUUID(), root, "codebase-A").codebaseProject).toBe("codebase-A");
+		expect(createProjectContext(codebaseA, Bun.randomUUIDv7(), root, "codebase-A").codebaseProject).toBe("codebase-A");
 	});
 
 	it("accepts an explicit undefined current codebase when the binding has no codebase", () => {
 		const root = initGit();
 		const identity = ProjectIdentityStore.open(root);
 
-		expect(createProjectContext(identity, randomUUID(), root, undefined).codebaseProject).toBeUndefined();
+		expect(createProjectContext(identity, Bun.randomUUIDv7(), root, undefined).codebaseProject).toBeUndefined();
 	});
 
 	it("accepts a real OMP v17 UUIDv7 session id", () => {
@@ -986,7 +986,7 @@ describe("createProjectContext", () => {
 		const root = initGit();
 		const identity = ProjectIdentityStore.open(root);
 
-		expect(() => (createProjectContext as (...args: unknown[]) => unknown)(identity, randomUUID(), root)).toThrow(
+		expect(() => (createProjectContext as (...args: unknown[]) => unknown)(identity, Bun.randomUUIDv7(), root)).toThrow(
 			"OMP project context is invalid",
 		);
 	});
@@ -996,7 +996,7 @@ describe("createProjectContext", () => {
 		const identity = ProjectIdentityStore.open(root);
 		const outside = realpathSync(tempProject());
 
-		expect(() => createProjectContext(identity, randomUUID(), outside, undefined)).toThrow(
+		expect(() => createProjectContext(identity, Bun.randomUUIDv7(), outside, undefined)).toThrow(
 			"OMP project context is invalid",
 		);
 	});
@@ -1008,7 +1008,7 @@ describe("createProjectContext", () => {
 		mkdirSync(expectedCwd, { recursive: true });
 		const nativeCwd = `${identity.binding.canonicalRoot}${sep}packages${sep}..${sep}packages${sep}app`;
 
-		const context = createProjectContext(identity, randomUUID(), nativeCwd, undefined);
+		const context = createProjectContext(identity, Bun.randomUUIDv7(), nativeCwd, undefined);
 
 		expect(context.cwd).toBe(realpathSync(expectedCwd).split(sep).join("/"));
 	});
@@ -1020,7 +1020,7 @@ describe("createProjectContext", () => {
 		const escaped = join(identity.binding.canonicalRoot, "escaped");
 		symlinkSync(outside, escaped, process.platform === "win32" ? "junction" : "dir");
 
-		expect(() => createProjectContext(identity, randomUUID(), escaped, undefined)).toThrow(
+		expect(() => createProjectContext(identity, Bun.randomUUIDv7(), escaped, undefined)).toThrow(
 			"OMP project context is invalid",
 		);
 	});
@@ -1030,6 +1030,15 @@ describe("createProjectContext", () => {
 		const identity = ProjectIdentityStore.open(root);
 
 		expect(() => createProjectContext(identity, sessionId as never, root, undefined)).toThrow(
+			"OMP project context is invalid",
+		);
+	});
+
+	it("rejects a UUIDv4 session id", () => {
+		const root = initGit();
+		const identity = ProjectIdentityStore.open(root);
+
+		expect(() => createProjectContext(identity, randomUUID(), root, undefined)).toThrow(
 			"OMP project context is invalid",
 		);
 	});
