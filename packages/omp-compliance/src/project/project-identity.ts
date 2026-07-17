@@ -48,7 +48,6 @@ export interface ProjectIdentityOpenOptions {
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const PUBLISH_WAIT_MS = 5_000;
 const PUBLISH_RECOVERY_GRACE_MS = 1_000;
-const PUBLISH_OWNER_LEASE_MS = 30_000;
 const PUBLISH_TIMESTAMP_TOLERANCE_MS = 5_000;
 const MAX_PROBEABLE_PID = 2_147_483_647;
 const REMOTE_IDENTITY_PREFIX = "git-remote:v1://";
@@ -87,6 +86,7 @@ interface PublishOwner {
 	readonly token: string;
 	readonly pid: number;
 	readonly createdAt: string;
+	readonly processStartedAtMs?: number;
 }
 
 interface PublishMarkerSnapshot extends FileIdentity {
@@ -478,7 +478,13 @@ interface PublishAttempt {
 
 function createPublishMarker(directory: string, storageIdentity: StorageIdentity): PublishAttempt {
 	while (true) {
-		const owner = Object.freeze({ token: randomUUID(), pid: process.pid, createdAt: new Date().toISOString() });
+		const processStartedAtMs = readProcessStartedAt(process.pid);
+		const owner = Object.freeze({
+			token: randomUUID(),
+			pid: process.pid,
+			createdAt: new Date().toISOString(),
+			...(processStartedAtMs === undefined ? {} : { processStartedAtMs }),
+		});
 		const markerPath = join(directory, `.project.publish.${owner.token}.json`);
 		let markerNode: FileNodeIdentity | undefined;
 		try {
@@ -867,18 +873,28 @@ function removeFileIfIdentityMatches(path: string, identity: FileIdentity): bool
 function parsePublishOwner(content: string, expectedToken: string): PublishOwner | undefined {
 	try {
 		const value = JSON.parse(content) as unknown;
+		const hasProcessStartedAt = isRecord(value) && Object.hasOwn(value, "processStartedAtMs");
 		if (
 			!isRecord(value) ||
-			Object.keys(value).length !== 3 ||
+			Object.keys(value).length !== (hasProcessStartedAt ? 4 : 3) ||
 			value.token !== expectedToken ||
 			!Number.isSafeInteger(value.pid) ||
 			(value.pid as number) <= 0 ||
 			(value.pid as number) > MAX_PROBEABLE_PID ||
-			!isIsoTimestamp(value.createdAt)
+			!isIsoTimestamp(value.createdAt) ||
+			(hasProcessStartedAt &&
+				(!Number.isSafeInteger(value.processStartedAtMs) ||
+					(value.processStartedAtMs as number) <= 0 ||
+					(value.processStartedAtMs as number) % 1_000 !== 0))
 		) {
 			return undefined;
 		}
-		return Object.freeze({ token: value.token as string, pid: value.pid as number, createdAt: value.createdAt });
+		return Object.freeze({
+			token: value.token as string,
+			pid: value.pid as number,
+			createdAt: value.createdAt,
+			...(hasProcessStartedAt ? { processStartedAtMs: value.processStartedAtMs as number } : {}),
+		});
 	} catch {
 		return undefined;
 	}
@@ -908,9 +924,9 @@ function isPublishMarkerActive(snapshot: PublishMarkerSnapshot): boolean {
 	const ageMs = Date.now() - nanosecondsToMilliseconds(snapshot.mtimeNs);
 	const timestampIsPlausible = ageMs >= -PUBLISH_TIMESTAMP_TOLERANCE_MS;
 	if (!snapshot.owner) return timestampIsPlausible && ageMs < PUBLISH_RECOVERY_GRACE_MS;
-	const ownerState = probePublishOwner(snapshot.owner, snapshot);
+	const ownerState = probePublishOwner(snapshot.owner);
 	if (ownerState === "current") return true;
-	if (ownerState === "unknown") return timestampIsPlausible && ageMs < PUBLISH_OWNER_LEASE_MS;
+	if (ownerState === "unknown") return true;
 	return false;
 }
 
@@ -931,31 +947,34 @@ function nanosecondsToMilliseconds(value: bigint): number {
 	return Number(value / 1_000_000n);
 }
 
-function probePublishOwner(owner: PublishOwner, snapshot: PublishMarkerSnapshot): PublishOwnerState {
-	const createdAt = Date.parse(owner.createdAt);
-	if (Math.abs(createdAt - nanosecondsToMilliseconds(snapshot.mtimeNs)) > PUBLISH_TIMESTAMP_TOLERANCE_MS)
-		return "stale";
+function probePublishOwner(owner: PublishOwner): PublishOwnerState {
 	const processState = probeProcess(owner.pid);
 	if (processState === "dead") return "stale";
 	if (processState === "unknown") return "unknown";
+	if (owner.processStartedAtMs === undefined) return "unknown";
 	const processStartedAt = readProcessStartedAt(owner.pid);
 	if (processStartedAt === undefined) return "unknown";
-	return processStartedAt <= createdAt + PUBLISH_TIMESTAMP_TOLERANCE_MS ? "current" : "stale";
+	return processStartedAt === owner.processStartedAtMs ? "current" : "stale";
 }
 
 function readProcessStartedAt(pid: number): number | undefined {
-	if (pid === process.pid) return Date.now() - process.uptime() * 1_000;
-	if (process.platform === "win32") return undefined;
+	if (process.platform === "win32") {
+		return pid === process.pid ? normalizeProcessStartedAt(Date.now() - process.uptime() * 1_000) : undefined;
+	}
 	try {
 		const output = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
 			encoding: "utf8",
 			stdio: ["ignore", "pipe", "ignore"],
 		}).trim();
 		const timestamp = Date.parse(output);
-		return Number.isNaN(timestamp) ? undefined : timestamp;
+		return Number.isNaN(timestamp) ? undefined : normalizeProcessStartedAt(timestamp);
 	} catch {
 		return undefined;
 	}
+}
+
+function normalizeProcessStartedAt(timestamp: number): number {
+	return Math.floor(timestamp / 1_000) * 1_000;
 }
 
 function probeProcess(pid: number): ProcessState {
