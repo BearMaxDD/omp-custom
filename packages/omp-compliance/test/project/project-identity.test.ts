@@ -9,11 +9,13 @@ import {
 	realpathSync,
 	renameSync,
 	rmSync,
+	statSync,
 	symlinkSync,
+	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { createProjectContext } from "../../src/project/project-context";
 import {
 	PROJECT_IDENTITY_INVALID_ERROR,
@@ -97,6 +99,19 @@ describe("ProjectIdentityStore", () => {
 		expect(readBinding(root)).toEqual(initial.binding);
 	});
 
+	it("returns project_mismatch when a non-git SSH user changes", () => {
+		const root = initGit("alice@git.example.com:repos/widget.git");
+		const initial = ProjectIdentityStore.open(root);
+		git(root, "remote", "set-url", "origin", "bob@git.example.com:repos/widget.git");
+
+		const reopened = ProjectIdentityStore.open(root);
+
+		expect(initial.binding.gitRemoteIdentity).toBe("alice@git.example.com/repos/widget");
+		expect(reopened.status).toBe("project_mismatch");
+		expect(reopened.observedRemote).toBe("bob@git.example.com/repos/widget");
+		expect(reopened.binding.projectId).toBe(initial.binding.projectId);
+	});
+
 	it("uses a non-Git cwd as the stable root and supports a missing remote", () => {
 		const root = tempProject();
 		const nested = join(root, "nested");
@@ -109,6 +124,35 @@ describe("ProjectIdentityStore", () => {
 		expect(first.binding.canonicalRoot).toBe(realpathSync(nested));
 		expect(first.binding.gitRemoteIdentity).toBeUndefined();
 		expect(second.binding.projectId).toBe(first.binding.projectId);
+	});
+
+	it("fails closed below a repository with a corrupted .git marker", () => {
+		const root = initGit();
+		const nested = join(root, "packages", "app");
+		mkdirSync(nested, { recursive: true });
+		rmSync(join(root, ".git"), { recursive: true });
+		writeFileSync(join(root, ".git"), "gitdir: /definitely/missing\n");
+
+		expect(() => ProjectIdentityStore.open(nested)).toThrow(PROJECT_IDENTITY_INVALID_ERROR);
+		expect(existsSync(bindingPath(nested))).toBe(false);
+		expect(existsSync(bindingPath(root))).toBe(false);
+	});
+
+	it("fails closed in a real repository when the git probe fails", () => {
+		const root = initGit();
+		const nested = join(root, "packages", "app");
+		mkdirSync(nested, { recursive: true });
+		const originalGitDir = process.env.GIT_DIR;
+		try {
+			process.env.GIT_DIR = join(root, "missing-git-dir");
+			expect(() => ProjectIdentityStore.open(nested)).toThrow(PROJECT_IDENTITY_INVALID_ERROR);
+		} finally {
+			if (originalGitDir === undefined) Reflect.deleteProperty(process.env, "GIT_DIR");
+			else process.env.GIT_DIR = originalGitDir;
+		}
+
+		expect(existsSync(bindingPath(nested))).toBe(false);
+		expect(existsSync(bindingPath(root))).toBe(false);
 	});
 
 	it("does not infer identity after moving a project without a remote", () => {
@@ -239,6 +283,60 @@ describe("ProjectIdentityStore", () => {
 		expect(existsSync(join(directory, ".project.lock"))).toBe(false);
 	});
 
+	it.each(["", '{"token":'])("recovers a stale malformed lock: %j", (content) => {
+		const root = initGit();
+		const directory = join(root, ".omp", "compliance");
+		const lockPath = join(directory, ".project.lock");
+		mkdirSync(directory, { recursive: true });
+		writeFileSync(lockPath, content);
+		const staleTime = new Date(Date.now() - 60_000);
+		utimesSync(lockPath, staleTime, staleTime);
+
+		const result = ProjectIdentityStore.open(root);
+
+		expect(result.status).toBe("bound");
+		expect(existsSync(lockPath)).toBe(false);
+	});
+
+	it("does not remove a recent malformed lock while its creator may still be writing", async () => {
+		const root = initGit();
+		const directory = join(root, ".omp", "compliance");
+		const lockPath = join(directory, ".project.lock");
+		mkdirSync(directory, { recursive: true });
+		writeFileSync(lockPath, '{"token":');
+		const before = statSync(lockPath);
+		const modulePath = join(import.meta.dir, "../../src/project/project-identity.ts");
+		const script = `import { ProjectIdentityStore } from ${JSON.stringify(modulePath)}; ProjectIdentityStore.open(${JSON.stringify(root)});`;
+		const child = Bun.spawn([process.execPath, "-e", script], { stderr: "pipe", stdout: "pipe" });
+		await Bun.sleep(100);
+		const after = statSync(lockPath);
+		child.kill();
+		await child.exited;
+
+		expect(after.ino).toBe(before.ino);
+		expect(after.mtimeMs).toBe(before.mtimeMs);
+		expect(readFileSync(lockPath, "utf8")).toBe('{"token":');
+		expect(existsSync(bindingPath(root))).toBe(false);
+	});
+
+	it("recovers a stale lock whose PID belongs to a newer process instance", () => {
+		const root = initGit();
+		const directory = join(root, ".omp", "compliance");
+		const lockPath = join(directory, ".project.lock");
+		mkdirSync(directory, { recursive: true });
+		writeFileSync(
+			lockPath,
+			JSON.stringify({ token: randomUUID(), pid: process.pid, createdAt: new Date(0).toISOString() }),
+		);
+		const staleTime = new Date(0);
+		utimesSync(lockPath, staleTime, staleTime);
+
+		const result = ProjectIdentityStore.open(root);
+
+		expect(result.status).toBe("bound");
+		expect(existsSync(lockPath)).toBe(false);
+	});
+
 	it("does not recover a lock owned by a live process", async () => {
 		const root = initGit();
 		const directory = join(root, ".omp", "compliance");
@@ -255,6 +353,57 @@ describe("ProjectIdentityStore", () => {
 
 		expect(JSON.parse(readFileSync(lockPath, "utf8")).token).toBe(token);
 		expect(existsSync(bindingPath(root))).toBe(false);
+	});
+
+	it("fails closed if the storage directories are replaced while waiting for the lock", async () => {
+		const root = initGit();
+		const ompDirectory = join(root, ".omp");
+		const directory = join(ompDirectory, "compliance");
+		mkdirSync(directory, { recursive: true });
+		writeFileSync(
+			join(directory, ".project.lock"),
+			JSON.stringify({ token: randomUUID(), pid: process.pid, createdAt: new Date().toISOString() }),
+		);
+		const modulePath = join(import.meta.dir, "../../src/project/project-identity.ts");
+		const script = `import { ProjectIdentityStore } from ${JSON.stringify(modulePath)}; ProjectIdentityStore.open(${JSON.stringify(root)});`;
+		const child = Bun.spawn([process.execPath, "-e", script], { stderr: "pipe", stdout: "pipe" });
+		await Bun.sleep(100);
+		renameSync(ompDirectory, join(root, ".omp-replaced"));
+		mkdirSync(directory, { recursive: true });
+		const stderr = await new Response(child.stderr).text();
+		const exitCode = await child.exited;
+
+		expect(exitCode).not.toBe(0);
+		expect(stderr).toContain(PROJECT_IDENTITY_INVALID_ERROR);
+		expect(existsSync(bindingPath(root))).toBe(false);
+	});
+
+	it("does not clobber a binding that appears while another opener waits", async () => {
+		const root = initGit();
+		const directory = join(root, ".omp", "compliance");
+		const lockPath = join(directory, ".project.lock");
+		mkdirSync(directory, { recursive: true });
+		writeFileSync(
+			lockPath,
+			JSON.stringify({ token: randomUUID(), pid: process.pid, createdAt: new Date().toISOString() }),
+		);
+		const expected = {
+			schemaVersion: 1,
+			projectId: randomUUID(),
+			canonicalRoot: realpathSync(root),
+			createdAt: new Date().toISOString(),
+		} as const;
+		const modulePath = join(import.meta.dir, "../../src/project/project-identity.ts");
+		const script = `import { ProjectIdentityStore } from ${JSON.stringify(modulePath)}; console.log(ProjectIdentityStore.open(${JSON.stringify(root)}).binding.projectId);`;
+		const child = Bun.spawn([process.execPath, "-e", script], { stderr: "pipe", stdout: "pipe" });
+		await Bun.sleep(100);
+		writeFileSync(bindingPath(root), `${JSON.stringify(expected)}\n`);
+		const stdout = await new Response(child.stdout).text();
+
+		expect(await child.exited).toBe(0);
+		expect(stdout.trim()).toBe(expected.projectId);
+		expect(readBinding(root)).toEqual(expected);
+		expect(existsSync(lockPath)).toBe(true);
 	});
 });
 
@@ -286,6 +435,20 @@ describe("normalizeRemoteIdentity", () => {
 		);
 	});
 
+	it("preserves non-git SSH users without breaking git and HTTPS compatibility", () => {
+		const alice = normalizeRemoteIdentity("alice@git.example.com:repos/widget.git");
+		const bob = normalizeRemoteIdentity("ssh://bob@git.example.com/repos/widget.git");
+		const git = normalizeRemoteIdentity("git@git.example.com:repos/widget.git");
+		const https = normalizeRemoteIdentity("https://git.example.com/repos/widget.git");
+
+		expect(alice).toBe("alice@git.example.com/repos/widget");
+		expect(bob).toBe("bob@git.example.com/repos/widget");
+		expect(alice).not.toBe(bob);
+		expect(git).toBe(https);
+		expect(normalizeRemoteIdentity(alice as string)).toBe(alice);
+		expect(normalizeRemoteIdentity(bob as string)).toBe(bob);
+	});
+
 	it.each([
 		"https://user:password@host.example/org/repo.git",
 		"user:password@host.example:org/repo.git",
@@ -310,25 +473,18 @@ describe("normalizeRemoteIdentity", () => {
 });
 
 describe("createProjectContext", () => {
-	it("derives an immutable narrow context from a validated binding", () => {
-		const root = realpathSync(tempProject());
-		const binding: ProjectBinding = {
-			schemaVersion: 1,
-			projectId: randomUUID(),
-			canonicalRoot: root,
-			gitRemoteIdentity: "github.com/acme/widget",
-			codebaseProjectId: "codebase-acme-widget",
-			createdAt: new Date().toISOString(),
-		};
-		const cwd = join(root, "packages", "app");
+	it("derives an immutable narrow context from a bound store result", () => {
+		const root = initGit("https://github.com/acme/widget.git");
+		const identity = ProjectIdentityStore.open(root, { codebaseProjectId: "codebase-acme-widget" });
+		const cwd = join(identity.binding.canonicalRoot, "packages", "app");
 		const sessionId = randomUUID();
 		mkdirSync(cwd, { recursive: true });
 
-		const context = createProjectContext(binding, sessionId, cwd);
+		const context = createProjectContext(identity, sessionId, cwd);
 
 		expect(context).toEqual({
-			projectId: binding.projectId,
-			root,
+			projectId: identity.binding.projectId,
+			root: identity.binding.canonicalRoot,
 			remote: "github.com/acme/widget",
 			codebaseProject: "codebase-acme-widget",
 			sessionId,
@@ -338,80 +494,84 @@ describe("createProjectContext", () => {
 		expect("switchProject" in context).toBe(false);
 	});
 
-	it.each([
-		["projectId", "not-a-uuid"],
-		["canonicalRoot", "relative/path"],
-		["gitRemoteIdentity", "https://user:secret@github.com/acme/widget.git"],
-		["gitRemoteIdentity", "github.com/acme/%252Fwidget"],
-		["codebaseProjectId", ""],
-		["createdAt", "yesterday"],
-	])("rejects an invalid binding field %s", (field, value) => {
+	it("rejects a bare ProjectBinding", () => {
 		const root = realpathSync(tempProject());
-		const binding = {
+		const binding: ProjectBinding = {
 			schemaVersion: 1,
 			projectId: randomUUID(),
 			canonicalRoot: root,
-			gitRemoteIdentity: "github.com/acme/widget",
-			codebaseProjectId: "codebase-acme-widget",
 			createdAt: new Date().toISOString(),
-			[field]: value,
-		} as never;
+		};
 
-		expect(() => createProjectContext(binding, randomUUID(), root)).toThrow("OMP project context is invalid");
+		expect(() => createProjectContext(binding as never, randomUUID(), root)).toThrow("OMP project context is invalid");
+	});
+
+	it("rejects an unbranded copy of a bound result", () => {
+		const root = initGit();
+		const identity = ProjectIdentityStore.open(root);
+
+		expect(() => createProjectContext({ ...identity }, randomUUID(), identity.observedRoot)).toThrow(
+			"OMP project context is invalid",
+		);
+	});
+
+	it("rejects a genuine rebind_required result", () => {
+		const original = initGit("git@github.com:acme/widget.git");
+		ProjectIdentityStore.open(original);
+		const moved = `${original}-context-moved`;
+		renameSync(original, moved);
+		cleanup.splice(cleanup.indexOf(original), 1, moved);
+		const identity = ProjectIdentityStore.open(moved);
+
+		expect(identity.status).toBe("rebind_required");
+		expect(() => createProjectContext(identity, randomUUID(), moved)).toThrow("OMP project context is invalid");
+	});
+
+	it("rejects a genuine project_mismatch result", () => {
+		const root = initGit("https://github.com/acme/widget.git");
+		ProjectIdentityStore.open(root);
+		git(root, "remote", "set-url", "origin", "https://github.com/acme/other.git");
+		const identity = ProjectIdentityStore.open(root);
+
+		expect(identity.status).toBe("project_mismatch");
+		expect(() => createProjectContext(identity, randomUUID(), root)).toThrow("OMP project context is invalid");
 	});
 
 	it("rejects a cwd outside the binding root", () => {
-		const root = realpathSync(tempProject());
+		const root = initGit();
+		const identity = ProjectIdentityStore.open(root);
 		const outside = realpathSync(tempProject());
-		const binding: ProjectBinding = {
-			schemaVersion: 1,
-			projectId: randomUUID(),
-			canonicalRoot: root,
-			createdAt: new Date().toISOString(),
-		};
 
-		expect(() => createProjectContext(binding, randomUUID(), outside)).toThrow("OMP project context is invalid");
+		expect(() => createProjectContext(identity, randomUUID(), outside)).toThrow("OMP project context is invalid");
+	});
+
+	it("accepts a native absolute cwd and canonicalizes it after realpath", () => {
+		const root = initGit();
+		const identity = ProjectIdentityStore.open(root);
+		const expectedCwd = join(identity.binding.canonicalRoot, "packages", "app");
+		mkdirSync(expectedCwd, { recursive: true });
+		const nativeCwd = `${identity.binding.canonicalRoot}${sep}packages${sep}..${sep}packages${sep}app`;
+
+		const context = createProjectContext(identity, randomUUID(), nativeCwd);
+
+		expect(context.cwd).toBe(realpathSync(expectedCwd).split(sep).join("/"));
 	});
 
 	it("rejects a cwd symlink that escapes the binding root", () => {
-		const root = realpathSync(tempProject());
+		const root = initGit();
+		const identity = ProjectIdentityStore.open(root);
 		const outside = realpathSync(tempProject());
-		const escaped = join(root, "escaped");
+		const escaped = join(identity.binding.canonicalRoot, "escaped");
 		symlinkSync(outside, escaped, process.platform === "win32" ? "junction" : "dir");
-		const binding: ProjectBinding = {
-			schemaVersion: 1,
-			projectId: randomUUID(),
-			canonicalRoot: root,
-			createdAt: new Date().toISOString(),
-		};
 
-		expect(() => createProjectContext(binding, randomUUID(), escaped)).toThrow("OMP project context is invalid");
+		expect(() => createProjectContext(identity, randomUUID(), escaped)).toThrow("OMP project context is invalid");
 	});
 
 	it.each(["not-a-uuid", {}])("rejects an invalid session id", (sessionId) => {
-		const root = realpathSync(tempProject());
-		const binding: ProjectBinding = {
-			schemaVersion: 1,
-			projectId: randomUUID(),
-			canonicalRoot: root,
-			createdAt: new Date().toISOString(),
-		};
+		const root = initGit();
+		const identity = ProjectIdentityStore.open(root);
 
-		expect(() => createProjectContext(binding, sessionId as never, root)).toThrow("OMP project context is invalid");
-	});
-
-	it("rejects a binding whose identity is supplied by an accessor", () => {
-		const root = realpathSync(tempProject());
-		const binding = {
-			schemaVersion: 1,
-			get projectId() {
-				return randomUUID();
-			},
-			canonicalRoot: root,
-			createdAt: new Date().toISOString(),
-		} as ProjectBinding;
-
-		expect(() => createProjectContext(binding, randomUUID(), root)).toThrow("OMP project context is invalid");
+		expect(() => createProjectContext(identity, sessionId as never, root)).toThrow("OMP project context is invalid");
 	});
 
 	it("does not expose Task 9 internals from the package root", async () => {

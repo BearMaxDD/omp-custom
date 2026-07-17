@@ -4,18 +4,18 @@ import {
 	constants,
 	closeSync,
 	existsSync,
+	fstatSync,
 	fsyncSync,
+	linkSync,
 	lstatSync,
 	mkdirSync,
 	openSync,
 	readFileSync,
 	realpathSync,
-	renameSync,
-	rmSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { isAbsolute, join, normalize, sep } from "node:path";
+import { dirname, isAbsolute, join, normalize, sep } from "node:path";
 
 export const PROJECT_IDENTITY_INVALID_ERROR = "OMP project identity is invalid; compliance activation refused";
 
@@ -44,8 +44,11 @@ export interface ProjectIdentityOpenOptions {
 
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const LOCK_WAIT_MS = 5_000;
+const LOCK_RECOVERY_GRACE_MS = 1_000;
+const LOCK_TIMESTAMP_TOLERANCE_MS = 5_000;
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
 const SLEEP_BUFFER = new Int32Array(new SharedArrayBuffer(4));
+const PROJECT_IDENTITY_RESULTS = new WeakSet<object>();
 const BINDING_KEYS = new Set([
 	"schemaVersion",
 	"projectId",
@@ -62,6 +65,36 @@ interface LockOwner {
 	readonly createdAt: string;
 }
 
+interface LockSnapshot {
+	readonly dev: number;
+	readonly ino: number;
+	readonly mtimeMs: number;
+	readonly size: number;
+	readonly owner?: LockOwner;
+}
+
+interface FileNodeIdentity {
+	readonly dev: number;
+	readonly ino: number;
+}
+
+interface FileIdentity extends FileNodeIdentity {
+	readonly mtimeMs: number;
+	readonly size: number;
+}
+
+interface DirectoryIdentity {
+	readonly path: string;
+	readonly realpath: string;
+	readonly dev: number;
+	readonly ino: number;
+}
+
+interface StorageIdentity {
+	readonly omp: DirectoryIdentity;
+	readonly compliance: DirectoryIdentity;
+}
+
 // biome-ignore lint/complexity/noStaticOnlyClass: The plan specifies a named ProjectIdentityStore.open boundary.
 export class ProjectIdentityStore {
 	static open(cwd: string, options: ProjectIdentityOpenOptions = {}): ProjectIdentityResult {
@@ -75,13 +108,19 @@ export class ProjectIdentityStore {
 		const existing = readBindingIfPresent(filePath);
 		const binding = existing ?? createBindingAtomically(filePath, observedRoot, observedRemote, codebaseProjectId);
 
-		return Object.freeze({
+		const result = Object.freeze({
 			status: compareBinding(binding, observedRoot, observedRemote, codebaseProjectId),
 			binding,
 			observedRoot,
 			...(observedRemote === undefined ? {} : { observedRemote }),
 		});
+		PROJECT_IDENTITY_RESULTS.add(result);
+		return result;
 	}
+}
+
+export function isBoundProjectIdentityResult(value: unknown): value is ProjectIdentityResult {
+	return isRecord(value) && PROJECT_IDENTITY_RESULTS.has(value) && value.status === "bound";
 }
 
 function canonicalPath(path: string): string {
@@ -92,6 +131,7 @@ function runGit(cwd: string, args: string[]): string | undefined {
 	try {
 		return execFileSync("git", ["-C", cwd, ...args], {
 			encoding: "utf8",
+			env: process.env,
 			stdio: ["ignore", "pipe", "ignore"],
 		}).trim();
 	} catch {
@@ -101,7 +141,24 @@ function runGit(cwd: string, args: string[]): string | undefined {
 
 function findGitRoot(cwd: string): string | undefined {
 	const root = runGit(cwd, ["rev-parse", "--show-toplevel"]);
-	return root ? canonicalPath(root) : undefined;
+	if (root) return canonicalPath(root);
+	if (hasGitMarker(cwd)) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
+	return undefined;
+}
+
+function hasGitMarker(cwd: string): boolean {
+	let current = cwd;
+	while (true) {
+		try {
+			lstatSync(join(current, ".git"));
+			return true;
+		} catch (error) {
+			if (!isNotFound(error)) throw new Error(PROJECT_IDENTITY_INVALID_ERROR, { cause: error });
+		}
+		const parent = dirname(current);
+		if (parent === current) return false;
+		current = parent;
+	}
 }
 
 function readGitRemoteIdentity(root: string): string | undefined {
@@ -127,21 +184,28 @@ export function normalizeRemoteIdentity(remoteUrl: string): string | undefined {
 
 	let host: string;
 	let path: string;
-	const canonical = trimmed.match(/^(\[[0-9A-Fa-f:.]+\](?::\d+)?|[A-Za-z0-9.-]+(?::\d+)?)\/(.+)$/);
-	if (canonical?.[1] && canonical[2]) {
-		host = canonical[1].toLowerCase();
-		path = canonical[2];
+	let sshUsername: string | undefined;
+	const canonical = trimmed.match(
+		/^(?:([A-Za-z0-9._-]+)@)?(\[[0-9A-Fa-f:.]+\](?::\d+)?|[A-Za-z0-9.-]+(?::\d+)?)\/(.+)$/,
+	);
+	if (canonical?.[2] && canonical[3]) {
+		sshUsername = canonical[1];
+		host = canonical[2].toLowerCase();
+		path = canonical[3];
 	} else if (!trimmed.includes("://")) {
-		const scpLike = trimmed.match(/^(?:[A-Za-z0-9._-]+@)?(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):([^?#]+)$/);
-		if (!scpLike?.[1] || !scpLike[2] || scpLike[2].includes("@")) return undefined;
-		host = scpLike[1].toLowerCase();
-		path = scpLike[2];
+		const scpLike = trimmed.match(/^(?:([A-Za-z0-9._-]+)@)?(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):([^?#]+)$/);
+		if (!scpLike?.[2] || !scpLike[3] || scpLike[3].includes("@")) return undefined;
+		sshUsername = scpLike[1];
+		host = scpLike[2].toLowerCase();
+		path = scpLike[3];
 	} else {
 		try {
 			const parsed = new URL(trimmed);
 			if (!(["https:", "http:", "ssh:", "git:"] as const).includes(parsed.protocol as never)) return undefined;
 			if (parsed.password || (parsed.username && parsed.protocol !== "ssh:") || parsed.search || parsed.hash)
 				return undefined;
+			if (parsed.username && !/^[A-Za-z0-9._-]+$/.test(parsed.username)) return undefined;
+			sshUsername = parsed.username || undefined;
 			host = parsed.hostname.toLowerCase();
 			if (!host) return undefined;
 			const defaultPort = parsed.protocol === "ssh:" ? "22" : undefined;
@@ -165,7 +229,8 @@ export function normalizeRemoteIdentity(remoteUrl: string): string | undefined {
 		}
 		segments[segments.length - 1] = segments.at(-1)?.replace(/\.git$/i, "") ?? "";
 		if (!segments.at(-1)) return undefined;
-		return `${host}/${segments.join("/")}`;
+		const userPrefix = sshUsername && sshUsername !== "git" ? `${sshUsername}@` : "";
+		return `${userPrefix}${host}/${segments.join("/")}`;
 	} catch {
 		return undefined;
 	}
@@ -180,8 +245,9 @@ function createBindingAtomically(
 	const directory = join(canonicalRoot, ".omp", "compliance");
 	const lockPath = join(directory, ".project.lock");
 	prepareStorageDirectory(canonicalRoot);
+	const storageIdentity = captureStorageIdentity(canonicalRoot);
 	assertStoragePathSafe(canonicalRoot);
-	const lockOwner = acquireLock(lockPath, filePath, canonicalRoot);
+	const lockOwner = acquireLock(lockPath, filePath, canonicalRoot, storageIdentity);
 	if (!lockOwner) {
 		const concurrentBinding = readBindingIfPresent(filePath);
 		if (concurrentBinding) return concurrentBinding;
@@ -201,49 +267,92 @@ function createBindingAtomically(
 			createdAt: new Date().toISOString(),
 		});
 		const temporaryPath = join(directory, `.project.${randomUUID()}.tmp`);
+		let publishedBinding = binding;
+		let temporaryNode: FileNodeIdentity | undefined;
 
 		try {
+			assertStorageIdentity(storageIdentity);
 			const fd = openSync(temporaryPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | NO_FOLLOW, 0o600);
 			try {
+				const opened = fstatSync(fd);
+				temporaryNode = Object.freeze({ dev: opened.dev, ino: opened.ino });
+				assertStorageIdentity(storageIdentity);
 				writeFileSync(fd, `${JSON.stringify(binding, null, 2)}\n`, "utf8");
 				fsyncSync(fd);
+				assertStorageIdentity(storageIdentity);
 			} finally {
 				closeSync(fd);
 			}
+			const temporaryIdentity = captureRegularFileIdentity(temporaryPath, temporaryNode);
+			assertStorageIdentity(storageIdentity);
 			assertStoragePathSafe(canonicalRoot);
-			renameSync(temporaryPath, filePath);
-			fsyncDirectory(directory);
+			assertRegularFileIdentity(temporaryPath, temporaryIdentity);
+			let linked = false;
+			try {
+				linkSync(temporaryPath, filePath);
+				linked = true;
+			} catch (error) {
+				if (!isAlreadyExists(error)) throw error;
+				const competingBinding = readBindingIfPresent(filePath);
+				if (!competingBinding) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
+				publishedBinding = competingBinding;
+			}
+			if (linked) assertRegularFileIdentity(filePath, temporaryIdentity);
+			assertStorageIdentity(storageIdentity);
+			fsyncDirectory(directory, storageIdentity.compliance);
+			assertStorageIdentity(storageIdentity);
 		} finally {
-			rmSync(temporaryPath, { force: true });
+			if (temporaryNode) removeFileNodeIfUnchanged(temporaryPath, temporaryNode);
 		}
 
-		return binding;
+		return publishedBinding;
 	} finally {
 		removeLockIfOwned(lockPath, lockOwner.token);
 	}
 }
 
-function acquireLock(lockPath: string, filePath: string, canonicalRoot: string): LockOwner | undefined {
+function acquireLock(
+	lockPath: string,
+	filePath: string,
+	canonicalRoot: string,
+	storageIdentity: StorageIdentity,
+): LockOwner | undefined {
 	const deadline = Date.now() + LOCK_WAIT_MS;
 	while (true) {
+		assertStorageIdentity(storageIdentity);
 		assertStoragePathSafe(canonicalRoot);
 		const owner = Object.freeze({ token: randomUUID(), pid: process.pid, createdAt: new Date().toISOString() });
+		let createdLock = false;
 		try {
 			const fd = openSync(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | NO_FOLLOW, 0o600);
+			createdLock = true;
 			try {
 				writeFileSync(fd, `${JSON.stringify(owner)}\n`, "utf8");
 				fsyncSync(fd);
 			} finally {
 				closeSync(fd);
 			}
+			assertStorageIdentity(storageIdentity);
 			return owner;
 		} catch (error) {
+			if (createdLock) {
+				removeLockIfOwned(lockPath, owner.token);
+				throw error;
+			}
 			if (!isAlreadyExists(error)) throw error;
 			if (existsSync(filePath)) return undefined;
-			const existingOwner = readLockOwner(lockPath);
-			if (existingOwner && !isProcessAlive(existingOwner.pid)) {
-				removeLockIfOwned(lockPath, existingOwner.token);
-				continue;
+			const snapshot = readLockSnapshot(lockPath);
+			if (snapshot) {
+				const ageMs = Date.now() - snapshot.mtimeMs;
+				if (snapshot.owner && !isProcessAlive(snapshot.owner.pid)) {
+					if (removeLockIfUnchanged(lockPath, snapshot)) continue;
+				} else if (
+					ageMs >= LOCK_RECOVERY_GRACE_MS &&
+					(!snapshot.owner || !isLockOwnerCurrent(snapshot.owner, snapshot)) &&
+					removeLockIfUnchanged(lockPath, snapshot)
+				) {
+					continue;
+				}
 			}
 			if (Date.now() >= deadline) throw new Error("Timed out acquiring OMP project identity lock");
 			Atomics.wait(SLEEP_BUFFER, 0, 0, 10);
@@ -305,6 +414,47 @@ function prepareStorageDirectory(canonicalRoot: string): void {
 	assertDirectoryNotLink(complianceDirectory);
 }
 
+function captureStorageIdentity(canonicalRoot: string): StorageIdentity {
+	return Object.freeze({
+		omp: captureDirectoryIdentity(join(canonicalRoot, ".omp")),
+		compliance: captureDirectoryIdentity(join(canonicalRoot, ".omp", "compliance")),
+	});
+}
+
+function captureDirectoryIdentity(path: string): DirectoryIdentity {
+	try {
+		const stats = lstatSync(path);
+		if (stats.isSymbolicLink() || !stats.isDirectory()) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
+		return Object.freeze({ path, realpath: canonicalPath(path), dev: stats.dev, ino: stats.ino });
+	} catch (error) {
+		if (error instanceof Error && error.message === PROJECT_IDENTITY_INVALID_ERROR) throw error;
+		throw new Error(PROJECT_IDENTITY_INVALID_ERROR, { cause: error });
+	}
+}
+
+function assertStorageIdentity(identity: StorageIdentity): void {
+	assertDirectoryIdentity(identity.omp);
+	assertDirectoryIdentity(identity.compliance);
+}
+
+function assertDirectoryIdentity(identity: DirectoryIdentity): void {
+	try {
+		const stats = lstatSync(identity.path);
+		if (
+			stats.isSymbolicLink() ||
+			!stats.isDirectory() ||
+			stats.dev !== identity.dev ||
+			stats.ino !== identity.ino ||
+			canonicalPath(identity.path) !== identity.realpath
+		) {
+			throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
+		}
+	} catch (error) {
+		if (error instanceof Error && error.message === PROJECT_IDENTITY_INVALID_ERROR) throw error;
+		throw new Error(PROJECT_IDENTITY_INVALID_ERROR, { cause: error });
+	}
+}
+
 function createDirectoryIfMissing(path: string): void {
 	try {
 		mkdirSync(path);
@@ -344,6 +494,42 @@ function assertRegularFileOrMissing(path: string): void {
 	}
 }
 
+function captureRegularFileIdentity(path: string, expectedNode: FileNodeIdentity): FileIdentity {
+	try {
+		const stats = lstatSync(path);
+		if (stats.isSymbolicLink() || !stats.isFile() || stats.dev !== expectedNode.dev || stats.ino !== expectedNode.ino) {
+			throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
+		}
+		return Object.freeze({ dev: stats.dev, ino: stats.ino, mtimeMs: stats.mtimeMs, size: stats.size });
+	} catch (error) {
+		if (error instanceof Error && error.message === PROJECT_IDENTITY_INVALID_ERROR) throw error;
+		throw new Error(PROJECT_IDENTITY_INVALID_ERROR, { cause: error });
+	}
+}
+
+function assertRegularFileIdentity(path: string, identity: FileIdentity): void {
+	try {
+		const stats = lstatSync(path);
+		if (stats.isSymbolicLink() || !stats.isFile() || !sameFileIdentity(identity, stats)) {
+			throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
+		}
+	} catch (error) {
+		if (error instanceof Error && error.message === PROJECT_IDENTITY_INVALID_ERROR) throw error;
+		throw new Error(PROJECT_IDENTITY_INVALID_ERROR, { cause: error });
+	}
+}
+
+function removeFileNodeIfUnchanged(path: string, identity: FileNodeIdentity): void {
+	try {
+		const stats = lstatSync(path);
+		if (!stats.isSymbolicLink() && stats.isFile() && stats.dev === identity.dev && stats.ino === identity.ino) {
+			unlinkSync(path);
+		}
+	} catch {
+		// Best-effort cleanup must not remove a replacement path.
+	}
+}
+
 function readLockOwner(lockPath: string): LockOwner | undefined {
 	let fd: number | undefined;
 	try {
@@ -367,9 +553,69 @@ function readLockOwner(lockPath: string): LockOwner | undefined {
 	}
 }
 
+function readLockSnapshot(lockPath: string): LockSnapshot | undefined {
+	try {
+		const before = lstatSync(lockPath);
+		if (before.isSymbolicLink() || !before.isFile()) return undefined;
+		const owner = readLockOwner(lockPath);
+		const after = lstatSync(lockPath);
+		if (!sameFileIdentity(before, after)) return undefined;
+		return Object.freeze({
+			dev: after.dev,
+			ino: after.ino,
+			mtimeMs: after.mtimeMs,
+			size: after.size,
+			...(owner === undefined ? {} : { owner }),
+		});
+	} catch {
+		return undefined;
+	}
+}
+
+function removeLockIfUnchanged(lockPath: string, snapshot: LockSnapshot): boolean {
+	try {
+		const current = lstatSync(lockPath);
+		if (!sameFileIdentity(snapshot, current)) return false;
+		unlinkSync(lockPath);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function sameFileIdentity(
+	left: Pick<LockSnapshot, "dev" | "ino" | "mtimeMs" | "size">,
+	right: Pick<LockSnapshot, "dev" | "ino" | "mtimeMs" | "size">,
+): boolean {
+	return left.dev === right.dev && left.ino === right.ino && left.mtimeMs === right.mtimeMs && left.size === right.size;
+}
+
+function isLockOwnerCurrent(owner: LockOwner, snapshot: LockSnapshot): boolean {
+	const createdAt = Date.parse(owner.createdAt);
+	if (Math.abs(createdAt - snapshot.mtimeMs) > LOCK_TIMESTAMP_TOLERANCE_MS) return false;
+	const processStartedAt = readProcessStartedAt(owner.pid);
+	return processStartedAt === undefined || processStartedAt <= createdAt + LOCK_TIMESTAMP_TOLERANCE_MS;
+}
+
+function readProcessStartedAt(pid: number): number | undefined {
+	if (pid === process.pid) return Date.now() - process.uptime() * 1_000;
+	if (process.platform === "win32") return undefined;
+	try {
+		const output = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+		}).trim();
+		const timestamp = Date.parse(output);
+		return Number.isNaN(timestamp) ? undefined : timestamp;
+	} catch {
+		return undefined;
+	}
+}
+
 function removeLockIfOwned(lockPath: string, token: string): void {
 	try {
-		if (readLockOwner(lockPath)?.token === token) unlinkSync(lockPath);
+		const snapshot = readLockSnapshot(lockPath);
+		if (snapshot?.owner?.token === token) removeLockIfUnchanged(lockPath, snapshot);
 	} catch {
 		// Lock cleanup is best-effort and must never remove another owner's lock.
 	}
@@ -384,17 +630,23 @@ function isProcessAlive(pid: number): boolean {
 	}
 }
 
-function fsyncDirectory(directory: string): void {
+function fsyncDirectory(directory: string, identity: DirectoryIdentity): void {
+	assertDirectoryIdentity(identity);
 	try {
-		const fd = openSync(directory, constants.O_RDONLY);
+		const fd = openSync(directory, constants.O_RDONLY | NO_FOLLOW);
 		try {
+			const before = fstatSync(fd);
+			if (before.dev !== identity.dev || before.ino !== identity.ino) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
 			fsyncSync(fd);
+			const after = fstatSync(fd);
+			if (after.dev !== identity.dev || after.ino !== identity.ino) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
 		} finally {
 			closeSync(fd);
 		}
 	} catch (error) {
 		if (process.platform !== "win32" || !hasErrorCode(error, ["EACCES", "EINVAL", "EISDIR", "EPERM"])) throw error;
 	}
+	assertDirectoryIdentity(identity);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

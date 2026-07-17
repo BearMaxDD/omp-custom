@@ -1,6 +1,6 @@
 import { realpathSync } from "node:fs";
 import { isAbsolute, normalize, relative, sep } from "node:path";
-import { type ProjectBinding, validateProjectBinding } from "./project-identity";
+import { type ProjectIdentityResult, isBoundProjectIdentityResult, validateProjectBinding } from "./project-identity";
 
 export interface ProjectContext {
 	readonly projectId: string;
@@ -15,15 +15,16 @@ const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f
 const PROJECT_CONTEXT_INVALID_ERROR = "OMP project context is invalid";
 
 export function createProjectContext(
-	binding: Readonly<ProjectBinding>,
+	identity: ProjectIdentityResult,
 	sessionId: string,
 	cwd: string,
 ): Readonly<ProjectContext> {
 	let canonicalCwd: string;
-	let validatedBinding: Readonly<ProjectBinding>;
+	let validatedBinding: ReturnType<typeof validateProjectBinding>;
 	try {
+		if (!isBoundProjectIdentityResult(identity)) throw new Error(PROJECT_CONTEXT_INVALID_ERROR);
 		canonicalCwd = canonicalPath(cwd);
-		validatedBinding = validateProjectBinding(binding);
+		validatedBinding = validateProjectBinding(identity.binding);
 		if (
 			!isUuid(sessionId) ||
 			canonicalPath(validatedBinding.canonicalRoot) !== validatedBinding.canonicalRoot ||
@@ -52,7 +53,7 @@ function isUuid(value: unknown): value is string {
 }
 
 function canonicalPath(value: unknown): string {
-	if (typeof value !== "string" || !isAbsolute(value) || normalize(value).split(sep).join("/") !== value) {
+	if (typeof value !== "string" || !isAbsolute(value)) {
 		throw new Error(PROJECT_CONTEXT_INVALID_ERROR);
 	}
 	return normalize(realpathSync(value)).split(sep).join("/");
