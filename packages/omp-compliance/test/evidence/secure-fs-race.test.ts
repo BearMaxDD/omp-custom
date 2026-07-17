@@ -115,4 +115,34 @@ describe.skipIf(process.platform === "win32")("Evidence secure filesystem", () =
 		expect(physicalEvents).toHaveLength(1);
 		expect(log.readAll().filter((event) => event.eventId === "crash-event")).toHaveLength(1);
 	});
+
+	it("截断恢复落盘后进程崩溃时重试仍保留 recovery 和新事件各一次", async () => {
+		const root = temporaryRoot();
+		const path = join(root, "events.jsonl");
+		const ready = join(root, "ready");
+		writeFileSync(path, '{"eventId":"valid","type":"first"}\n{"eventId":"broken', "utf8");
+		const script = `
+			import { writeFileSync } from "node:fs";
+			import { EventLog } from ${JSON.stringify(eventLogModule)};
+			import { setSecureFsTestHook } from ${JSON.stringify(secureFsModule)};
+			setSecureFsTestHook((event) => {
+				if (event.stage !== "tail_recovered") return;
+				writeFileSync(process.argv[2], "ready");
+				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+			});
+			new EventLog(process.argv[1]).append({ eventId: "good-after-tail", type: "completion" });
+		`;
+		const child = Bun.spawn([process.execPath, "-e", script, path, ready], { stderr: "pipe" });
+		const deadline = Date.now() + 5_000;
+		while (!existsSync(ready) && Date.now() < deadline) await Bun.sleep(10);
+		expect(existsSync(ready)).toBeTrue();
+		child.kill("SIGKILL");
+		await child.exited;
+
+		const log = new EventLog(path);
+		log.append({ eventId: "good-after-tail", type: "completion" });
+		const physicalLines = readFileSync(path, "utf8").split("\n");
+		expect(physicalLines.filter((line) => line.includes('"type":"recovery_truncated_tail"'))).toHaveLength(1);
+		expect(physicalLines.filter((line) => line.includes('"eventId":"good-after-tail"'))).toHaveLength(1);
+	});
 });

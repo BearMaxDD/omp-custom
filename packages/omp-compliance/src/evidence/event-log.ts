@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { SecurePathScope, secureFileName } from "./secure-fs";
+import { SecurePathScope, type SecureRecoveryRecord, secureFileName } from "./secure-fs";
 
 export interface EvidenceEvent {
 	eventId: string;
@@ -45,6 +45,11 @@ function recoveryEventFor(content: string, truncatedTail: string): EvidenceRecov
 		timestamp: new Date().toISOString(),
 		truncatedBytes: Buffer.byteLength(truncatedTail),
 	};
+}
+
+function recoveryRecordFor(content: string, truncatedTail: string): SecureRecoveryRecord {
+	const recovery = recoveryEventFor(content, truncatedTail);
+	return { eventId: recovery.eventId, content: Buffer.from(`${JSON.stringify(recovery)}\n`) };
 }
 
 function legacyEventIdFor(line: string): string {
@@ -94,7 +99,12 @@ export class EventLog<T extends EvidenceEvent = EvidenceEvent> {
 
 	append(event: T): void {
 		try {
-			this.scope.appendIdempotent(this.fileName, event.eventId, Buffer.from(`${JSON.stringify(event)}\n`));
+			this.scope.appendIdempotent(
+				this.fileName,
+				event.eventId,
+				Buffer.from(`${JSON.stringify(event)}\n`),
+				recoveryRecordFor,
+			);
 		} catch (error) {
 			if (error instanceof EvidencePersistenceError) throw error;
 			throw new EvidencePersistenceError("append_event", this.path, error);
@@ -113,10 +123,15 @@ export class EventLog<T extends EvidenceEvent = EvidenceEvent> {
 			const recovery = recoveryEventFor(result.content, result.parsed.truncatedTail);
 			if (!result.parsed.seen.has(recovery.eventId)) {
 				const prefix = result.content.endsWith("\n") ? "" : "\n";
+				const recoveryRecord = {
+					eventId: recovery.eventId,
+					content: Buffer.from(`${JSON.stringify(recovery)}\n`),
+				};
 				this.scope.appendIdempotent(
 					this.fileName,
 					recovery.eventId,
 					Buffer.from(`${prefix}${JSON.stringify(recovery)}\n`),
+					() => recoveryRecord,
 				);
 				result.parsed.events.push(recovery as unknown as T);
 			}

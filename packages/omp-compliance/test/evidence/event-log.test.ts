@@ -121,6 +121,33 @@ describe("EventLog", () => {
 		expect(readFileSync(path, "utf8").match(/recovery_truncated_tail/g)).toHaveLength(1);
 	});
 
+	it("截断后不调用 readAll 直接追加时恢复尾部且保留新事件", () => {
+		const path = join(temporaryRoot(), "events.jsonl");
+		writeFileSync(path, '{"eventId":"valid","type":"first"}\n{"eventId":"broken', "utf8");
+		const log = new EventLog<TestEvent>(path);
+
+		log.append({ eventId: "good-event", type: "completion" });
+
+		const events = log.readAll();
+		expect(events.map((event) => event.eventId)).toContain("good-event");
+		expect(events.filter((event) => event.type === "recovery_truncated_tail")).toHaveLength(1);
+		const physical = readFileSync(path, "utf8").split("\n");
+		expect(physical.filter((line) => line.includes('"eventId":"good-event"'))).toHaveLength(1);
+		expect(physical.filter((line) => line.includes('"type":"recovery_truncated_tail"'))).toHaveLength(1);
+	});
+
+	it("完整 JSON 仅缺换行时补换行且不生成 recovery", () => {
+		const path = join(temporaryRoot(), "events.jsonl");
+		writeFileSync(path, '{"eventId":"valid-no-newline","type":"first"}', "utf8");
+		const log = new EventLog<TestEvent>(path);
+
+		log.append({ eventId: "good-event", type: "completion" });
+
+		const events = log.readAll();
+		expect(events.map((event) => event.eventId)).toEqual(["valid-no-newline", "good-event"]);
+		expect(events.some((event) => event.type === "recovery_truncated_tail")).toBeFalse();
+	});
+
 	it("读取失败抛出包含稳定诊断字段的 EvidencePersistenceError", () => {
 		const path = join(temporaryRoot(), "events.jsonl");
 		mkdirSync(path);
@@ -179,5 +206,33 @@ describe("EventLog", () => {
 			.split("\n")
 			.filter((line) => line.includes('"eventId":"shared-event"'));
 		expect(physicalEvents).toHaveLength(1);
+	});
+
+	it("多进程同时向截断日志直接追加时 recovery 不重且所有新事件不丢", async () => {
+		const root = temporaryRoot();
+		const path = join(root, "events.jsonl");
+		const barrier = join(root, "start");
+		writeFileSync(path, '{"eventId":"valid","type":"first"}\n{"eventId":"broken', "utf8");
+		const script = `
+			import { existsSync } from "node:fs";
+			import { EventLog } from ${JSON.stringify(eventLogModule)};
+			while (!existsSync(process.argv[3])) await Bun.sleep(2);
+			new EventLog(process.argv[1]).append({ eventId: \`good-\${process.argv[2]}\`, type: "completion" });
+		`;
+		const children = Array.from({ length: 12 }, (_, index) =>
+			Bun.spawn([process.execPath, "-e", script, path, String(index), barrier], { stderr: "pipe" }),
+		);
+		writeFileSync(barrier, "start", "utf8");
+		for (const child of children) {
+			const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+			expect(stderr).toBe("");
+			expect(exitCode).toBe(0);
+		}
+
+		const physicalLines = readFileSync(path, "utf8").split("\n");
+		expect(physicalLines.filter((line) => line.includes('"type":"recovery_truncated_tail"'))).toHaveLength(1);
+		for (let index = 0; index < 12; index += 1) {
+			expect(physicalLines.filter((line) => line.includes(`"eventId":"good-${index}"`))).toHaveLength(1);
+		}
 	});
 });

@@ -26,7 +26,7 @@ export class SecureFsError extends Error {
 }
 
 export interface SecureFsTestEvent {
-	stage: "directory_opened" | "lock_acquired" | "claim_created" | "event_appended";
+	stage: "directory_opened" | "lock_acquired" | "claim_created" | "event_appended" | "tail_recovered";
 }
 
 let testHook: ((event: SecureFsTestEvent) => void) | undefined;
@@ -54,6 +54,7 @@ const posix = supportedPlatform
 			close: { args: [FFIType.i32], returns: FFIType.i32 },
 			write: { args: [FFIType.i32, FFIType.ptr, FFIType.u64], returns: FFIType.i64 },
 			read: { args: [FFIType.i32, FFIType.ptr, FFIType.u64], returns: FFIType.i64 },
+			pread: { args: [FFIType.i32, FFIType.ptr, FFIType.u64, FFIType.i64], returns: FFIType.i64 },
 			flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
 			lseek: { args: [FFIType.i32, FFIType.i64, FFIType.i32], returns: FFIType.i64 },
 			...(process.platform === "darwin"
@@ -277,6 +278,13 @@ export interface SecureLockedFile {
 	append(content: Buffer): void;
 }
 
+export interface SecureRecoveryRecord {
+	eventId: string;
+	content: Buffer;
+}
+
+export type SecureRecoveryFactory = (content: string, truncatedTail: string) => SecureRecoveryRecord;
+
 export class SecurePathScope {
 	private readonly components: string[];
 	private readonly anchorDepth: number;
@@ -357,7 +365,7 @@ export class SecurePathScope {
 		return this.withLockedFile(name, { createDirectory: false, createFile: false }, (file) => file.read());
 	}
 
-	appendIdempotent(name: string, eventId: string, content: Buffer): void {
+	appendIdempotent(name: string, eventId: string, content: Buffer, recoveryFactory: SecureRecoveryFactory): void {
 		assertComponent(name);
 		const directory = this.openDirectory(true);
 		if (directory === undefined) fail("open_directory");
@@ -395,14 +403,13 @@ export class SecurePathScope {
 			if (requirePosix().flock(directory, LOCK_UN) < 0) fail("lock_file");
 			directoryLocked = false;
 			testHook?.({ stage: "lock_acquired" });
+			this.recoverUnterminatedTail(logDescriptor, claimDirectory, recoveryFactory);
 
-			if (!claimCreated) {
-				const currentClaim = openAt(claimDirectory, claimName, constants.O_RDONLY | constants.O_NOFOLLOW);
-				try {
-					if (readAll(currentClaim).toString("utf8") === "done\n") return;
-				} finally {
-					closeQuietly(currentClaim);
-				}
+			const currentClaim = openAt(claimDirectory, claimName, constants.O_RDONLY | constants.O_NOFOLLOW);
+			try {
+				if (readAll(currentClaim).toString("utf8") === "done\n") return;
+			} finally {
+				closeQuietly(currentClaim);
 			}
 
 			if (claimCreated || !fileContainsEventId(logDescriptor, eventId)) {
@@ -421,6 +428,71 @@ export class SecurePathScope {
 			if (claimDirectory !== undefined) closeQuietly(claimDirectory);
 			closeQuietly(directory);
 		}
+	}
+
+	private recoverUnterminatedTail(
+		logDescriptor: number,
+		claimDirectory: number,
+		recoveryFactory: SecureRecoveryFactory,
+	): void {
+		const size = Number(requirePosix().lseek(logDescriptor, 0, SEEK_END));
+		if (size < 0) fail("read_file");
+		if (size === 0) return;
+
+		const finalByte = Buffer.allocUnsafe(1);
+		const bytesRead = Number(requirePosix().pread(logDescriptor, ptr(finalByte), 1, size - 1));
+		if (bytesRead !== 1) fail("read_file");
+		if (finalByte[0] === 0x0a) return;
+
+		const content = readAll(logDescriptor).toString("utf8");
+		const truncatedTail = content.slice(content.lastIndexOf("\n") + 1);
+		try {
+			JSON.parse(truncatedTail);
+			if (Number(requirePosix().lseek(logDescriptor, 0, SEEK_END)) < 0) fail("write_file");
+			writeAll(logDescriptor, Buffer.from("\n"));
+			if (requirePosix().fsync(logDescriptor) < 0) fail("sync_file");
+			return;
+		} catch (error) {
+			if (error instanceof SecureFsError) throw error;
+		}
+
+		const recovery = recoveryFactory(content, truncatedTail);
+		this.appendClaimedWhileLocked(
+			claimDirectory,
+			logDescriptor,
+			recovery.eventId,
+			Buffer.concat([Buffer.from("\n"), recovery.content]),
+		);
+		testHook?.({ stage: "tail_recovered" });
+	}
+
+	private appendClaimedWhileLocked(
+		claimDirectory: number,
+		logDescriptor: number,
+		eventId: string,
+		content: Buffer,
+	): void {
+		const claimName = `${createHash("sha256").update(eventId).digest("hex")}.claim`;
+		const claimCreated = createExclusiveAt(claimDirectory, claimName, Buffer.from("pending\n"));
+		if (claimCreated) {
+			if (requirePosix().fsync(claimDirectory) < 0) fail("sync_file");
+		} else {
+			const claimDescriptor = openAt(claimDirectory, claimName, constants.O_RDONLY | constants.O_NOFOLLOW);
+			try {
+				if (readAll(claimDescriptor).toString("utf8") === "done\n") return;
+			} finally {
+				closeQuietly(claimDescriptor);
+			}
+			if (fileContainsEventId(logDescriptor, eventId)) {
+				atomicReplaceAt(claimDirectory, claimName, Buffer.from("done\n"));
+				return;
+			}
+		}
+
+		if (Number(requirePosix().lseek(logDescriptor, 0, SEEK_END)) < 0) fail("write_file");
+		writeAll(logDescriptor, content);
+		if (requirePosix().fsync(logDescriptor) < 0) fail("sync_file");
+		atomicReplaceAt(claimDirectory, claimName, Buffer.from("done\n"));
 	}
 
 	atomicWrite(name: string, content: Buffer): void {
