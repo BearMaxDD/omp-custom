@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
+import { basename, dirname, join } from "node:path";
 import {
+	ClaimJournalCorruptionError,
 	EvidenceLogCorruptionError,
 	SecureFsError,
 	SecurePathScope,
@@ -74,6 +76,24 @@ function recoveryRecordFor(content: string, truncatedTail: string): SecureRecove
 
 function legacyEventIdFor(line: string): string {
 	return deterministicEvidenceEventId(`legacy_event\0${line}`);
+}
+
+function persistenceFailure(error: unknown, fallback: string): { path: string; cause: unknown } {
+	if (!(error instanceof SecureFsError) || !(error.cause instanceof ClaimJournalCorruptionError)) {
+		return { path: fallback, cause: error };
+	}
+	const journalPath = join(dirname(fallback), basename(error.cause.path));
+	const diagnostic = new ClaimJournalCorruptionError(
+		journalPath,
+		error.cause.line,
+		error.cause.offset,
+		error.cause.reason,
+		error.cause.cause,
+	);
+	return {
+		path: journalPath,
+		cause: new SecureFsError(error.operation, error.code, diagnostic),
+	};
 }
 
 interface ParsedEvents<T> {
@@ -157,7 +177,8 @@ export class EventLog<T extends EvidenceEvent = EvidenceEvent> {
 			);
 		} catch (error) {
 			if (error instanceof EvidencePersistenceError) throw error;
-			throw new EvidencePersistenceError("append_event", this.path, error);
+			const failure = persistenceFailure(error, this.path);
+			throw new EvidencePersistenceError("append_event", failure.path, failure.cause);
 		}
 	}
 
@@ -183,12 +204,13 @@ export class EventLog<T extends EvidenceEvent = EvidenceEvent> {
 					Buffer.from(`${prefix}${JSON.stringify(recovery)}\n`),
 					() => recoveryRecord,
 				);
-				result.parsed.events.push(recovery as unknown as T);
+				return this.readAll();
 			}
 			return result.parsed.events;
 		} catch (error) {
 			if (error instanceof EvidencePersistenceError) throw error;
-			throw new EvidencePersistenceError("read_event_log", this.path, error);
+			const failure = persistenceFailure(error, this.path);
+			throw new EvidencePersistenceError("read_event_log", failure.path, failure.cause);
 		}
 	}
 }

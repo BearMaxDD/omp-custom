@@ -14,6 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventLog, EvidencePersistenceError, deterministicEvidenceEventId } from "../../src/evidence/event-log";
+import * as secureFsSource from "../../src/evidence/secure-fs";
 import { type SecurePathScope, setSecureFsTestHook } from "../../src/evidence/secure-fs";
 
 interface TestEvent {
@@ -129,6 +130,26 @@ describe("EventLog", () => {
 
 		expect(log.readAll()).toEqual([event]);
 		expect(readFileSync(path, "utf8").trim().split("\n")).toHaveLength(1);
+	});
+
+	it("恢复事件已由竞争者持久化时返回值逐字段采用规范磁盘记录", () => {
+		const path = join(temporaryRoot(), "events.jsonl");
+		const original = `${JSON.stringify({ eventId: eventId("before-nested-recovery"), type: "valid" })}\n{"broken"`;
+		let persisted = original;
+		const scope = {
+			withLockedFile(_name: string, _options: unknown, operation: (file: { read(): Buffer }) => unknown) {
+				return operation({ read: () => Buffer.from(persisted) });
+			},
+			appendIdempotent(_name: string, _eventId: string, content: Buffer) {
+				const generated = JSON.parse(content.toString("utf8").trim()) as Record<string, unknown>;
+				const winner = { ...generated, timestamp: "2000-01-01T00:00:00.000Z", winner: "other-reader" };
+				persisted = `${original}\n${JSON.stringify(winner)}\n`;
+			},
+		} as unknown as SecurePathScope;
+
+		const result = new EventLog<TestEvent>(path, scope).readAll();
+		const persistedRecovery = JSON.parse(persisted.trim().split("\n").at(-1) as string);
+		expect(result.at(-1)).toEqual(persistedRecovery);
 	});
 
 	it("1000 个正常事件只使用单一追加式 claim journal 且不重写历史", () => {
@@ -414,6 +435,70 @@ describe("EventLog", () => {
 		expect(log.readAll().map((event) => event.eventId)).toEqual([firstEventId, secondEventId]);
 	});
 
+	it("claim journal 完整损坏行返回 journal 路径和稳定字节位置", () => {
+		const root = temporaryRoot();
+		const path = join(root, "events.jsonl");
+		const journalPath = join(root, ".events.jsonl.claims.jsonl");
+		const valid = `${JSON.stringify({ eventId: eventId("valid-claim"), state: "pending" })}\n`;
+		writeFileSync(path, "", "utf8");
+		writeFileSync(journalPath, `${valid}{"eventId":\n`, "utf8");
+
+		try {
+			new EventLog<TestEvent>(path).append({ eventId: eventId("after-broken-claim"), type: "blocked" });
+			expect.unreachable("完整损坏 claim 必须 fail-closed");
+		} catch (error) {
+			expect(error).toBeInstanceOf(EvidencePersistenceError);
+			expect(error).toMatchObject({ path: journalPath });
+			const secureCause = (error as Error & { cause?: unknown }).cause as Error & { cause?: unknown };
+			expect(secureCause.cause).toMatchObject({
+				path: journalPath,
+				line: 2,
+				offset: Buffer.byteLength(valid),
+				reason: "malformed_claim_json",
+			});
+		}
+	});
+
+	it("10 万事件 claim journal 保持单文件线性审计并满足宽松冷启动预算", () => {
+		const policy = (
+			secureFsSource as typeof secureFsSource & {
+				CLAIM_JOURNAL_CAPACITY_POLICY?: {
+					baselineEvents: number;
+					maxBaselineBytes: number;
+					maxColdStartMs: number;
+					persistence: string;
+				};
+			}
+		).CLAIM_JOURNAL_CAPACITY_POLICY;
+		expect(policy).toBeDefined();
+		const root = temporaryRoot();
+		const path = join(root, "events.jsonl");
+		const journalPath = join(root, ".events.jsonl.claims.jsonl");
+		const count = policy?.baselineEvents ?? 100_000;
+		const eventIds = Array.from({ length: count }, (_, index) => indexedEventId(index));
+		writeFileSync(
+			path,
+			eventIds.map((currentEventId) => `${JSON.stringify({ eventId: currentEventId, type: "capacity" })}\n`).join(""),
+		);
+		writeFileSync(
+			journalPath,
+			eventIds
+				.map(
+					(currentEventId) =>
+						`${JSON.stringify({ eventId: currentEventId, state: "pending" })}\n${JSON.stringify({ eventId: currentEventId, state: "done" })}\n`,
+				)
+				.join(""),
+		);
+		const startedAt = performance.now();
+		new EventLog<TestEvent>(path).append({ eventId: eventIds[0] as string, type: "capacity" });
+		const coldStartMs = performance.now() - startedAt;
+
+		expect(policy?.persistence).toBe("append_only_linear_audit");
+		expect(statSync(journalPath).size).toBeLessThanOrEqual(policy?.maxBaselineBytes ?? 0);
+		expect(coldStartMs).toBeLessThanOrEqual(policy?.maxColdStartMs ?? 0);
+		expect(readdirSync(root).filter((name) => name.includes("claims"))).toEqual([".events.jsonl.claims.jsonl"]);
+	}, 30_000);
+
 	it("旧 claim/checkpoint 在日志锁内迁移到 journal 后删除旧目录且保持幂等", () => {
 		const root = temporaryRoot();
 		const path = join(root, "events.jsonl");
@@ -676,6 +761,36 @@ describe("EventLog", () => {
 			.split("\n")
 			.filter((line) => line.includes('"type":"recovery_truncated_tail"'));
 		expect(physicalRecoveries).toHaveLength(1);
+	});
+
+	it("多进程并发恢复返回对象逐字段等于规范磁盘 recovery", async () => {
+		const root = temporaryRoot();
+		const path = join(root, "events.jsonl");
+		const barrier = join(root, "start");
+		writeFileSync(path, '{"eventId":"valid","type":"first"}\n{"eventId":"broken', "utf8");
+		const script = `
+			import { existsSync, writeFileSync } from "node:fs";
+			import { EventLog } from ${JSON.stringify(eventLogModule)};
+			while (!existsSync(process.argv[3])) await Bun.sleep(2);
+			const recovery = new EventLog(process.argv[1]).readAll().find((event) => event.type === "recovery_truncated_tail");
+			writeFileSync(process.argv[2], JSON.stringify(recovery));
+		`;
+		const children = Array.from({ length: 12 }, (_, index) => {
+			const output = join(root, `recovery-${index}.json`);
+			return {
+				output,
+				child: Bun.spawn([process.execPath, "-e", script, path, output, barrier], { stderr: "pipe" }),
+			};
+		});
+		writeFileSync(barrier, "start", "utf8");
+		for (const { child } of children) {
+			const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+			expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+		}
+		const canonical = new EventLog<TestEvent>(path).readAll().find((event) => event.type === "recovery_truncated_tail");
+		for (const { output } of children) {
+			expect(JSON.parse(readFileSync(output, "utf8"))).toEqual(canonical);
+		}
 	});
 
 	it("多进程并发追加相同 eventId 只产生一条物理记录", async () => {

@@ -38,6 +38,28 @@ afterEach(() => {
 });
 
 describe("EvidenceRepository", () => {
+	it.skipIf(process.platform === "win32")("/tmp 逻辑路径对已存在和不存在项目后代均锚定到真实祖先", () => {
+		const previousTmpdir = process.env.TMPDIR;
+		process.env.TMPDIR = "/tmp";
+		const sandbox = mkdtempSync("/tmp/omp-evidence-logical-tmp-");
+		roots.push(sandbox);
+		try {
+			const existingProject = join(sandbox, "existing-project");
+			mkdirSync(existingProject);
+			const existing = new EvidenceRepository(join(existingProject, ".omp", "compliance"));
+			existing.task("task-existing").state.write({ status: "active", attempt: 1 });
+			expect(existing.task("task-existing").state.read()).toEqual({ status: "active", attempt: 1 });
+
+			const missingProject = join(sandbox, "missing", "project");
+			const missing = new EvidenceRepository(join(missingProject, ".omp", "compliance"));
+			missing.task("task-missing").state.write({ status: "active", attempt: 2 });
+			expect(missing.task("task-missing").state.read()).toEqual({ status: "active", attempt: 2 });
+		} finally {
+			if (previousTmpdir === undefined) process.env.TMPDIR = undefined;
+			else process.env.TMPDIR = previousTmpdir;
+		}
+	});
+
 	it.each([".omp", "compliance", "repository"] as const)("构造前预置 %s symlink 时失败关闭且不写入外部", (target) => {
 		const sandbox = temporaryRoot();
 		const projectRoot = join(sandbox, "project");

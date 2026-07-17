@@ -269,6 +269,57 @@ describe.skipIf(process.platform === "win32")("Evidence secure filesystem", () =
 		expect(existsSync(kind === "state" ? task.paths.state : task.paths.events)).toBeFalse();
 	});
 
+	it.each(["events", "snapshot"] as const)("读取期间规范 %s 文件被替换时拒绝返回旧 inode 数据", (kind) => {
+		const root = temporaryRoot();
+		const path = join(root, kind === "events" ? "events.jsonl" : "state.json");
+		const parked = join(root, `parked-${kind}.json`);
+		const eventId = deterministicEvidenceEventId("post-read-file-identity");
+		const reader = kind === "events" ? new EventLog(path) : new SnapshotStore(path);
+		if (kind === "events") (reader as EventLog).append({ eventId, type: "canonical" });
+		else (reader as SnapshotStore).write({ source: "canonical" });
+		let replaced = false;
+		setSecureFsTestHook((event) => {
+			if (event.stage !== "lock_acquired" || replaced) return;
+			replaced = true;
+			renameSync(path, parked);
+			writeFileSync(
+				path,
+				kind === "events"
+					? `${JSON.stringify({ eventId: deterministicEvidenceEventId("replacement"), type: "replacement" })}\n`
+					: `${JSON.stringify({ source: "replacement" })}\n`,
+				"utf8",
+			);
+		});
+
+		const read = () => (kind === "events" ? (reader as EventLog).readAll() : (reader as SnapshotStore).read());
+		expect(read).toThrow(EvidencePersistenceError);
+		expect(replaced).toBeTrue();
+		expect(existsSync(parked)).toBeTrue();
+	});
+
+	it.each(["events", "snapshot"] as const)("读取期间 %s 父目录被替换时拒绝返回旧目录数据", (kind) => {
+		const root = temporaryRoot();
+		const outside = join(root, "outside");
+		const parked = join(root, "parked-task");
+		mkdirSync(outside);
+		const task = new EvidenceTaskRepository(join(root, "evidence"), `read-${kind}`);
+		const eventId = deterministicEvidenceEventId("post-read-directory-identity");
+		if (kind === "events") task.events.append({ eventId, type: "canonical" });
+		else task.state.write({ status: "canonical", attempt: 1 });
+		let replaced = false;
+		setSecureFsTestHook((event) => {
+			if (event.stage !== "lock_acquired" || replaced) return;
+			replaced = true;
+			renameSync(task.paths.root, parked);
+			symlinkSync(outside, task.paths.root, "dir");
+		});
+
+		const read = () => (kind === "events" ? task.events.readAll() : task.state.read());
+		expect(read).toThrow(EvidencePersistenceError);
+		expect(readdirSync(outside)).toEqual([]);
+		expect(replaced).toBeTrue();
+	});
+
 	it("claim_created 后 events 规范文件被替换时失败，跨进程重试不重复", async () => {
 		const root = temporaryRoot();
 		const path = join(root, "events.jsonl");

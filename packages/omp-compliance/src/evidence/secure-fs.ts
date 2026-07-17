@@ -16,6 +16,8 @@ type SecureFsOperation =
 	| "list_directory";
 
 export class SecureFsError extends Error {
+	declare readonly cause: unknown;
+
 	constructor(
 		readonly operation: SecureFsOperation,
 		readonly code?: number,
@@ -23,6 +25,21 @@ export class SecureFsError extends Error {
 	) {
 		super(`Secure filesystem operation failed: ${operation}`, { cause });
 		this.name = "SecureFsError";
+	}
+}
+
+export class ClaimJournalCorruptionError extends Error {
+	declare readonly cause: unknown;
+
+	constructor(
+		readonly path: string,
+		readonly line: number,
+		readonly offset: number,
+		readonly reason: "malformed_claim_json" | "invalid_claim_record",
+		cause?: unknown,
+	) {
+		super(`Claim journal is corrupt at line ${line}`, { cause });
+		this.name = "ClaimJournalCorruptionError";
 	}
 }
 
@@ -61,6 +78,14 @@ export interface SecureFsTestEvent {
 	hotSize?: number;
 	pendingSize?: number;
 }
+
+// Claims remain append-only for crash auditability. Memory is bounded; persisted history grows linearly.
+export const CLAIM_JOURNAL_CAPACITY_POLICY = {
+	persistence: "append_only_linear_audit",
+	baselineEvents: 100_000,
+	maxBaselineBytes: 16 * 1024 * 1024,
+	maxColdStartMs: 5_000,
+} as const;
 
 let testHook: ((event: SecureFsTestEvent) => void) | undefined;
 
@@ -434,6 +459,7 @@ interface ClaimJournalCache {
 	device: bigint;
 	inode: bigint;
 	offset: number;
+	nextLine: number;
 	mtimeNs: bigint;
 	bloom: ClaimBloom;
 	pendingBloom: ClaimBloom;
@@ -587,6 +613,7 @@ export class SecurePathScope {
 				},
 			});
 			if (options.createFile && retryPosix("fsync", () => requirePosix().fsync(directory)) < 0) fail("sync_file");
+			this.assertCanonicalFiles(directory, [{ name, descriptor: descriptor as number }]);
 			return result;
 		} finally {
 			if (directoryLocked) retryPosix("flock", () => requirePosix().flock(directory, LOCK_UN));
@@ -875,6 +902,7 @@ export class SecurePathScope {
 					device: status.dev,
 					inode: status.ino,
 					offset: 0,
+					nextLine: 1,
 					mtimeNs: status.mtimeNs,
 					bloom: new ClaimBloom(),
 					pendingBloom: new ClaimBloom(),
@@ -899,14 +927,33 @@ export class SecurePathScope {
 			testHook?.({ stage: "claim_journal_truncated" });
 		}
 
-		const committed = unread.subarray(0, completeLength).toString("utf8");
-		for (const line of committed.split("\n")) {
+		const committed = unread.subarray(0, completeLength);
+		let lineStart = 0;
+		let lineNumber = cache.nextLine;
+		for (let index = 0; index < committed.byteLength; index += 1) {
+			if (committed[index] !== 0x0a) continue;
+			const lineBuffer = committed.subarray(lineStart, index);
+			const line = lineBuffer.toString("utf8");
+			const lineOffset = offset + lineStart;
+			lineStart = index + 1;
+			const currentLine = lineNumber;
+			lineNumber += 1;
 			if (!line) continue;
 			let record: unknown;
 			try {
 				record = JSON.parse(line);
 			} catch (error) {
-				throw new SecureFsError("read_file", undefined, error);
+				throw new SecureFsError(
+					"read_file",
+					undefined,
+					new ClaimJournalCorruptionError(
+						`${this.absolutePath}${sep}${name}`,
+						currentLine,
+						lineOffset,
+						"malformed_claim_json",
+						error,
+					),
+				);
 			}
 			if (
 				typeof record !== "object" ||
@@ -914,11 +961,21 @@ export class SecurePathScope {
 				typeof (record as Partial<ClaimJournalRecord>).eventId !== "string" ||
 				!(["pending", "done"] as const).includes((record as Partial<ClaimJournalRecord>).state as ClaimState)
 			) {
-				throw new SecureFsError("read_file", undefined, new Error("Invalid claim journal record"));
+				throw new SecureFsError(
+					"read_file",
+					undefined,
+					new ClaimJournalCorruptionError(
+						`${this.absolutePath}${sep}${name}`,
+						currentLine,
+						lineOffset,
+						"invalid_claim_record",
+					),
+				);
 			}
 			applyClaimRecord(cache, record as ClaimJournalRecord);
 		}
 		cache.offset = offset + completeLength;
+		cache.nextLine = lineNumber;
 		const refreshed = fstatSync(descriptor, { bigint: true });
 		cache.device = refreshed.dev;
 		cache.inode = refreshed.ino;
@@ -933,6 +990,7 @@ export class SecurePathScope {
 		appendAndSync(descriptor, content);
 		applyClaimRecord(cache, record);
 		cache.offset += content.byteLength;
+		cache.nextLine += 1;
 		cache.mtimeNs = fstatSync(descriptor, { bigint: true }).mtimeNs;
 		testHook?.({ stage: "claim_journal_appended" });
 		emitClaimCacheStats(cache);

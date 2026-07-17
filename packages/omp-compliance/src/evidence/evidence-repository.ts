@@ -1,4 +1,4 @@
-import { lstatSync } from "node:fs";
+import { lstatSync, realpathSync } from "node:fs";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { EventLog, type EvidenceEvent, EvidencePersistenceError } from "./event-log";
 import { SecurePathScope } from "./secure-fs";
@@ -52,6 +52,17 @@ interface RepositoryBoundary {
 	components: string[];
 }
 
+const REPOSITORY_BOUNDARY_TOKEN = Symbol("evidence-repository-boundary");
+
+interface InternalRepositoryBoundary {
+	token: typeof REPOSITORY_BOUNDARY_TOKEN;
+	boundary: RepositoryBoundary;
+}
+
+function reuseRepositoryBoundary(boundary: RepositoryBoundary): InternalRepositoryBoundary {
+	return { token: REPOSITORY_BOUNDARY_TOKEN, boundary };
+}
+
 const REPOSITORY_CACHE_LIMIT = 64;
 
 function cachedRepository<T>(cache: Map<string, T>, id: string, create: () => T): T {
@@ -70,12 +81,16 @@ function cachedRepository<T>(cache: Map<string, T>, id: string, create: () => T)
 	return repository;
 }
 
-function nearestPlainDirectory(path: string): string {
+function canonicalTrustedAncestor(path: string): { trustedRoot: string; components: string[] } {
 	let candidate = resolve(path);
+	const components: string[] = [];
 	for (;;) {
 		try {
 			const status = lstatSync(candidate);
-			if (status.isDirectory() && !status.isSymbolicLink()) return candidate;
+			if (status.isDirectory() || status.isSymbolicLink()) {
+				const canonical = realpathSync.native(candidate);
+				if (lstatSync(canonical).isDirectory()) return { trustedRoot: canonical, components };
+			}
 		} catch (error) {
 			if (
 				typeof error !== "object" ||
@@ -88,6 +103,7 @@ function nearestPlainDirectory(path: string): string {
 		}
 		const parent = dirname(candidate);
 		if (parent === candidate) throw new Error("No trusted Evidence parent directory exists");
+		components.unshift(basename(candidate));
 		candidate = parent;
 	}
 }
@@ -100,8 +116,8 @@ function repositoryBoundary(root: string, trustedRoot?: string): RepositoryBound
 		repositoryRoot === join(dirname(repositoryRoot), "compliance")
 			? dirname(dirname(repositoryRoot))
 			: undefined;
-	const anchor = resolve(trustedRoot ?? standardProjectRoot ?? nearestPlainDirectory(dirname(repositoryRoot)));
-	const pathFromAnchor = relative(anchor, repositoryRoot);
+	const logicalAnchor = resolve(trustedRoot ?? standardProjectRoot ?? dirname(repositoryRoot));
+	const pathFromAnchor = relative(logicalAnchor, repositoryRoot);
 	if (
 		!pathFromAnchor ||
 		pathFromAnchor === ".." ||
@@ -110,7 +126,11 @@ function repositoryBoundary(root: string, trustedRoot?: string): RepositoryBound
 	) {
 		throw new Error("Evidence repository must be below its trusted root");
 	}
-	return { trustedRoot: anchor, components: pathFromAnchor.split(sep).filter(Boolean) };
+	const canonicalAnchor = canonicalTrustedAncestor(logicalAnchor);
+	return {
+		trustedRoot: canonicalAnchor.trustedRoot,
+		components: [...canonicalAnchor.components, ...pathFromAnchor.split(sep).filter(Boolean)],
+	};
 }
 
 export class EvidenceTaskRepository {
@@ -124,12 +144,16 @@ export class EvidenceTaskRepository {
 		root: string,
 		readonly taskId: string,
 		trustedRoot?: string,
+		internalBoundary?: InternalRepositoryBoundary,
 	) {
 		assertSafeTaskId(taskId);
 		const repositoryRoot = resolve(root);
 		const taskRoot = join(repositoryRoot, "tasks", taskId);
-		const boundary = repositoryBoundary(repositoryRoot, trustedRoot);
-		this.scope = new SecurePathScope(boundary.trustedRoot, [...boundary.components, "tasks", taskId]);
+		const resolvedBoundary =
+			internalBoundary?.token === REPOSITORY_BOUNDARY_TOKEN
+				? internalBoundary.boundary
+				: repositoryBoundary(repositoryRoot, trustedRoot);
+		this.scope = new SecurePathScope(resolvedBoundary.trustedRoot, [...resolvedBoundary.components, "tasks", taskId]);
 		this.paths = {
 			root: taskRoot,
 			state: join(taskRoot, "state.json"),
@@ -166,12 +190,16 @@ export class EvidenceTopicRepository {
 		root: string,
 		readonly topicId: string,
 		trustedRoot?: string,
+		internalBoundary?: InternalRepositoryBoundary,
 	) {
 		assertSafeTopicId(topicId);
 		const repositoryRoot = resolve(root);
 		const topicRoot = join(repositoryRoot, "topics", topicId);
-		const boundary = repositoryBoundary(repositoryRoot, trustedRoot);
-		this.scope = new SecurePathScope(boundary.trustedRoot, [...boundary.components, "topics", topicId]);
+		const resolvedBoundary =
+			internalBoundary?.token === REPOSITORY_BOUNDARY_TOKEN
+				? internalBoundary.boundary
+				: repositoryBoundary(repositoryRoot, trustedRoot);
+		this.scope = new SecurePathScope(resolvedBoundary.trustedRoot, [...resolvedBoundary.components, "topics", topicId]);
 		this.paths = {
 			root: topicRoot,
 			state: join(topicRoot, "state.json"),
@@ -226,7 +254,13 @@ export class EvidenceRepository {
 		return cachedRepository(
 			this.taskRepositories,
 			taskId,
-			() => new EvidenceTaskRepository(this.root, taskId, this.boundary.trustedRoot),
+			() =>
+				new EvidenceTaskRepository(
+					this.root,
+					taskId,
+					this.boundary.trustedRoot,
+					reuseRepositoryBoundary(this.boundary),
+				),
 		);
 	}
 
@@ -235,7 +269,13 @@ export class EvidenceRepository {
 		return cachedRepository(
 			this.topicRepositories,
 			topicId,
-			() => new EvidenceTopicRepository(this.root, topicId, this.boundary.trustedRoot),
+			() =>
+				new EvidenceTopicRepository(
+					this.root,
+					topicId,
+					this.boundary.trustedRoot,
+					reuseRepositoryBoundary(this.boundary),
+				),
 		);
 	}
 
@@ -266,13 +306,23 @@ export class EvidenceRepository {
 			const cleanedTemporarySnapshots = this.rootSnapshots.flatMap((snapshot) => snapshot.recover());
 			cleanedTemporarySnapshots.push(
 				...taskIds.flatMap((taskId) => {
-					const task = new EvidenceTaskRepository(this.root, taskId, this.boundary.trustedRoot);
+					const task = new EvidenceTaskRepository(
+						this.root,
+						taskId,
+						this.boundary.trustedRoot,
+						reuseRepositoryBoundary(this.boundary),
+					);
 					return [...task.state.recover(), ...task.contract.recover()];
 				}),
 			);
 			cleanedTemporarySnapshots.push(
 				...topicIds.flatMap((topicId) =>
-					new EvidenceTopicRepository(this.root, topicId, this.boundary.trustedRoot).recover(),
+					new EvidenceTopicRepository(
+						this.root,
+						topicId,
+						this.boundary.trustedRoot,
+						reuseRepositoryBoundary(this.boundary),
+					).recover(),
 				),
 			);
 			return { taskIds, topicIds, cleanedTemporarySnapshots };
