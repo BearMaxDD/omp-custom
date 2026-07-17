@@ -3,25 +3,15 @@ import { execFileSync } from "node:child_process";
 /**
  * Upstream API Contract Test.
  *
- * Proves bugs revealed by the REAL upstream OMP v16.4.x shapes.
- *
- * BUG: brainstorm hook gates on event.trigger === "brainstorm_review"
- *      (brainstorm/advisor-hook.ts:43) but upstream agent-session.ts:16259
- *      ALWAYS sends trigger: "compliance_review" for extension-initiated
- *      reviews. The hook silently no-ops and the envelope is stranded.
- *
- * BUG: requestAdvisorReview receipt uses { status } (upstream v16.4.x
- *      extensibility/extensions/types.ts:918-921) but brainstorm-runtime.ts
- *      and compliance-runtime.ts check .accepted boolean.
- *
- * Each test expects the CORRECT behavior (hook returns result, receipt
- * accepted). Current code returns undefined → test fails RED.
+ * Guards the extension against drifting away from the pinned OMP v17 Host
+ * package and against introducing local protocol-type intermediaries.
  */
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AdvisorBeforeRunEvent } from "@oh-my-pi/pi-coding-agent/advisor/index";
+import ts from "typescript";
 import { createComplianceAdvisorHook } from "../../src/advisor/compliance-advisor-hook";
 import { ComplianceReviewRegistry, createEnvelope } from "../../src/advisor/review-envelope";
 import { createBrainstormAdvisorHook } from "../../src/brainstorm/advisor-hook";
@@ -33,6 +23,53 @@ import { FakeExtensionAPI } from "../support/fake-extension-api";
 
 const HOST_PACKAGE = "/Users/mima1234/Code/super/.worktrees/oh-my-pi-v17-advisor-protocol/packages/coding-agent";
 const HOST_HEAD = "2adbf91f6d73534342f194f99b1a305db37ae1cf";
+const PACKAGE_ROOT = join(import.meta.dir, "../..");
+const ROOT_TYPES_MODULE = join(PACKAGE_ROOT, "src/types");
+
+function collectTypeScriptFiles(directory: string): string[] {
+	return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+		const path = join(directory, entry.name);
+		if (entry.isDirectory()) return collectTypeScriptFiles(path);
+		return /\.[cm]?tsx?$/.test(entry.name) ? [path] : [];
+	});
+}
+
+function collectModuleSpecifiers(file: string): string[] {
+	const sourceFile = ts.createSourceFile(file, readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true);
+	const specifiers: string[] = [];
+	const visit = (node: ts.Node): void => {
+		if (
+			(ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) &&
+			node.moduleSpecifier &&
+			ts.isStringLiteral(node.moduleSpecifier)
+		) {
+			specifiers.push(node.moduleSpecifier.text);
+		} else if (
+			ts.isImportEqualsDeclaration(node) &&
+			ts.isExternalModuleReference(node.moduleReference) &&
+			node.moduleReference.expression &&
+			ts.isStringLiteral(node.moduleReference.expression)
+		) {
+			specifiers.push(node.moduleReference.expression.text);
+		} else if (
+			ts.isCallExpression(node) &&
+			node.expression.kind === ts.SyntaxKind.ImportKeyword &&
+			node.arguments.length === 1 &&
+			ts.isStringLiteral(node.arguments[0])
+		) {
+			specifiers.push(node.arguments[0].text);
+		}
+		ts.forEachChild(node, visit);
+	};
+	ts.forEachChild(sourceFile, visit);
+	return specifiers;
+}
+
+function resolvesToRootTypes(file: string, specifier: string): boolean {
+	if (!specifier.startsWith(".")) return false;
+	const target = resolve(dirname(file), specifier).replace(/\.[cm]?[jt]sx?$/, "");
+	return target === ROOT_TYPES_MODULE || target === join(ROOT_TYPES_MODULE, "index");
+}
 
 const tmpDir = mkdtempSync(join(tmpdir(), "omp-contract-"));
 const store = new TopicStore(tmpDir);
@@ -48,6 +85,18 @@ afterAll(() => {
 
 describe("upstream API contract — REAL shapes", () => {
 	describe("OMP v17 extension contract", () => {
+		it("keeps the compiler package direct and out of the Host catalog bridge", () => {
+			const rootPackageJson = JSON.parse(readFileSync(join(PACKAGE_ROOT, "../../package.json"), "utf8")) as {
+				workspaces?: { catalog?: Record<string, string> };
+			};
+			const packageJson = JSON.parse(readFileSync(join(PACKAGE_ROOT, "package.json"), "utf8")) as {
+				devDependencies?: Record<string, string>;
+			};
+
+			expect(rootPackageJson.workspaces?.catalog?.["@typescript/native-preview"]).toBeUndefined();
+			expect(packageJson.devDependencies?.["@typescript/native-preview"]).toBe("7.0.0-dev.20260707.2");
+		});
+
 		it("resolves the v17 development dependency from the pinned Host worktree", () => {
 			const packageJson = JSON.parse(readFileSync(join(import.meta.dir, "../../package.json"), "utf8")) as {
 				peerDependencies?: Record<string, string>;
@@ -92,10 +141,24 @@ describe("upstream API contract — REAL shapes", () => {
 			}
 		});
 
-		it("does not re-export or alias Host protocol types", () => {
-			const typesPath = join(import.meta.dir, "../../src/types.ts");
-			const typesSource = existsSync(typesPath) ? readFileSync(typesPath, "utf8") : "";
-			const indexSource = readFileSync(join(import.meta.dir, "../../src/index.ts"), "utf8");
+		it("does not keep a root protocol-types intermediary", () => {
+			expect(existsSync(`${ROOT_TYPES_MODULE}.ts`)).toBe(false);
+		});
+
+		it("does not re-export or alias Host protocol types from the public index", () => {
+			const indexPath = join(PACKAGE_ROOT, "src/index.ts");
+			const indexSource = readFileSync(indexPath, "utf8");
+			const sourceFile = ts.createSourceFile(indexPath, indexSource, ts.ScriptTarget.Latest, true);
+			const hostReExports = sourceFile.statements
+				.filter(ts.isExportDeclaration)
+				.flatMap((statement) =>
+					statement.moduleSpecifier && ts.isStringLiteral(statement.moduleSpecifier)
+						? [statement.moduleSpecifier.text]
+						: [],
+				)
+				.filter((specifier) => specifier.startsWith("@oh-my-pi/"));
+
+			expect(hostReExports).toEqual([]);
 			for (const hostType of [
 				"ExtensionAPI",
 				"ExtensionContext",
@@ -105,14 +168,24 @@ describe("upstream API contract — REAL shapes", () => {
 				"AgentTool",
 				"AgentToolResult",
 				"AdvisorBeforeRunEvent",
-				"AdvisorBeforeRunResult",
+				"AdvisorRunAugmentation",
 				"AdvisorReviewRequest",
 				"AdvisorReviewReceipt",
 			]) {
-				expect(typesSource).not.toMatch(new RegExp(`\\b${hostType}\\b`));
 				expect(indexSource).not.toMatch(new RegExp(`\\b${hostType}\\b`));
 			}
-			expect(indexSource).not.toContain('from "./types"');
+		});
+
+		it("does not import the root protocol-types intermediary from production or tests", () => {
+			const violations = [join(PACKAGE_ROOT, "src"), join(PACKAGE_ROOT, "test")]
+				.flatMap(collectTypeScriptFiles)
+				.flatMap((file) =>
+					collectModuleSpecifiers(file)
+						.filter((specifier) => resolvesToRootTypes(file, specifier))
+						.map((specifier) => `${file}: ${specifier}`),
+				);
+
+			expect(violations).toEqual([]);
 		});
 
 		it("keeps the Fake and event bridge free of double-assertion signature escapes", () => {
