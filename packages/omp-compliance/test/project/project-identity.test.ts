@@ -547,6 +547,21 @@ describe("ProjectIdentityStore", () => {
 		expect(existsSync(markerPath)).toBe(false);
 	});
 
+	it("reclaims a malformed marker whose mtime is beyond the future clock-skew tolerance", () => {
+		const root = initGit();
+		const directory = join(root, ".omp", "compliance");
+		const markerPath = join(directory, `.project.publish.${randomUUID()}.json`);
+		mkdirSync(directory, { recursive: true });
+		writeFileSync(markerPath, '{"token":');
+		const futureTime = new Date(Date.now() + 60_000);
+		utimesSync(markerPath, futureTime, futureTime);
+
+		const result = ProjectIdentityStore.open(root);
+
+		expect(result.status).toBe("bound");
+		expect(existsSync(markerPath)).toBe(false);
+	});
+
 	it("reclaims a stale marker whose PID belongs to a newer process instance", () => {
 		const root = initGit();
 		const directory = join(root, ".omp", "compliance");
@@ -592,6 +607,32 @@ describe("ProjectIdentityStore", () => {
 		const staleTime = new Date(Date.now() - 60_000);
 		writeFileSync(markerPath, JSON.stringify({ token, pid: unknownPid, createdAt: staleTime.toISOString() }));
 		utimesSync(markerPath, staleTime, staleTime);
+		const originalKill = process.kill;
+		process.kill = ((pid: number, signal?: string | number) => {
+			if (pid === unknownPid && signal === 0)
+				throw Object.assign(new Error("unknown process state"), { code: "EINVAL" });
+			return originalKill(pid, signal as never);
+		}) as typeof process.kill;
+
+		try {
+			const result = ProjectIdentityStore.open(root);
+			expect(result.status).toBe("bound");
+		} finally {
+			process.kill = originalKill;
+		}
+		expect(existsSync(markerPath)).toBe(false);
+	});
+
+	it("reclaims an unknown-owner marker whose timestamps are beyond the future clock-skew tolerance", () => {
+		const root = initGit();
+		const directory = join(root, ".omp", "compliance");
+		const token = randomUUID();
+		const markerPath = join(directory, `.project.publish.${token}.json`);
+		mkdirSync(directory, { recursive: true });
+		const unknownPid = 123_456;
+		const futureTime = new Date(Date.now() + 60_000);
+		writeFileSync(markerPath, JSON.stringify({ token, pid: unknownPid, createdAt: futureTime.toISOString() }));
+		utimesSync(markerPath, futureTime, futureTime);
 		const originalKill = process.kill;
 		process.kill = ((pid: number, signal?: string | number) => {
 			if (pid === unknownPid && signal === 0)

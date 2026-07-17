@@ -906,10 +906,11 @@ function readPublishMarkerSnapshot(marker: PublishMarkerPath): PublishMarkerSnap
 
 function isPublishMarkerActive(snapshot: PublishMarkerSnapshot): boolean {
 	const ageMs = Date.now() - nanosecondsToMilliseconds(snapshot.mtimeNs);
-	if (!snapshot.owner) return ageMs < PUBLISH_RECOVERY_GRACE_MS;
+	const timestampIsPlausible = ageMs >= -PUBLISH_TIMESTAMP_TOLERANCE_MS;
+	if (!snapshot.owner) return timestampIsPlausible && ageMs < PUBLISH_RECOVERY_GRACE_MS;
 	const ownerState = probePublishOwner(snapshot.owner, snapshot);
 	if (ownerState === "current") return true;
-	if (ownerState === "unknown") return ageMs < PUBLISH_OWNER_LEASE_MS;
+	if (ownerState === "unknown") return timestampIsPlausible && ageMs < PUBLISH_OWNER_LEASE_MS;
 	return false;
 }
 
