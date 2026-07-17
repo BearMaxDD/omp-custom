@@ -1,108 +1,40 @@
-import { randomUUID } from "node:crypto";
-import {
-	closeSync,
-	fsyncSync,
-	mkdirSync,
-	openSync,
-	readFileSync,
-	renameSync,
-	unlinkSync,
-	writeFileSync,
-} from "node:fs";
-import { basename, dirname, join } from "node:path";
-import { EvidencePersistenceError, type EvidenceWriteBoundary, type EvidenceWriteLease } from "./event-log";
-
-function isMissingFile(error: unknown): boolean {
-	return (
-		typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === "ENOENT"
-	);
-}
-
-function flushDirectory(path: string): void {
-	const descriptor = openSync(path, "r");
-	try {
-		fsyncSync(descriptor);
-	} finally {
-		closeSync(descriptor);
-	}
-}
+import { EvidencePersistenceError } from "./event-log";
+import { SecurePathScope, secureFileName } from "./secure-fs";
 
 export class SnapshotStore {
+	private readonly scope: SecurePathScope;
+	private readonly fileName: string;
+
 	constructor(
 		readonly path: string,
-		private readonly writeBoundary?: EvidenceWriteBoundary,
-	) {}
+		scope?: SecurePathScope,
+	) {
+		this.scope = scope ?? SecurePathScope.forFile(path);
+		this.fileName = secureFileName(path);
+	}
 
 	read<T = unknown>(): T | undefined {
-		let content: string;
+		let content: Buffer | undefined;
 		try {
-			content = readFileSync(this.path, "utf8");
+			content = this.scope.readFile(this.fileName);
 		} catch (error) {
-			if (isMissingFile(error)) {
-				return undefined;
-			}
+			if (error instanceof EvidencePersistenceError) throw error;
 			throw new EvidencePersistenceError("read_snapshot", this.path, error);
 		}
+		if (content === undefined) return undefined;
 
 		try {
-			return JSON.parse(content) as T;
+			return JSON.parse(content.toString("utf8")) as T;
 		} catch (error) {
 			throw new EvidencePersistenceError("parse_snapshot", this.path, error);
 		}
 	}
 
 	write(value: unknown): void {
-		const parent = dirname(this.path);
-		const temporaryPath = join(parent, `.${basename(this.path)}.${randomUUID()}.tmp`);
-		let descriptor: number | undefined;
-		let lease: EvidenceWriteLease | undefined;
-		let temporaryCreated = false;
-
 		try {
-			lease = this.writeBoundary?.prepareFileWrite(this.path);
-			if (!lease) {
-				mkdirSync(parent, { recursive: true });
-			}
-			descriptor = openSync(temporaryPath, "wx", 0o600);
-			temporaryCreated = true;
-			writeFileSync(descriptor, `${JSON.stringify(value)}\n`, "utf8");
-			fsyncSync(descriptor);
-			closeSync(descriptor);
-			descriptor = undefined;
-			if (lease) {
-				this.writeBoundary?.verifyFileWrite(lease);
-			}
-			renameSync(temporaryPath, this.path);
-			if (lease) {
-				this.writeBoundary?.verifyFileWrite(lease);
-			}
-			flushDirectory(parent);
+			this.scope.atomicWrite(this.fileName, Buffer.from(`${JSON.stringify(value)}\n`));
 		} catch (error) {
-			if (descriptor !== undefined) {
-				try {
-					closeSync(descriptor);
-				} catch {
-					// The original persistence failure remains authoritative.
-				}
-			}
-			let canCleanTemporary = true;
-			if (lease && this.writeBoundary) {
-				try {
-					this.writeBoundary.verifyFileWrite(lease);
-				} catch {
-					canCleanTemporary = false;
-				}
-			}
-			if (temporaryCreated && canCleanTemporary) {
-				try {
-					unlinkSync(temporaryPath);
-				} catch {
-					// The temp may not exist or may already have been renamed.
-				}
-			}
-			if (error instanceof EvidencePersistenceError) {
-				throw error;
-			}
+			if (error instanceof EvidencePersistenceError) throw error;
 			throw new EvidencePersistenceError("write_snapshot", this.path, error);
 		}
 	}
