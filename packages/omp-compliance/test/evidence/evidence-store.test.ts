@@ -77,8 +77,7 @@ describe("EvidenceStore — 损坏末尾行容错读取", () => {
 		expect(records).toHaveLength(2);
 		expect(records[0].event).toBe("active");
 		expect(records[1]).toMatchObject({
-			type: "evidence_log_recovered",
-			reason: "truncated_tail",
+			type: "recovery_truncated_tail",
 		});
 	});
 });

@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventLog, EvidencePersistenceError } from "../../src/evidence/event-log";
+import type { SecurePathScope } from "../../src/evidence/secure-fs";
 
 interface TestEvent {
 	eventId: string;
@@ -40,6 +41,25 @@ afterEach(() => {
 });
 
 describe("EventLog", () => {
+	it("正常唯一事件追加不读取或解析既有日志", () => {
+		const path = join(temporaryRoot(), "events.jsonl");
+		let appendCalls = 0;
+		const scope = {
+			appendIdempotent(_name: string, eventId: string, content: Buffer) {
+				appendCalls += 1;
+				expect(eventId).toBe("event-hot-path");
+				expect(content.toString("utf8")).toContain('"eventId":"event-hot-path"');
+			},
+			withLockedFile() {
+				throw new Error("正常追加热路径不得读取全日志");
+			},
+		} as unknown as SecurePathScope;
+
+		new EventLog<TestEvent>(path, scope).append({ eventId: "event-hot-path", type: "completion" });
+
+		expect(appendCalls).toBe(1);
+	});
+
 	it("连续追加不读取或替换已有日志文件", () => {
 		const path = join(temporaryRoot(), "events.jsonl");
 		const log = new EventLog<TestEvent>(path);
@@ -65,6 +85,17 @@ describe("EventLog", () => {
 		expect(readFileSync(path, "utf8").trim().split("\n")).toHaveLength(1);
 	});
 
+	it("claim 文件名只使用 eventId 的 SHA-256 摘要", () => {
+		const root = temporaryRoot();
+		const path = join(root, "events.jsonl");
+		new EventLog<TestEvent>(path).append({ eventId: "../../untrusted/event", type: "completion" });
+
+		const claims = readdirSync(join(root, ".events.jsonl.claims"));
+		expect(claims).toHaveLength(1);
+		expect(claims[0]).toMatch(/^[a-f0-9]{64}\.claim$/);
+		expect(claims[0]).not.toContain("untrusted");
+	});
+
 	it("读取时按 eventId 去重跨进程重试留下的重复行", () => {
 		const path = join(temporaryRoot(), "events.jsonl");
 		const event = { eventId: "stable-event", type: "completion" };
@@ -84,11 +115,10 @@ describe("EventLog", () => {
 
 		expect(firstRead[0]).toEqual(valid);
 		expect(firstRead[1]).toMatchObject({
-			type: "evidence_log_recovered",
-			reason: "truncated_tail",
+			type: "recovery_truncated_tail",
 		});
 		expect(secondRead).toEqual(firstRead);
-		expect(readFileSync(path, "utf8").match(/evidence_log_recovered/g)).toHaveLength(1);
+		expect(readFileSync(path, "utf8").match(/recovery_truncated_tail/g)).toHaveLength(1);
 	});
 
 	it("读取失败抛出包含稳定诊断字段的 EvidencePersistenceError", () => {
@@ -130,7 +160,7 @@ describe("EventLog", () => {
 
 		const physicalRecoveries = readFileSync(path, "utf8")
 			.split("\n")
-			.filter((line) => line.includes('"type":"evidence_log_recovered"'));
+			.filter((line) => line.includes('"type":"recovery_truncated_tail"'));
 		expect(physicalRecoveries).toHaveLength(1);
 	});
 

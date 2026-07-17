@@ -1,5 +1,5 @@
 import { FFIType, type Pointer, dlopen, ptr, read } from "bun:ffi";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants, lstatSync, realpathSync } from "node:fs";
 import { constants as osConstants } from "node:os";
 import { basename, dirname, isAbsolute, parse, resolve, sep } from "node:path";
@@ -26,7 +26,7 @@ export class SecureFsError extends Error {
 }
 
 export interface SecureFsTestEvent {
-	stage: "directory_opened" | "lock_acquired";
+	stage: "directory_opened" | "lock_acquired" | "claim_created" | "event_appended";
 }
 
 let testHook: ((event: SecureFsTestEvent) => void) | undefined;
@@ -201,6 +201,77 @@ function readAll(descriptor: number): Buffer {
 	return Buffer.concat(chunks);
 }
 
+function fileContainsEventId(descriptor: number, eventId: string): boolean {
+	const content = readAll(descriptor).toString("utf8");
+	for (const line of content.split("\n")) {
+		if (!line.trim()) continue;
+		try {
+			const event = JSON.parse(line) as { eventId?: unknown };
+			if (event.eventId === eventId) return true;
+		} catch {
+			// Truncated or malformed lines are not committed events.
+		}
+	}
+	return false;
+}
+
+function createExclusiveAt(directory: number, name: string, content: Buffer): boolean {
+	let descriptor: number | undefined;
+	try {
+		descriptor = openAt(
+			directory,
+			name,
+			constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+			0o600,
+		);
+		if (requirePosix().fchmod(descriptor, 0o600) < 0) fail("open_file");
+		writeAll(descriptor, content);
+		if (requirePosix().fsync(descriptor) < 0) fail("sync_file");
+		return true;
+	} catch (error) {
+		if (error instanceof SecureFsError && error.code === osConstants.errno.EEXIST) return false;
+		throw error;
+	} finally {
+		if (descriptor !== undefined) closeQuietly(descriptor);
+	}
+}
+
+function atomicReplaceAt(directory: number, name: string, content: Buffer): void {
+	const temporaryName = `.${name}.${randomUUID()}.tmp`;
+	let descriptor: number | undefined;
+	let temporaryExists = false;
+	try {
+		descriptor = openAt(
+			directory,
+			temporaryName,
+			constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+			0o600,
+		);
+		temporaryExists = true;
+		if (requirePosix().fchmod(descriptor, 0o600) < 0) fail("open_file");
+		writeAll(descriptor, content);
+		if (requirePosix().fsync(descriptor) < 0) fail("sync_file");
+		closeQuietly(descriptor);
+		descriptor = undefined;
+		const result = invokePath(temporaryName, (temporaryAddress) =>
+			invokePath(name, (finalAddress) => requirePosix().renameat(directory, temporaryAddress, directory, finalAddress)),
+		);
+		if (result < 0) fail("rename_file");
+		temporaryExists = false;
+		if (requirePosix().fsync(directory) < 0) fail("sync_file");
+	} finally {
+		if (descriptor !== undefined) closeQuietly(descriptor);
+		if (temporaryExists) {
+			try {
+				const result = invokePath(temporaryName, (address) => requirePosix().unlinkat(directory, address, 0));
+				if (result < 0 && errno() !== osConstants.errno.ENOENT) fail("unlink_file");
+			} catch {
+				// Cleanup cannot replace the authoritative write failure.
+			}
+		}
+	}
+}
+
 export interface SecureLockedFile {
 	read(): Buffer;
 	append(content: Buffer): void;
@@ -286,45 +357,80 @@ export class SecurePathScope {
 		return this.withLockedFile(name, { createDirectory: false, createFile: false }, (file) => file.read());
 	}
 
+	appendIdempotent(name: string, eventId: string, content: Buffer): void {
+		assertComponent(name);
+		const directory = this.openDirectory(true);
+		if (directory === undefined) fail("open_directory");
+		testHook?.({ stage: "directory_opened" });
+		const claimDirectoryName = `.${name}.claims`;
+		const claimName = `${createHash("sha256").update(eventId).digest("hex")}.claim`;
+		let claimDirectory: number | undefined;
+		let logDescriptor: number | undefined;
+		let directoryLocked = false;
+		let logLocked = false;
+		try {
+			if (requirePosix().flock(directory, LOCK_EX) < 0) fail("lock_file");
+			directoryLocked = true;
+			claimDirectory = this.openChildDirectory(directory, claimDirectoryName, true);
+			if (claimDirectory === undefined) fail("open_directory");
+			if (requirePosix().fsync(directory) < 0) fail("sync_file");
+
+			const claimCreated = createExclusiveAt(claimDirectory, claimName, Buffer.from("pending\n"));
+			if (claimCreated) {
+				if (requirePosix().fsync(claimDirectory) < 0) fail("sync_file");
+				testHook?.({ stage: "claim_created" });
+			} else {
+				const claimDescriptor = openAt(claimDirectory, claimName, constants.O_RDONLY | constants.O_NOFOLLOW);
+				try {
+					if (readAll(claimDescriptor).toString("utf8") === "done\n") return;
+				} finally {
+					closeQuietly(claimDescriptor);
+				}
+			}
+
+			logDescriptor = openOrCreateAt(directory, name);
+			if (requirePosix().fsync(directory) < 0) fail("sync_file");
+			if (requirePosix().flock(logDescriptor, LOCK_EX) < 0) fail("lock_file");
+			logLocked = true;
+			if (requirePosix().flock(directory, LOCK_UN) < 0) fail("lock_file");
+			directoryLocked = false;
+			testHook?.({ stage: "lock_acquired" });
+
+			if (!claimCreated) {
+				const currentClaim = openAt(claimDirectory, claimName, constants.O_RDONLY | constants.O_NOFOLLOW);
+				try {
+					if (readAll(currentClaim).toString("utf8") === "done\n") return;
+				} finally {
+					closeQuietly(currentClaim);
+				}
+			}
+
+			if (claimCreated || !fileContainsEventId(logDescriptor, eventId)) {
+				if (Number(requirePosix().lseek(logDescriptor, 0, SEEK_END)) < 0) fail("write_file");
+				writeAll(logDescriptor, content);
+				if (requirePosix().fsync(logDescriptor) < 0) fail("sync_file");
+				testHook?.({ stage: "event_appended" });
+			}
+			atomicReplaceAt(claimDirectory, claimName, Buffer.from("done\n"));
+		} finally {
+			if (directoryLocked) requirePosix().flock(directory, LOCK_UN);
+			if (logDescriptor !== undefined) {
+				if (logLocked) requirePosix().flock(logDescriptor, LOCK_UN);
+				closeQuietly(logDescriptor);
+			}
+			if (claimDirectory !== undefined) closeQuietly(claimDirectory);
+			closeQuietly(directory);
+		}
+	}
+
 	atomicWrite(name: string, content: Buffer): void {
 		assertComponent(name);
 		const directory = this.openDirectory(true);
 		if (directory === undefined) fail("open_directory");
 		testHook?.({ stage: "directory_opened" });
-		const temporaryName = `.${name}.${randomUUID()}.tmp`;
-		let temporaryDescriptor: number | undefined;
-		let temporaryExists = false;
 		try {
-			temporaryDescriptor = openAt(
-				directory,
-				temporaryName,
-				constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-				0o600,
-			);
-			temporaryExists = true;
-			if (requirePosix().fchmod(temporaryDescriptor, 0o600) < 0) fail("open_file");
-			writeAll(temporaryDescriptor, content);
-			if (requirePosix().fsync(temporaryDescriptor) < 0) fail("sync_file");
-			closeQuietly(temporaryDescriptor);
-			temporaryDescriptor = undefined;
-			const result = invokePath(temporaryName, (temporaryAddress) =>
-				invokePath(name, (finalAddress) =>
-					requirePosix().renameat(directory, temporaryAddress, directory, finalAddress),
-				),
-			);
-			if (result < 0) fail("rename_file");
-			temporaryExists = false;
-			if (requirePosix().fsync(directory) < 0) fail("sync_file");
+			atomicReplaceAt(directory, name, content);
 		} finally {
-			if (temporaryDescriptor !== undefined) closeQuietly(temporaryDescriptor);
-			if (temporaryExists) {
-				try {
-					const result = invokePath(temporaryName, (address) => requirePosix().unlinkat(directory, address, 0));
-					if (result < 0 && errno() !== osConstants.errno.ENOENT) fail("unlink_file");
-				} catch {
-					// Cleanup cannot replace the authoritative write failure.
-				}
-			}
 			closeQuietly(directory);
 		}
 	}

@@ -3,6 +3,7 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readFileSync,
 	readdirSync,
 	renameSync,
 	rmSync,
@@ -82,5 +83,36 @@ describe.skipIf(process.platform === "win32")("Evidence secure filesystem", () =
 		const log = new EventLog(path);
 		log.append({ eventId: "after-crash", type: "completion" });
 		expect(log.readAll().map((event) => event.eventId)).toContain("after-crash");
+	});
+
+	it.each(["claim_created", "event_appended"] as const)("%s 后进程崩溃时相同事件恢复后不丢不重", async (stage) => {
+		const root = temporaryRoot();
+		const path = join(root, "events.jsonl");
+		const ready = join(root, "ready");
+		const script = `
+			import { writeFileSync } from "node:fs";
+			import { EventLog } from ${JSON.stringify(eventLogModule)};
+			import { setSecureFsTestHook } from ${JSON.stringify(secureFsModule)};
+			setSecureFsTestHook((event) => {
+				if (event.stage !== ${JSON.stringify(stage)}) return;
+				writeFileSync(process.argv[2], "ready");
+				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+			});
+			new EventLog(process.argv[1]).append({ eventId: "crash-event", type: "completion" });
+		`;
+		const child = Bun.spawn([process.execPath, "-e", script, path, ready], { stderr: "pipe" });
+		const deadline = Date.now() + 5_000;
+		while (!existsSync(ready) && Date.now() < deadline) await Bun.sleep(10);
+		expect(existsSync(ready)).toBeTrue();
+		child.kill("SIGKILL");
+		await child.exited;
+
+		const log = new EventLog(path);
+		log.append({ eventId: "crash-event", type: "completion" });
+		const physicalEvents = readFileSync(path, "utf8")
+			.split("\n")
+			.filter((line) => line.includes('"eventId":"crash-event"'));
+		expect(physicalEvents).toHaveLength(1);
+		expect(log.readAll().filter((event) => event.eventId === "crash-event")).toHaveLength(1);
 	});
 });

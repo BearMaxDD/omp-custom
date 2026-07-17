@@ -8,8 +8,7 @@ export interface EvidenceEvent {
 }
 
 export interface EvidenceRecoveryEvent extends EvidenceEvent {
-	type: "evidence_log_recovered";
-	reason: "truncated_tail";
+	type: "recovery_truncated_tail";
 	timestamp: string;
 	truncatedBytes: number;
 }
@@ -42,8 +41,7 @@ function recoveryEventFor(content: string, truncatedTail: string): EvidenceRecov
 	const digest = createHash("sha256").update(content).digest("hex");
 	return {
 		eventId: `recovery:truncated-tail:${digest}`,
-		type: "evidence_log_recovered",
-		reason: "truncated_tail",
+		type: "recovery_truncated_tail",
 		timestamp: new Date().toISOString(),
 		truncatedBytes: Buffer.byteLength(truncatedTail),
 	};
@@ -96,10 +94,7 @@ export class EventLog<T extends EvidenceEvent = EvidenceEvent> {
 
 	append(event: T): void {
 		try {
-			this.scope.withLockedFile(this.fileName, { createDirectory: true, createFile: true }, (file) => {
-				const { seen } = parseEvents<T>(file.read().toString("utf8"));
-				if (!seen.has(event.eventId)) file.append(Buffer.from(`${JSON.stringify(event)}\n`));
-			});
+			this.scope.appendIdempotent(this.fileName, event.eventId, Buffer.from(`${JSON.stringify(event)}\n`));
 		} catch (error) {
 			if (error instanceof EvidencePersistenceError) throw error;
 			throw new EvidencePersistenceError("append_event", this.path, error);
@@ -108,21 +103,24 @@ export class EventLog<T extends EvidenceEvent = EvidenceEvent> {
 
 	readAll(): T[] {
 		try {
-			return (
-				this.scope.withLockedFile(this.fileName, { createDirectory: false, createFile: false }, (file) => {
-					const content = file.read().toString("utf8");
-					const parsed = parseEvents<T>(content);
-					if (parsed.truncatedTail === undefined) return parsed.events;
+			const result = this.scope.withLockedFile(this.fileName, { createDirectory: false, createFile: false }, (file) => {
+				const content = file.read().toString("utf8");
+				return { content, parsed: parseEvents<T>(content) };
+			});
+			if (result === undefined) return [];
+			if (result.parsed.truncatedTail === undefined) return result.parsed.events;
 
-					const recovery = recoveryEventFor(content, parsed.truncatedTail);
-					if (!parsed.seen.has(recovery.eventId)) {
-						const prefix = content.endsWith("\n") ? "" : "\n";
-						file.append(Buffer.from(`${prefix}${JSON.stringify(recovery)}\n`));
-						parsed.events.push(recovery as unknown as T);
-					}
-					return parsed.events;
-				}) ?? []
-			);
+			const recovery = recoveryEventFor(result.content, result.parsed.truncatedTail);
+			if (!result.parsed.seen.has(recovery.eventId)) {
+				const prefix = result.content.endsWith("\n") ? "" : "\n";
+				this.scope.appendIdempotent(
+					this.fileName,
+					recovery.eventId,
+					Buffer.from(`${prefix}${JSON.stringify(recovery)}\n`),
+				);
+				result.parsed.events.push(recovery as unknown as T);
+			}
+			return result.parsed.events;
 		} catch (error) {
 			if (error instanceof EvidencePersistenceError) throw error;
 			throw new EvidencePersistenceError("read_event_log", this.path, error);
