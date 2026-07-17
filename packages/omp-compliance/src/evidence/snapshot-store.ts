@@ -1,3 +1,4 @@
+import { dirname, join } from "node:path";
 import { EvidencePersistenceError } from "./event-log";
 import { SecurePathScope, secureFileName } from "./secure-fs";
 
@@ -36,6 +37,15 @@ export class SnapshotStore {
 		} catch (error) {
 			if (error instanceof EvidencePersistenceError) throw error;
 			throw new EvidencePersistenceError("write_snapshot", this.path, error);
+		}
+	}
+
+	recover(): string[] {
+		try {
+			return this.scope.removeAtomicTemps(this.fileName).map((name) => join(dirname(this.path), name));
+		} catch (error) {
+			if (error instanceof EvidencePersistenceError) throw error;
+			throw new EvidencePersistenceError("recover_snapshot", this.path, error);
 		}
 	}
 }

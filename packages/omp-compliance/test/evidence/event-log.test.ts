@@ -1,8 +1,17 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	readdirSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { EventLog, EvidencePersistenceError } from "../../src/evidence/event-log";
+import { EventLog, EvidencePersistenceError, deterministicEvidenceEventId } from "../../src/evidence/event-log";
 import type { SecurePathScope } from "../../src/evidence/secure-fs";
 
 interface TestEvent {
@@ -18,6 +27,10 @@ function temporaryRoot(): string {
 	const root = mkdtempSync(join(tmpdir(), "omp-event-log-"));
 	roots.push(root);
 	return root;
+}
+
+function eventId(identity: string): string {
+	return deterministicEvidenceEventId(`test\0${identity}`);
 }
 
 async function runConcurrentChildren(script: string, args: string[], count = 12): Promise<void> {
@@ -41,21 +54,45 @@ afterEach(() => {
 });
 
 describe("EventLog", () => {
+	it.each([
+		"event-1",
+		"550e8400-e29b-11d4-a716-446655440000",
+		"550e8400-e29b-41d4-7716-446655440000",
+		"550e8400-e29b-61d4-a716-446655440000",
+	])("拒绝不符合 UUID v4/v5/v7 与 RFC variant 的 eventId：%s", (eventId) => {
+		const path = join(temporaryRoot(), "events.jsonl");
+		expect(() => new EventLog<TestEvent>(path).append({ eventId, type: "completion" })).toThrow(
+			EvidencePersistenceError,
+		);
+		expect(existsSync(path)).toBe(false);
+	});
+
+	it.each([
+		"550e8400-e29b-41d4-a716-446655440000",
+		"550e8400-e29b-51d4-b716-446655440000",
+		"01890f9e-7b5a-7cc3-98f4-446655440000",
+	])("接受标准 UUID eventId：%s", (eventId) => {
+		const path = join(temporaryRoot(), "events.jsonl");
+		new EventLog<TestEvent>(path).append({ eventId, type: "completion" });
+		expect(new EventLog<TestEvent>(path).readAll()).toEqual([{ eventId, type: "completion" }]);
+	});
+
 	it("正常唯一事件追加不读取或解析既有日志", () => {
 		const path = join(temporaryRoot(), "events.jsonl");
+		const hotPathEventId = eventId("hot-path");
 		let appendCalls = 0;
 		const scope = {
 			appendIdempotent(_name: string, eventId: string, content: Buffer) {
 				appendCalls += 1;
-				expect(eventId).toBe("event-hot-path");
-				expect(content.toString("utf8")).toContain('"eventId":"event-hot-path"');
+				expect(eventId).toBe(hotPathEventId);
+				expect(content.toString("utf8")).toContain(`"eventId":"${hotPathEventId}"`);
 			},
 			withLockedFile() {
 				throw new Error("正常追加热路径不得读取全日志");
 			},
 		} as unknown as SecurePathScope;
 
-		new EventLog<TestEvent>(path, scope).append({ eventId: "event-hot-path", type: "completion" });
+		new EventLog<TestEvent>(path, scope).append({ eventId: hotPathEventId, type: "completion" });
 
 		expect(appendCalls).toBe(1);
 	});
@@ -64,19 +101,21 @@ describe("EventLog", () => {
 		const path = join(temporaryRoot(), "events.jsonl");
 		const log = new EventLog<TestEvent>(path);
 
-		log.append({ eventId: "event-1", type: "first" });
+		const firstEventId = eventId("event-1");
+		const secondEventId = eventId("event-2");
+		log.append({ eventId: firstEventId, type: "first" });
 		const firstIdentity = statSync(path).ino;
-		log.append({ eventId: "event-2", type: "second" });
+		log.append({ eventId: secondEventId, type: "second" });
 
 		expect(statSync(path).ino).toBe(firstIdentity);
 		expect(readFileSync(path, "utf8").trim().split("\n")).toHaveLength(2);
-		expect(log.readAll().map((event) => event.eventId)).toEqual(["event-1", "event-2"]);
+		expect(log.readAll().map((event) => event.eventId)).toEqual([firstEventId, secondEventId]);
 	});
 
 	it("相同 eventId 重试只产生一条可见及物理记录", () => {
 		const path = join(temporaryRoot(), "events.jsonl");
 		const log = new EventLog<TestEvent>(path);
-		const event = { eventId: "stable-event", type: "completion" };
+		const event = { eventId: eventId("stable-event"), type: "completion" };
 
 		log.append(event);
 		log.append(event);
@@ -88,12 +127,12 @@ describe("EventLog", () => {
 	it("claim 文件名只使用 eventId 的 SHA-256 摘要", () => {
 		const root = temporaryRoot();
 		const path = join(root, "events.jsonl");
-		new EventLog<TestEvent>(path).append({ eventId: "../../untrusted/event", type: "completion" });
+		new EventLog<TestEvent>(path).append({ eventId: eventId("claim-name"), type: "completion" });
 
 		const claims = readdirSync(join(root, ".events.jsonl.claims"));
 		expect(claims).toHaveLength(1);
 		expect(claims[0]).toMatch(/^[a-f0-9]{64}\.claim$/);
-		expect(claims[0]).not.toContain("untrusted");
+		expect(claims[0]).not.toContain("-");
 	});
 
 	it("读取时按 eventId 去重跨进程重试留下的重复行", () => {
@@ -118,6 +157,7 @@ describe("EventLog", () => {
 			type: "recovery_truncated_tail",
 		});
 		expect(secondRead).toEqual(firstRead);
+		expect(firstRead[1]?.eventId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 		expect(readFileSync(path, "utf8").match(/recovery_truncated_tail/g)).toHaveLength(1);
 	});
 
@@ -126,13 +166,14 @@ describe("EventLog", () => {
 		writeFileSync(path, '{"eventId":"valid","type":"first"}\n{"eventId":"broken', "utf8");
 		const log = new EventLog<TestEvent>(path);
 
-		log.append({ eventId: "good-event", type: "completion" });
+		const goodEventId = eventId("good-event");
+		log.append({ eventId: goodEventId, type: "completion" });
 
 		const events = log.readAll();
-		expect(events.map((event) => event.eventId)).toContain("good-event");
+		expect(events.map((event) => event.eventId)).toContain(goodEventId);
 		expect(events.filter((event) => event.type === "recovery_truncated_tail")).toHaveLength(1);
 		const physical = readFileSync(path, "utf8").split("\n");
-		expect(physical.filter((line) => line.includes('"eventId":"good-event"'))).toHaveLength(1);
+		expect(physical.filter((line) => line.includes(`"eventId":"${goodEventId}"`))).toHaveLength(1);
 		expect(physical.filter((line) => line.includes('"type":"recovery_truncated_tail"'))).toHaveLength(1);
 	});
 
@@ -141,10 +182,11 @@ describe("EventLog", () => {
 		writeFileSync(path, '{"eventId":"valid-no-newline","type":"first"}', "utf8");
 		const log = new EventLog<TestEvent>(path);
 
-		log.append({ eventId: "good-event", type: "completion" });
+		const goodEventId = eventId("good-event");
+		log.append({ eventId: goodEventId, type: "completion" });
 
 		const events = log.readAll();
-		expect(events.map((event) => event.eventId)).toEqual(["valid-no-newline", "good-event"]);
+		expect(events.map((event) => event.eventId)).toEqual(["valid-no-newline", goodEventId]);
 		expect(events.some((event) => event.type === "recovery_truncated_tail")).toBeFalse();
 	});
 
@@ -168,9 +210,9 @@ describe("EventLog", () => {
 		writeFileSync(blockedParent, "not a directory", "utf8");
 		const path = join(blockedParent, "events.jsonl");
 
-		expect(() => new EventLog<TestEvent>(path).append({ eventId: "event-1", type: "completion" })).toThrow(
-			EvidencePersistenceError,
-		);
+		expect(() =>
+			new EventLog<TestEvent>(path).append({ eventId: eventId("write-failure"), type: "completion" }),
+		).toThrow(EvidencePersistenceError);
 	});
 
 	it("多进程并发恢复截断日志只物理追加一条 recovery", async () => {
@@ -193,18 +235,19 @@ describe("EventLog", () => {
 
 	it("多进程并发追加相同 eventId 只产生一条物理记录", async () => {
 		const path = join(temporaryRoot(), "events.jsonl");
+		const sharedEventId = eventId("shared-event");
 		const script = `
 			import { existsSync } from "node:fs";
 			import { EventLog } from ${JSON.stringify(eventLogModule)};
 			while (!existsSync(process.argv[2])) await Bun.sleep(2);
-			new EventLog(process.argv[1]).append({ eventId: "shared-event", type: "completion" });
+			new EventLog(process.argv[1]).append({ eventId: ${JSON.stringify(sharedEventId)}, type: "completion" });
 		`;
 
 		await runConcurrentChildren(script, [path]);
 
 		const physicalEvents = readFileSync(path, "utf8")
 			.split("\n")
-			.filter((line) => line.includes('"eventId":"shared-event"'));
+			.filter((line) => line.includes(`"eventId":"${sharedEventId}"`));
 		expect(physicalEvents).toHaveLength(1);
 	});
 
@@ -212,15 +255,16 @@ describe("EventLog", () => {
 		const root = temporaryRoot();
 		const path = join(root, "events.jsonl");
 		const barrier = join(root, "start");
+		const eventIds = Array.from({ length: 12 }, (_, index) => eventId(`good-${index}`));
 		writeFileSync(path, '{"eventId":"valid","type":"first"}\n{"eventId":"broken', "utf8");
 		const script = `
 			import { existsSync } from "node:fs";
 			import { EventLog } from ${JSON.stringify(eventLogModule)};
 			while (!existsSync(process.argv[3])) await Bun.sleep(2);
-			new EventLog(process.argv[1]).append({ eventId: \`good-\${process.argv[2]}\`, type: "completion" });
+			new EventLog(process.argv[1]).append({ eventId: process.argv[2], type: "completion" });
 		`;
 		const children = Array.from({ length: 12 }, (_, index) =>
-			Bun.spawn([process.execPath, "-e", script, path, String(index), barrier], { stderr: "pipe" }),
+			Bun.spawn([process.execPath, "-e", script, path, eventIds[index] as string, barrier], { stderr: "pipe" }),
 		);
 		writeFileSync(barrier, "start", "utf8");
 		for (const child of children) {
@@ -231,8 +275,8 @@ describe("EventLog", () => {
 
 		const physicalLines = readFileSync(path, "utf8").split("\n");
 		expect(physicalLines.filter((line) => line.includes('"type":"recovery_truncated_tail"'))).toHaveLength(1);
-		for (let index = 0; index < 12; index += 1) {
-			expect(physicalLines.filter((line) => line.includes(`"eventId":"good-${index}"`))).toHaveLength(1);
+		for (const currentEventId of eventIds) {
+			expect(physicalLines.filter((line) => line.includes(`"eventId":"${currentEventId}"`))).toHaveLength(1);
 		}
 	});
 });

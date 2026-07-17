@@ -15,11 +15,14 @@ export interface EvidenceRecoveryEvent extends EvidenceEvent {
 
 export type EvidencePersistenceOperation =
 	| "append_event"
+	| "validate_event_id"
 	| "read_event_log"
 	| "recover_event_log"
 	| "read_snapshot"
 	| "parse_snapshot"
 	| "write_snapshot"
+	| "recover_snapshot"
+	| "recover_repository"
 	| "validate_evidence_path"
 	| "ensure_artifact_directory";
 
@@ -37,10 +40,21 @@ export class EvidencePersistenceError extends Error {
 	}
 }
 
+export function deterministicEvidenceEventId(identity: string): string {
+	const bytes = createHash("sha256").update(identity).digest().subarray(0, 16);
+	bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x50;
+	bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80;
+	const hex = bytes.toString("hex");
+	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+export function isEvidenceEventId(value: string): boolean {
+	return /^[0-9a-f]{8}-[0-9a-f]{4}-[457][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
 function recoveryEventFor(content: string, truncatedTail: string): EvidenceRecoveryEvent {
-	const digest = createHash("sha256").update(content).digest("hex");
 	return {
-		eventId: `recovery:truncated-tail:${digest}`,
+		eventId: deterministicEvidenceEventId(`recovery_truncated_tail\0${content}`),
 		type: "recovery_truncated_tail",
 		timestamp: new Date().toISOString(),
 		truncatedBytes: Buffer.byteLength(truncatedTail),
@@ -53,7 +67,7 @@ function recoveryRecordFor(content: string, truncatedTail: string): SecureRecove
 }
 
 function legacyEventIdFor(line: string): string {
-	return `legacy:${createHash("sha256").update(line).digest("hex")}`;
+	return deterministicEvidenceEventId(`legacy_event\0${line}`);
 }
 
 interface ParsedEvents<T> {
@@ -98,6 +112,13 @@ export class EventLog<T extends EvidenceEvent = EvidenceEvent> {
 	}
 
 	append(event: T): void {
+		if (!isEvidenceEventId(event.eventId)) {
+			throw new EvidencePersistenceError(
+				"validate_event_id",
+				this.path,
+				new Error("Evidence eventId must be an RFC UUID v4, v5, or v7"),
+			);
+		}
 		try {
 			this.scope.appendIdempotent(
 				this.fileName,

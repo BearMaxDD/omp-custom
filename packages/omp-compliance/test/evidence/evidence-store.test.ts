@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { EvidencePersistenceError } from "../../src/evidence/event-log";
@@ -29,9 +29,11 @@ function makeRecord(overrides: Partial<EvidenceRecord> = {}): EvidenceRecord {
 
 describe("EvidenceStore — 写入与重新读取", () => {
 	let store: EvidenceStore;
+	let storeRoot: string;
 
 	beforeEach(() => {
-		store = new EvidenceStore(temporaryRoot());
+		storeRoot = temporaryRoot();
+		store = new EvidenceStore(storeRoot);
 	});
 
 	it("appends and reads back a single record", async () => {
@@ -41,6 +43,19 @@ describe("EvidenceStore — 写入与重新读取", () => {
 		expect(records).toHaveLength(1);
 		expect(records[0].taskId).toBe("task-1");
 		expect(records[0].event).toBe("completion_requested");
+		expect(records[0].eventId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+	});
+
+	it("兼容事件使用确定性 UUIDv5 语义且重试不重复", async () => {
+		const record = makeRecord();
+		await store.append(record);
+		await store.append(record);
+
+		const records = await store.readAll("task-1");
+		expect(records).toHaveLength(1);
+		expect(records[0].eventId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+		const physical = readFileSync(join(storeRoot, "tasks", "task-1", "events.jsonl"), "utf8");
+		expect(physical.trim().split("\n")).toHaveLength(1);
 	});
 
 	it("reads back multiple appended records in order", async () => {

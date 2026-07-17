@@ -1,6 +1,6 @@
 import { FFIType, type Pointer, dlopen, ptr, read } from "bun:ffi";
 import { createHash, randomUUID } from "node:crypto";
-import { constants, lstatSync, realpathSync } from "node:fs";
+import { constants, fstatSync, lstatSync, readdirSync, realpathSync } from "node:fs";
 import { constants as osConstants } from "node:os";
 import { basename, dirname, isAbsolute, parse, resolve, sep } from "node:path";
 
@@ -12,7 +12,8 @@ type SecureFsOperation =
 	| "write_file"
 	| "sync_file"
 	| "rename_file"
-	| "unlink_file";
+	| "unlink_file"
+	| "list_directory";
 
 export class SecureFsError extends Error {
 	constructor(
@@ -26,7 +27,13 @@ export class SecureFsError extends Error {
 }
 
 export interface SecureFsTestEvent {
-	stage: "directory_opened" | "lock_acquired" | "claim_created" | "event_appended" | "tail_recovered";
+	stage:
+		| "directory_opened"
+		| "lock_acquired"
+		| "claim_created"
+		| "event_appended"
+		| "tail_recovered"
+		| "recovery_entries_listed";
 }
 
 let testHook: ((event: SecureFsTestEvent) => void) | undefined;
@@ -287,6 +294,7 @@ export type SecureRecoveryFactory = (content: string, truncatedTail: string) => 
 
 export class SecurePathScope {
 	private readonly components: string[];
+	private readonly absolutePath: string;
 	private readonly anchorDepth: number;
 	private readonly anchorDevice: bigint;
 	private readonly anchorInode: bigint;
@@ -300,6 +308,7 @@ export class SecurePathScope {
 		const rootComponents = absoluteRoot.slice(sep.length).split(sep).filter(Boolean);
 		for (const component of [...rootComponents, ...childDirectories]) assertComponent(component);
 		this.components = [...rootComponents, ...childDirectories];
+		this.absolutePath = `${sep}${this.components.join(sep)}`;
 		this.anchorDepth = canonical.anchorDepth;
 		this.anchorDevice = canonical.anchorDevice;
 		this.anchorInode = canonical.anchorInode;
@@ -520,6 +529,109 @@ export class SecurePathScope {
 			if (child !== undefined) closeQuietly(child);
 			closeQuietly(parent);
 		}
+	}
+
+	listDirectories(): string[] {
+		const directory = this.openDirectory(false);
+		if (directory === undefined) return [];
+		try {
+			return this.discoverEntries(directory).filter((name) => {
+				try {
+					const child = openAt(
+						directory,
+						name,
+						constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+					);
+					closeQuietly(child);
+					return true;
+				} catch (error) {
+					if (
+						error instanceof SecureFsError &&
+						(error.code === osConstants.errno.ENOENT ||
+							error.code === osConstants.errno.ENOTDIR ||
+							error.code === osConstants.errno.ELOOP)
+					) {
+						return false;
+					}
+					throw error;
+				}
+			});
+		} finally {
+			closeQuietly(directory);
+		}
+	}
+
+	removeAtomicTemps(fileName: string): string[] {
+		assertComponent(fileName);
+		const directory = this.openDirectory(false);
+		if (directory === undefined) return [];
+		const escapedFileName = fileName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		const temporaryPattern = new RegExp(
+			`^\\.${escapedFileName}\\.[0-9a-f]{8}-[0-9a-f]{4}-[457][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.tmp$`,
+			"i",
+		);
+		const removed: string[] = [];
+		let locked = false;
+		try {
+			if (requirePosix().flock(directory, LOCK_EX) < 0) fail("lock_file");
+			locked = true;
+			for (const name of this.discoverEntries(directory)) {
+				if (!temporaryPattern.test(name)) continue;
+				let descriptor: number | undefined;
+				try {
+					descriptor = openAt(directory, name, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+					if (!fstatSync(descriptor).isFile()) continue;
+				} catch (error) {
+					if (
+						error instanceof SecureFsError &&
+						(error.code === osConstants.errno.ENOENT || error.code === osConstants.errno.ELOOP)
+					) {
+						continue;
+					}
+					throw error;
+				} finally {
+					if (descriptor !== undefined) closeQuietly(descriptor);
+				}
+
+				const result = invokePath(name, (address) => requirePosix().unlinkat(directory, address, 0));
+				if (result < 0) {
+					if (errno() === osConstants.errno.ENOENT) continue;
+					fail("unlink_file");
+				}
+				removed.push(name);
+			}
+			if (removed.length > 0 && requirePosix().fsync(directory) < 0) fail("sync_file");
+			return removed;
+		} finally {
+			if (locked) requirePosix().flock(directory, LOCK_UN);
+			closeQuietly(directory);
+		}
+	}
+
+	private discoverEntries(directory: number): string[] {
+		let entries: string[];
+		try {
+			entries = readdirSync(this.absolutePath);
+		} catch (error) {
+			throw new SecureFsError("list_directory", undefined, error);
+		}
+		testHook?.({ stage: "recovery_entries_listed" });
+		let status: ReturnType<typeof lstatSync>;
+		try {
+			status = lstatSync(this.absolutePath, { bigint: true });
+		} catch (error) {
+			throw new SecureFsError("list_directory", undefined, error);
+		}
+		const identity = directoryIdentity(directory);
+		if (
+			status.isSymbolicLink() ||
+			!status.isDirectory() ||
+			status.dev !== identity.device ||
+			status.ino !== identity.inode
+		) {
+			throw new SecureFsError("list_directory", undefined, new Error("Secure directory identity changed"));
+		}
+		return entries;
 	}
 
 	private openDirectory(create: boolean): number | undefined {

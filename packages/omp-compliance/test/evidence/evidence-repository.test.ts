@@ -1,13 +1,25 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	readdirSync,
+	renameSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { EvidencePersistenceError } from "../../src/evidence/event-log";
+import { EvidencePersistenceError, deterministicEvidenceEventId } from "../../src/evidence/event-log";
 import {
 	EvidenceRepository,
 	EvidenceTaskRepository,
 	type EvidenceTaskState,
 } from "../../src/evidence/evidence-repository";
+import { setSecureFsTestHook } from "../../src/evidence/secure-fs";
 import { SnapshotStore } from "../../src/evidence/snapshot-store";
 
 const roots: string[] = [];
@@ -22,6 +34,7 @@ afterEach(() => {
 	for (const root of roots.splice(0)) {
 		rmSync(root, { recursive: true, force: true });
 	}
+	setSecureFsTestHook(undefined);
 });
 
 describe("EvidenceRepository", () => {
@@ -65,8 +78,6 @@ describe("EvidenceRepository", () => {
 			reviews: join(root, "tasks", "task-123", "reviews"),
 			codebase: join(root, "tasks", "task-123", "codebase"),
 			delegations: join(root, "tasks", "task-123", "delegations"),
-			topics: join(root, "tasks", "task-123", "topics"),
-			overrides: join(root, "tasks", "task-123", "overrides.jsonl"),
 		});
 		expect(existsSync(root)).toBe(false);
 
@@ -112,7 +123,9 @@ describe("EvidenceRepository", () => {
 
 		const write = () => {
 			if (target === "state") task.state.write({ status: "active", attempt: 1 });
-			if (target === "events") task.events.append({ eventId: "event-1", type: "task_started" });
+			if (target === "events") {
+				task.events.append({ eventId: deterministicEvidenceEventId("tasks-symlink"), type: "task_started" });
+			}
 			if (target === "reviews") task.ensureArtifactDirectory("reviews");
 		};
 
@@ -131,7 +144,9 @@ describe("EvidenceRepository", () => {
 
 		const write = () => {
 			if (target === "state") task.state.write({ status: "active", attempt: 1 });
-			if (target === "events") task.events.append({ eventId: "event-1", type: "task_started" });
+			if (target === "events") {
+				task.events.append({ eventId: deterministicEvidenceEventId("task-symlink"), type: "task_started" });
+			}
 			if (target === "reviews") task.ensureArtifactDirectory("reviews");
 		};
 
@@ -148,7 +163,63 @@ describe("EvidenceRepository", () => {
 		expect(existsSync(task.paths.reviews)).toBe(true);
 		expect(existsSync(task.paths.codebase)).toBe(false);
 		expect(existsSync(task.paths.delegations)).toBe(false);
-		expect(existsSync(task.paths.topics)).toBe(false);
+	});
+
+	it("topic 与 overrides 使用 TRD 根级布局且构造无副作用", () => {
+		const root = join(temporaryRoot(), "repository");
+		const repository = new EvidenceRepository(root);
+		const topic = repository.topic("topic-123");
+
+		expect(topic.paths).toEqual({
+			root: join(root, "topics", "topic-123"),
+			state: join(root, "topics", "topic-123", "state.json"),
+			events: join(root, "topics", "topic-123", "events.jsonl"),
+			reviews: join(root, "topics", "topic-123", "reviews"),
+		});
+		expect(repository.overrides.path).toBe(join(root, "overrides.jsonl"));
+		expect(existsSync(root)).toBe(false);
+	});
+
+	it.each(["../escape", "topic/child", "topic\\child", "/absolute", "", ".", ".."])(
+		"拒绝不安全 topicId：%s",
+		(topicId) => {
+			expect(() => new EvidenceRepository(temporaryRoot()).topic(topicId)).toThrow("Invalid evidence topicId");
+		},
+	);
+
+	it("recover 发现任务并清理合法崩溃临时快照且重复执行幂等", () => {
+		const root = temporaryRoot();
+		const firstTaskRoot = join(root, "tasks", "task-a");
+		const secondTaskRoot = join(root, "tasks", "task-b");
+		const topicRoot = join(root, "topics", "topic-a");
+		mkdirSync(firstTaskRoot, { recursive: true });
+		mkdirSync(secondTaskRoot, { recursive: true });
+		mkdirSync(topicRoot, { recursive: true });
+		const stateTemp = `.state.json.${randomUUID()}.tmp`;
+		const contractTemp = `.contract.json.${randomUUID()}.tmp`;
+		const topicStateTemp = `.state.json.${randomUUID()}.tmp`;
+		const projectTemp = `.project.json.${randomUUID()}.tmp`;
+		writeFileSync(join(firstTaskRoot, stateTemp), "partial", "utf8");
+		writeFileSync(join(firstTaskRoot, contractTemp), "partial", "utf8");
+		writeFileSync(join(topicRoot, topicStateTemp), "partial", "utf8");
+		writeFileSync(join(root, projectTemp), "partial", "utf8");
+
+		const repository = new EvidenceRepository(root);
+		const first = repository.recover();
+		const second = repository.recover();
+
+		expect(first.taskIds).toEqual(["task-a", "task-b"]);
+		expect(first.topicIds).toEqual(["topic-a"]);
+		expect(first.cleanedTemporarySnapshots.sort()).toEqual(
+			[
+				join(firstTaskRoot, contractTemp),
+				join(firstTaskRoot, stateTemp),
+				join(root, projectTemp),
+				join(topicRoot, topicStateTemp),
+			].sort(),
+		);
+		expect(second).toEqual({ taskIds: ["task-a", "task-b"], topicIds: ["topic-a"], cleanedTemporarySnapshots: [] });
+		expect(readdirSync(firstTaskRoot)).toEqual([]);
 	});
 
 	it("仓库事件日志与快照可重新打开恢复", () => {
@@ -156,11 +227,12 @@ describe("EvidenceRepository", () => {
 		const first = new EvidenceRepository(root).task("task-1");
 		const state: EvidenceTaskState = { status: "active", attempt: 2 };
 		first.state.write(state);
-		first.events.append({ eventId: "event-1", type: "task_started" });
+		const eventId = deterministicEvidenceEventId("repository-reopen");
+		first.events.append({ eventId, type: "task_started" });
 
 		const reopened = new EvidenceRepository(root).task("task-1");
 		expect(reopened.state.read<EvidenceTaskState>()).toEqual(state);
-		expect(reopened.events.readAll()).toEqual([{ eventId: "event-1", type: "task_started" }]);
+		expect(reopened.events.readAll()).toEqual([{ eventId, type: "task_started" }]);
 	});
 
 	it("底层关键持久化失败保持 EvidencePersistenceError", () => {
@@ -198,5 +270,67 @@ describe("SnapshotStore", () => {
 		mkdirSync(path);
 
 		expect(() => new SnapshotStore(path).read()).toThrow(EvidencePersistenceError);
+	});
+
+	it("recover 只清理本快照合法 UUID 临时文件且不跟随 symlink", () => {
+		const root = temporaryRoot();
+		const outside = join(root, "outside.json");
+		const path = join(root, "state.json");
+		const validTemp = `.state.json.${randomUUID()}.tmp`;
+		const symlinkTemp = `.state.json.${randomUUID()}.tmp`;
+		writeFileSync(join(root, validTemp), "partial", "utf8");
+		writeFileSync(join(root, ".state.json.not-a-uuid.tmp"), "unknown", "utf8");
+		writeFileSync(join(root, ".contract.json.550e8400-e29b-41d4-a716-446655440000.tmp"), "other", "utf8");
+		writeFileSync(outside, "outside", "utf8");
+		symlinkSync(outside, join(root, symlinkTemp));
+
+		const store = new SnapshotStore(path);
+		expect(store.recover()).toEqual([join(root, validTemp)]);
+		expect(store.recover()).toEqual([]);
+		expect(readdirSync(root).sort()).toEqual(
+			[
+				".contract.json.550e8400-e29b-41d4-a716-446655440000.tmp",
+				".state.json.not-a-uuid.tmp",
+				symlinkTemp,
+				"outside.json",
+			].sort(),
+		);
+	});
+
+	it("Repository recover 拒绝 tasks symlink 且不清理外部临时文件", () => {
+		const sandbox = temporaryRoot();
+		const root = join(sandbox, "repository");
+		const outside = join(sandbox, "outside");
+		mkdirSync(root);
+		mkdirSync(outside);
+		const tempName = `.state.json.${randomUUID()}.tmp`;
+		writeFileSync(join(outside, tempName), "outside", "utf8");
+		symlinkSync(outside, join(root, "tasks"), "dir");
+
+		expect(() => new EvidenceRepository(root).recover()).toThrow(EvidencePersistenceError);
+		expect(readFileSync(join(outside, tempName), "utf8")).toBe("outside");
+	});
+
+	it("recover 名称发现后目录被替换时失败关闭且不删除外部文件", () => {
+		const sandbox = temporaryRoot();
+		const taskRoot = join(sandbox, "task");
+		const movedTaskRoot = join(sandbox, "task-original");
+		const outside = join(sandbox, "outside");
+		mkdirSync(taskRoot);
+		mkdirSync(outside);
+		const tempName = `.state.json.${randomUUID()}.tmp`;
+		writeFileSync(join(taskRoot, tempName), "inside", "utf8");
+		writeFileSync(join(outside, tempName), "outside", "utf8");
+		const store = new SnapshotStore(join(taskRoot, "state.json"));
+		setSecureFsTestHook((event) => {
+			if ((event as { stage: string }).stage !== "recovery_entries_listed") return;
+			setSecureFsTestHook(undefined);
+			renameSync(taskRoot, movedTaskRoot);
+			symlinkSync(outside, taskRoot, "dir");
+		});
+
+		expect(() => store.recover()).toThrow(EvidencePersistenceError);
+		expect(readFileSync(join(outside, tempName), "utf8")).toBe("outside");
+		expect(readFileSync(join(movedTaskRoot, tempName), "utf8")).toBe("inside");
 	});
 });

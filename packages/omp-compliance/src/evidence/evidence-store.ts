@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { deterministicEvidenceEventId } from "./event-log";
 import { EvidenceRepository } from "./evidence-repository";
 
 export interface EvidenceRecord {
@@ -35,7 +35,7 @@ function eventIdFor(record: EvidenceRecord): string {
 		record.outputTruncated ?? null,
 		record.commandTruncated ?? null,
 	]);
-	return `evidence:${createHash("sha256").update(identity).digest("hex")}`;
+	return deterministicEvidenceEventId(`evidence_store\0${identity}`);
 }
 
 /**

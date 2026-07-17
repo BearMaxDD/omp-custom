@@ -10,7 +10,7 @@ export interface EvidenceTaskState {
 	[key: string]: unknown;
 }
 
-export type EvidenceArtifactDirectory = "reviews" | "codebase" | "delegations" | "topics";
+export type EvidenceArtifactDirectory = "reviews" | "codebase" | "delegations";
 
 export interface EvidenceTaskPaths {
 	root: string;
@@ -20,13 +20,30 @@ export interface EvidenceTaskPaths {
 	reviews: string;
 	codebase: string;
 	delegations: string;
-	topics: string;
-	overrides: string;
+}
+
+export interface EvidenceTopicPaths {
+	root: string;
+	state: string;
+	events: string;
+	reviews: string;
+}
+
+export interface EvidenceRepositoryRecovery {
+	taskIds: string[];
+	topicIds: string[];
+	cleanedTemporarySnapshots: string[];
 }
 
 function assertSafeTaskId(taskId: string): void {
 	if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(taskId) || taskId === "." || taskId === "..") {
 		throw new Error("Invalid evidence taskId");
+	}
+}
+
+function assertSafeTopicId(topicId: string): void {
+	if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(topicId) || topicId === "." || topicId === "..") {
+		throw new Error("Invalid evidence topicId");
 	}
 }
 
@@ -83,7 +100,6 @@ export class EvidenceTaskRepository {
 	readonly state: SnapshotStore;
 	readonly contract: SnapshotStore;
 	readonly events: EventLog;
-	readonly overrides: EventLog;
 	private readonly scope: SecurePathScope;
 
 	constructor(
@@ -104,13 +120,10 @@ export class EvidenceTaskRepository {
 			reviews: join(taskRoot, "reviews"),
 			codebase: join(taskRoot, "codebase"),
 			delegations: join(taskRoot, "delegations"),
-			topics: join(taskRoot, "topics"),
-			overrides: join(taskRoot, "overrides.jsonl"),
 		};
 		this.state = new SnapshotStore(this.paths.state, this.scope);
 		this.contract = new SnapshotStore(this.paths.contract, this.scope);
 		this.events = new EventLog<EvidenceEvent>(this.paths.events, this.scope);
-		this.overrides = new EventLog<EvidenceEvent>(this.paths.overrides, this.scope);
 	}
 
 	ensureArtifactDirectory(kind: EvidenceArtifactDirectory): string {
@@ -125,17 +138,116 @@ export class EvidenceTaskRepository {
 	}
 }
 
+export class EvidenceTopicRepository {
+	readonly paths: EvidenceTopicPaths;
+	readonly state: SnapshotStore;
+	readonly events: EventLog;
+	private readonly scope: SecurePathScope;
+
+	constructor(
+		root: string,
+		readonly topicId: string,
+		trustedRoot?: string,
+	) {
+		assertSafeTopicId(topicId);
+		const repositoryRoot = resolve(root);
+		const topicRoot = join(repositoryRoot, "topics", topicId);
+		const boundary = repositoryBoundary(repositoryRoot, trustedRoot);
+		this.scope = new SecurePathScope(boundary.trustedRoot, [...boundary.components, "topics", topicId]);
+		this.paths = {
+			root: topicRoot,
+			state: join(topicRoot, "state.json"),
+			events: join(topicRoot, "events.jsonl"),
+			reviews: join(topicRoot, "reviews"),
+		};
+		this.state = new SnapshotStore(this.paths.state, this.scope);
+		this.events = new EventLog<EvidenceEvent>(this.paths.events, this.scope);
+	}
+
+	ensureReviewsDirectory(): string {
+		try {
+			this.scope.ensureDirectory("reviews");
+			return this.paths.reviews;
+		} catch (error) {
+			if (error instanceof EvidencePersistenceError) throw error;
+			throw new EvidencePersistenceError("ensure_artifact_directory", this.paths.reviews, error);
+		}
+	}
+
+	recover(): string[] {
+		return this.state.recover();
+	}
+}
+
 export class EvidenceRepository {
 	readonly root: string;
+	readonly overrides: EventLog;
 	private readonly trustedRoot?: string;
+	private readonly boundary: RepositoryBoundary;
+	private readonly tasksScope: SecurePathScope;
+	private readonly topicsScope: SecurePathScope;
+	private readonly rootSnapshots: SnapshotStore[];
 
 	constructor(root: string, trustedRoot?: string) {
 		this.root = resolve(root);
 		this.trustedRoot = trustedRoot === undefined ? undefined : resolve(trustedRoot);
+		this.boundary = repositoryBoundary(this.root, this.trustedRoot);
+		this.tasksScope = new SecurePathScope(this.boundary.trustedRoot, [...this.boundary.components, "tasks"]);
+		this.topicsScope = new SecurePathScope(this.boundary.trustedRoot, [...this.boundary.components, "topics"]);
+		const rootScope = new SecurePathScope(this.boundary.trustedRoot, this.boundary.components);
+		this.overrides = new EventLog<EvidenceEvent>(join(this.root, "overrides.jsonl"), rootScope);
+		this.rootSnapshots = [
+			new SnapshotStore(join(this.root, "project.json"), rootScope),
+			new SnapshotStore(join(this.root, "scheduler.json"), rootScope),
+		];
 	}
 
 	task(taskId: string): EvidenceTaskRepository {
 		assertSafeTaskId(taskId);
 		return new EvidenceTaskRepository(this.root, taskId, this.trustedRoot);
+	}
+
+	topic(topicId: string): EvidenceTopicRepository {
+		assertSafeTopicId(topicId);
+		return new EvidenceTopicRepository(this.root, topicId, this.trustedRoot);
+	}
+
+	recover(): EvidenceRepositoryRecovery {
+		try {
+			const taskIds = this.tasksScope
+				.listDirectories()
+				.filter((taskId) => {
+					try {
+						assertSafeTaskId(taskId);
+						return true;
+					} catch {
+						return false;
+					}
+				})
+				.sort();
+			const topicIds = this.topicsScope
+				.listDirectories()
+				.filter((topicId) => {
+					try {
+						assertSafeTopicId(topicId);
+						return true;
+					} catch {
+						return false;
+					}
+				})
+				.sort();
+			const cleanedTemporarySnapshots = this.rootSnapshots.flatMap((snapshot) => snapshot.recover());
+			cleanedTemporarySnapshots.push(
+				...taskIds.flatMap((taskId) => {
+					const task = this.task(taskId);
+					return [...task.state.recover(), ...task.contract.recover()];
+				}),
+			);
+			cleanedTemporarySnapshots.push(...topicIds.flatMap((topicId) => this.topic(topicId).recover()));
+			return { taskIds, topicIds, cleanedTemporarySnapshots };
+		} catch (error) {
+			if (error instanceof EvidencePersistenceError) throw error;
+			throw new EvidencePersistenceError("recover_repository", this.root, error);
+		}
 	}
 }
