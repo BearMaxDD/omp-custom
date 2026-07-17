@@ -74,6 +74,7 @@ export interface SecureFsTestEvent {
 		| "claim_journal_target_scan"
 		| "claim_journal_stream_stats"
 		| "event_log_stream_stats"
+		| "tail_recovery_stream_stats"
 		| "legacy_claims_persisted"
 		| "legacy_claims_migrated";
 	bloomBytes?: number;
@@ -363,6 +364,7 @@ function hashFilePrefix(descriptor: number, length: number): Buffer {
 }
 
 interface JsonlStreamResult {
+	trailing: Buffer;
 	trailingBytes: number;
 	nextLine: number;
 	maxReadChunkBytes: number;
@@ -382,6 +384,7 @@ function streamJsonl(
 	firstLine: number,
 	onLine: (line: JsonlLine) => void,
 	onLineTooLong: (line: number, offset: number) => never,
+	onChunk?: (chunk: Buffer) => void,
 ): JsonlStreamResult {
 	let position = start;
 	let carry = Buffer.alloc(0);
@@ -396,6 +399,7 @@ function streamJsonl(
 			Math.min(CLAIM_JOURNAL_CAPACITY_POLICY.readChunkBytes, end - position),
 		);
 		if (chunk.byteLength === 0) fail("read_file");
+		onChunk?.(chunk);
 		maxReadChunkBytes = Math.max(maxReadChunkBytes, chunk.byteLength);
 		position += chunk.byteLength;
 		const combined = carry.byteLength === 0 ? chunk : Buffer.concat([carry, chunk]);
@@ -418,6 +422,7 @@ function streamJsonl(
 		}
 	}
 	return {
+		trailing: carry,
 		trailingBytes: carry.byteLength,
 		nextLine: lineNumber,
 		maxReadChunkBytes,
@@ -573,7 +578,7 @@ export interface SecureRecoveryRecord {
 	content: Buffer;
 }
 
-export type SecureRecoveryFactory = (content: Buffer, truncatedTail: Buffer) => SecureRecoveryRecord;
+export type SecureRecoveryFactory = (originalDigest: Buffer, truncatedBytes: number) => SecureRecoveryRecord;
 
 type ClaimState = "pending" | "done";
 
@@ -1016,8 +1021,29 @@ export class SecurePathScope {
 		if (bytesRead !== 1) fail("read_file");
 		if (finalByte[0] === 0x0a) return;
 
-		const content = readAll(logDescriptor);
-		const truncatedTail = content.subarray(content.lastIndexOf(0x0a) + 1);
+		const recoveryHasher = createRecoveryTruncatedTailHasher();
+		const streamed = streamJsonl(
+			logDescriptor,
+			0,
+			size,
+			1,
+			() => undefined,
+			(line, offset) => {
+				throw new SecureFsError(
+					"read_file",
+					undefined,
+					new EvidenceLogCorruptionError(line, offset, "event_line_too_long"),
+				);
+			},
+			(chunk) => recoveryHasher.update(chunk),
+		);
+		testHook?.({
+			stage: "tail_recovery_stream_stats",
+			maxReadChunkBytes: streamed.maxReadChunkBytes,
+			maxCarryBytes: streamed.maxCarryBytes,
+			scannedBytes: size,
+		});
+		const truncatedTail = streamed.trailing;
 		try {
 			JSON.parse(truncatedTail.toString("utf8"));
 			if (Number(retryPosix("lseek", () => requirePosix().lseek(logDescriptor, 0, SEEK_END))) < 0) {
@@ -1030,7 +1056,7 @@ export class SecurePathScope {
 			if (error instanceof SecureFsError) throw error;
 		}
 
-		const recovery = recoveryFactory(content, truncatedTail);
+		const recovery = recoveryFactory(recoveryHasher.digest(), truncatedTail.byteLength);
 		this.appendClaimedWhileLocked(
 			journalDescriptor,
 			journal,

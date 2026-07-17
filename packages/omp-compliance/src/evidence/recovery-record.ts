@@ -34,11 +34,27 @@ export function createRecoveryTruncatedTailEvent(
 	truncatedTail: Buffer,
 	timestamp = new Date().toISOString(),
 ): RecoveryTruncatedTailEvent {
+	return createRecoveryTruncatedTailEventFromDigest(
+		recoveryTruncatedTailDigest(originalContent),
+		truncatedTail.byteLength,
+		timestamp,
+	);
+}
+
+export function createRecoveryTruncatedTailEventFromDigest(
+	originalDigest: Buffer,
+	truncatedBytes: number,
+	timestamp = new Date().toISOString(),
+): RecoveryTruncatedTailEvent {
+	if (originalDigest.byteLength !== 32) throw new TypeError("Recovery digest must be a SHA-256 digest");
+	if (!Number.isSafeInteger(truncatedBytes) || truncatedBytes < 0) {
+		throw new TypeError("Recovery truncatedBytes must be a non-negative safe integer");
+	}
 	return {
-		eventId: evidenceUuidFromDigest(recoveryTruncatedTailDigest(originalContent)),
+		eventId: evidenceUuidFromDigest(originalDigest),
 		type: "recovery_truncated_tail",
 		timestamp,
-		truncatedBytes: truncatedTail.byteLength,
+		truncatedBytes,
 	};
 }
 
@@ -59,6 +75,7 @@ export function isRecoveryTruncatedTailForDigest(
 	originalDigest: Buffer,
 	truncatedBytes: number,
 ): value is RecoveryTruncatedTailEvent {
+	if (originalDigest.byteLength !== 32) return false;
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const record = value as Record<string, unknown>;
 	const fields = Object.keys(record).sort();

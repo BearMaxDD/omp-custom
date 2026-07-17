@@ -2,6 +2,7 @@ import { basename, dirname, join } from "node:path";
 import {
 	type RecoveryTruncatedTailEvent,
 	createRecoveryTruncatedTailEvent,
+	createRecoveryTruncatedTailEventFromDigest,
 	deterministicEvidenceEventId,
 	isRecoveryTruncatedTailFor,
 } from "./recovery-record";
@@ -59,8 +60,8 @@ function recoveryEventFor(content: Buffer, truncatedTail: Buffer): EvidenceRecov
 	return createRecoveryTruncatedTailEvent(content, truncatedTail);
 }
 
-function recoveryRecordFor(content: Buffer, truncatedTail: Buffer): SecureRecoveryRecord {
-	const recovery = recoveryEventFor(content, truncatedTail);
+function recoveryRecordFor(originalDigest: Buffer, truncatedBytes: number): SecureRecoveryRecord {
+	const recovery = createRecoveryTruncatedTailEventFromDigest(originalDigest, truncatedBytes);
 	return { eventId: recovery.eventId, content: Buffer.from(`${JSON.stringify(recovery)}\n`) };
 }
 

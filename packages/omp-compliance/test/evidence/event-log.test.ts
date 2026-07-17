@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
 import {
+	appendFileSync,
 	closeSync,
+	copyFileSync,
+	createReadStream,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -62,6 +65,31 @@ function overwriteLineStart(path: string, position: "first" | "middle" | "last")
 	}
 	utimesSync(path, before.atime, before.mtime);
 	return { line: line + 1, offset };
+}
+
+async function countFileOccurrences(path: string, needle: string): Promise<number> {
+	let carry = "";
+	let count = 0;
+	for await (const chunk of createReadStream(path, { highWaterMark: 64 * 1024 })) {
+		const content = carry + (chunk as Buffer).toString("utf8");
+		const safeLength = Math.max(0, content.length - (needle.length - 1));
+		let offset = 0;
+		for (;;) {
+			const found = content.indexOf(needle, offset);
+			if (found < 0 || found >= safeLength) break;
+			count += 1;
+			offset = found + needle.length;
+		}
+		carry = content.slice(safeLength);
+	}
+	let offset = 0;
+	for (;;) {
+		const found = carry.indexOf(needle, offset);
+		if (found < 0) break;
+		count += 1;
+		offset = found + needle.length;
+	}
+	return count;
 }
 
 async function runConcurrentChildren(script: string, args: string[], count = 12): Promise<void> {
@@ -1028,6 +1056,54 @@ describe("EventLog", () => {
 				.match(/recovery_truncated_tail/g),
 		).toHaveLength(1);
 	});
+
+	it("约 60 MiB 事件日志的单字节和多字节截断尾部均以有界流式读取恢复", async () => {
+		const root = temporaryRoot();
+		const basePath = join(root, "large-base.jsonl");
+		const repeated = Buffer.from(
+			`${JSON.stringify({ eventId: eventId("large-prefix"), type: "large", payload: "x".repeat(60 * 1024) })}\n`,
+		);
+		const descriptor = openSync(basePath, "w");
+		try {
+			const repeats = Math.ceil((60 * 1024 * 1024) / repeated.byteLength);
+			for (let index = 0; index < repeats; index += 1) writeSync(descriptor, repeated);
+		} finally {
+			closeSync(descriptor);
+		}
+
+		for (const [name, tail] of [
+			["single-byte", Buffer.from([0xe2])],
+			["multi-byte", Buffer.from("中").subarray(0, 2)],
+		] as const) {
+			const path = join(root, `${name}.jsonl`);
+			copyFileSync(basePath, path);
+			appendFileSync(path, tail);
+			let maxReadChunkBytes = 0;
+			let maxCarryBytes = 0;
+			setSecureFsTestHook((event) => {
+				const detail = event as unknown as {
+					stage: string;
+					maxReadChunkBytes?: number;
+					maxCarryBytes?: number;
+				};
+				if (detail.stage !== "tail_recovery_stream_stats") return;
+				maxReadChunkBytes = Math.max(maxReadChunkBytes, detail.maxReadChunkBytes ?? 0);
+				maxCarryBytes = Math.max(maxCarryBytes, detail.maxCarryBytes ?? 0);
+			});
+			const appendedId = eventId(`large-${name}`);
+			const log = new EventLog<TestEvent>(path);
+
+			log.append({ eventId: appendedId, type: "appended" });
+			const events = log.readAll();
+
+			expect(maxReadChunkBytes).toBeGreaterThan(0);
+			expect(maxReadChunkBytes).toBeLessThanOrEqual(64 * 1024);
+			expect(maxCarryBytes).toBeLessThanOrEqual(64 * 1024);
+			expect(events.filter((event) => event.type === "recovery_truncated_tail")).toHaveLength(1);
+			expect(events.some((event) => event.eventId === appendedId)).toBeTrue();
+			expect(await countFileOccurrences(path, '"type":"recovery_truncated_tail"')).toBe(1);
+		}
+	}, 30_000);
 
 	it("不同非法尾字节生成不同的确定性 recovery eventId", () => {
 		const ids = [0xe2, 0xe3].map((byte) => {
