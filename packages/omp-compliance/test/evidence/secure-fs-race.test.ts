@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { EventLog, deterministicEvidenceEventId } from "../../src/evidence/event-log";
+import { EventLog, EvidencePersistenceError, deterministicEvidenceEventId } from "../../src/evidence/event-log";
 import { EvidenceTaskRepository } from "../../src/evidence/evidence-repository";
 import {
 	SecurePathScope,
@@ -230,28 +230,33 @@ describe.skipIf(process.platform === "win32")("Evidence secure filesystem", () =
 		log.append({ eventId: firstId, type: "test" });
 		expect(readFileSync(logPath, "utf8").match(new RegExp(firstId, "g"))).toHaveLength(1);
 	});
-	it.each(["state", "events"] as const)("父目录在锚定后被替换时 %s 不写入外部", (kind) => {
+	it.each(["state", "events"] as const)("提交后规范路径被替换时 %s 写入失败且不写入外部", (kind) => {
 		const root = temporaryRoot();
 		const outside = join(root, "outside");
 		const parked = join(root, "parked-task");
 		mkdirSync(outside);
 		const task = new EvidenceTaskRepository(join(root, "evidence"), "task-race");
 		let replaced = false;
+		let journalAppends = 0;
 		setSecureFsTestHook((event) => {
-			if (event.stage !== "directory_opened" || replaced) return;
+			if (event.stage === "claim_journal_appended") journalAppends += 1;
+			const shouldReplace = kind === "state" ? event.stage === "snapshot_temp_synced" : journalAppends === 2;
+			if (!shouldReplace || replaced) return;
 			replaced = true;
 			renameSync(task.paths.root, parked);
 			symlinkSync(outside, task.paths.root, "dir");
 		});
 
-		if (kind === "state") {
-			task.state.write({ status: "running" });
-		} else {
-			task.events.append({ eventId: deterministicEvidenceEventId("directory-replaced"), type: "completion" });
-		}
+		const write = () =>
+			kind === "state"
+				? task.state.write({ status: "running" })
+				: task.events.append({ eventId: deterministicEvidenceEventId("directory-replaced"), type: "completion" });
 
+		expect(write).toThrow(EvidencePersistenceError);
+		expect(replaced).toBeTrue();
 		expect(readdirSync(outside)).toEqual([]);
 		expect(existsSync(join(parked, kind === "state" ? "state.json" : "events.jsonl"))).toBeTrue();
+		expect(existsSync(kind === "state" ? task.paths.state : task.paths.events)).toBeFalse();
 	});
 
 	it("持锁进程崩溃后内核释放锁且后续追加可恢复", async () => {

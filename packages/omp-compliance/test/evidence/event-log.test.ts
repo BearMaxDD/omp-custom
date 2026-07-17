@@ -6,6 +6,7 @@ import {
 	mkdtempSync,
 	readFileSync,
 	readdirSync,
+	renameSync,
 	rmSync,
 	statSync,
 	writeFileSync,
@@ -32,6 +33,10 @@ function temporaryRoot(): string {
 
 function eventId(identity: string): string {
 	return deterministicEvidenceEventId(`test\0${identity}`);
+}
+
+function indexedEventId(index: number): string {
+	return `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`;
 }
 
 async function runConcurrentChildren(script: string, args: string[], count = 12): Promise<void> {
@@ -154,6 +159,89 @@ describe("EventLog", () => {
 		expect({ fullReads, deltaReads, journalAppends }).toEqual({ fullReads: 1, deltaReads: 0, journalAppends: 2_000 });
 	});
 
+	it.each([10_000, 100_000])(
+		"%d 个历史事件只保留有界 hot cache、Bloom 与 pending",
+		(count) => {
+			const root = temporaryRoot();
+			const path = join(root, "events.jsonl");
+			const journalPath = join(root, ".events.jsonl.claims.jsonl");
+			const eventIds = Array.from({ length: count }, (_, index) => indexedEventId(index));
+			writeFileSync(
+				path,
+				eventIds.map((currentEventId) => `${JSON.stringify({ eventId: currentEventId, type: "history" })}\n`).join(""),
+				"utf8",
+			);
+			writeFileSync(
+				journalPath,
+				eventIds
+					.map(
+						(currentEventId) =>
+							`${JSON.stringify({ eventId: currentEventId, state: "pending" })}\n${JSON.stringify({ eventId: currentEventId, state: "done" })}\n`,
+					)
+					.join(""),
+				"utf8",
+			);
+			let stats: { bloomBytes: number; hotSize: number; pendingSize: number; targetScans: number } | undefined;
+			let targetScans = 0;
+			setSecureFsTestHook((event) => {
+				const detail = event as unknown as {
+					stage: string;
+					bloomBytes?: number;
+					hotSize?: number;
+					pendingSize?: number;
+				};
+				if (detail.stage === "claim_journal_target_scan") targetScans += 1;
+				if (detail.stage === "claim_journal_cache_stats") {
+					stats = {
+						bloomBytes: detail.bloomBytes ?? -1,
+						hotSize: detail.hotSize ?? -1,
+						pendingSize: detail.pendingSize ?? -1,
+						targetScans,
+					};
+				}
+			});
+
+			const log = new EventLog<TestEvent>(path);
+			log.append({ eventId: eventIds[0] as string, type: "history" });
+			log.append({ eventId: eventIds.at(-1) as string, type: "history" });
+			const newEventId = indexedEventId(count + 1);
+			log.append({ eventId: newEventId, type: "new" });
+
+			expect(stats).toEqual({ bloomBytes: 1024 * 1024, hotSize: 4_096, pendingSize: 0, targetScans: 1 });
+			expect(readFileSync(path, "utf8").match(/\n/g)).toHaveLength(count + 1);
+			expect(log.readAll().filter((event) => event.eventId === eventIds[0])).toHaveLength(1);
+			expect(log.readAll().filter((event) => event.eventId === eventIds.at(-1))).toHaveLength(1);
+		},
+		30_000,
+	);
+
+	it("Bloom 对不同哈希分布的历史 eventId 不产生假阴性", () => {
+		const root = temporaryRoot();
+		const path = join(root, "events.jsonl");
+		const journalPath = join(root, ".events.jsonl.claims.jsonl");
+		const eventIds = Array.from({ length: 10_000 }, (_, index) => indexedEventId(index));
+		writeFileSync(
+			path,
+			eventIds.map((currentEventId) => `${JSON.stringify({ eventId: currentEventId, type: "history" })}\n`).join(""),
+		);
+		writeFileSync(
+			journalPath,
+			eventIds
+				.map(
+					(currentEventId) =>
+						`${JSON.stringify({ eventId: currentEventId, state: "pending" })}\n${JSON.stringify({ eventId: currentEventId, state: "done" })}\n`,
+				)
+				.join(""),
+		);
+		const log = new EventLog<TestEvent>(path);
+
+		for (const historicalId of eventIds.slice(0, 64)) {
+			log.append({ eventId: historicalId, type: "history" });
+		}
+
+		expect(readFileSync(path, "utf8").match(/\n/g)).toHaveLength(10_000);
+	});
+
 	it.each([200, 1_000])(
 		"%d 次 pending 中断恢复后 claim inode 保持常数且事件不丢不重",
 		(count) => {
@@ -226,6 +314,35 @@ describe("EventLog", () => {
 
 		expect({ fullReads, deltaReads }).toEqual({ fullReads: 1, deltaReads: 1 });
 		expect(log.readAll().map((event) => event.eventId)).toEqual([firstEventId, childEventId, finalEventId]);
+	});
+
+	it("claim journal 被原子替换后全量重建有界索引并保持历史幂等", () => {
+		const root = temporaryRoot();
+		const path = join(root, "events.jsonl");
+		const journalPath = join(root, ".events.jsonl.claims.jsonl");
+		const replacementPath = join(root, "replacement.jsonl");
+		const firstEventId = eventId("replace-first");
+		const externalEventId = eventId("replace-external");
+		const log = new EventLog<TestEvent>(path);
+		let fullReads = 0;
+		setSecureFsTestHook((event) => {
+			if (event.stage === "claim_journal_full_read") fullReads += 1;
+		});
+		log.append({ eventId: firstEventId, type: "replace" });
+		writeFileSync(
+			path,
+			`${readFileSync(path, "utf8")}${JSON.stringify({ eventId: externalEventId, type: "replace" })}\n`,
+		);
+		writeFileSync(
+			replacementPath,
+			`${JSON.stringify({ eventId: firstEventId, state: "pending" })}\n${JSON.stringify({ eventId: firstEventId, state: "done" })}\n${JSON.stringify({ eventId: externalEventId, state: "pending" })}\n${JSON.stringify({ eventId: externalEventId, state: "done" })}\n`,
+		);
+		renameSync(replacementPath, journalPath);
+
+		log.append({ eventId: externalEventId, type: "replace" });
+
+		expect(fullReads).toBe(2);
+		expect(log.readAll().filter((event) => event.eventId === externalEventId)).toHaveLength(1);
 	});
 
 	it("claim journal 截断尾部在锁内回退到完整换行后继续追加", () => {

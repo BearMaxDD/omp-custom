@@ -40,8 +40,13 @@ export interface SecureFsTestEvent {
 		| "claim_journal_delta_read"
 		| "claim_journal_appended"
 		| "claim_journal_truncated"
+		| "claim_journal_cache_stats"
+		| "claim_journal_target_scan"
 		| "legacy_claims_persisted"
 		| "legacy_claims_migrated";
+	bloomBytes?: number;
+	hotSize?: number;
+	pendingSize?: number;
 }
 
 let testHook: ((event: SecureFsTestEvent) => void) | undefined;
@@ -364,12 +369,76 @@ interface ClaimJournalRecord {
 	state: ClaimState;
 }
 
+const CLAIM_BLOOM_BYTES = 1024 * 1024;
+const CLAIM_HOT_LIMIT = 4_096;
+
+class ClaimBloom {
+	private readonly bits = Buffer.alloc(CLAIM_BLOOM_BYTES);
+
+	get byteLength(): number {
+		return this.bits.byteLength;
+	}
+
+	add(eventId: string): void {
+		for (const position of this.positions(eventId)) {
+			const byte = position >>> 3;
+			this.bits[byte] = (this.bits[byte] ?? 0) | (1 << (position & 7));
+		}
+	}
+
+	mightContain(eventId: string): boolean {
+		for (const position of this.positions(eventId)) {
+			if (((this.bits[position >>> 3] ?? 0) & (1 << (position & 7))) === 0) return false;
+		}
+		return true;
+	}
+
+	private positions(eventId: string): number[] {
+		const digest = createHash("sha256").update(eventId).digest();
+		const first = digest.readUInt32LE(0);
+		const second = (digest.readUInt32LE(4) | 1) >>> 0;
+		const bitCount = this.bits.byteLength * 8;
+		return Array.from({ length: 7 }, (_, index) => (first + index * second + index * index) % bitCount);
+	}
+}
+
 interface ClaimJournalCache {
 	device: bigint;
 	inode: bigint;
 	offset: number;
 	mtimeNs: bigint;
-	states: Map<string, ClaimState>;
+	bloom: ClaimBloom;
+	hotDone: Map<string, true>;
+	pending: Set<string>;
+}
+
+function rememberDone(cache: ClaimJournalCache, eventId: string): void {
+	cache.hotDone.delete(eventId);
+	cache.hotDone.set(eventId, true);
+	if (cache.hotDone.size > CLAIM_HOT_LIMIT) {
+		const oldest = cache.hotDone.keys().next().value;
+		if (oldest !== undefined) cache.hotDone.delete(oldest);
+	}
+}
+
+function applyClaimRecord(cache: ClaimJournalCache, record: ClaimJournalRecord): void {
+	if (record.state === "pending") {
+		cache.pending.add(record.eventId);
+		cache.hotDone.delete(record.eventId);
+		return;
+	}
+	cache.pending.delete(record.eventId);
+	cache.bloom.add(record.eventId);
+	rememberDone(cache, record.eventId);
+}
+
+function emitClaimCacheStats(cache: ClaimJournalCache): void {
+	testHook?.({
+		stage: "claim_journal_cache_stats",
+		bloomBytes: cache.bloom.byteLength,
+		hotSize: cache.hotDone.size,
+		pendingSize: cache.pending.size,
+	});
 }
 
 function claimState(content: string): { state: "pending" | "done"; eventId?: string } | undefined {
@@ -496,6 +565,7 @@ export class SecurePathScope {
 		let journalDescriptor: number | undefined;
 		let directoryLocked = false;
 		let logLocked = false;
+		let completed = false;
 		try {
 			if (retryPosix("flock", () => requirePosix().flock(directory, LOCK_EX)) < 0) fail("lock_file");
 			directoryLocked = true;
@@ -516,34 +586,46 @@ export class SecurePathScope {
 				logDescriptor,
 			);
 
-			const initialState = journal.states.get(eventId);
-			if (initialState === "done") return;
+			const initialState = this.getClaimState(journalDescriptor, journal, eventId);
+			if (initialState === "done") {
+				completed = true;
+				return;
+			}
 			if (initialState === undefined) {
 				this.appendClaimJournalRecord(journalDescriptor, journal, { eventId, state: "pending" });
 				testHook?.({ stage: "claim_created" });
 			}
 
 			this.recoverUnterminatedTail(logDescriptor, journalDescriptor, journal, recoveryFactory);
-			if (journal.states.get(eventId) === "done") return;
+			if (this.getClaimState(journalDescriptor, journal, eventId) === "done") {
+				completed = true;
+				return;
+			}
 			if (
 				initialState === "pending" &&
 				(migratedEventIds?.has(eventId) ?? fileContainsEventId(logDescriptor, eventId))
 			) {
 				this.appendClaimJournalRecord(journalDescriptor, journal, { eventId, state: "done" });
+				completed = true;
 				return;
 			}
 
 			appendAndSync(logDescriptor, content);
 			testHook?.({ stage: "event_appended" });
 			this.appendClaimJournalRecord(journalDescriptor, journal, { eventId, state: "done" });
+			completed = true;
 		} finally {
-			if (directoryLocked) retryPosix("flock", () => requirePosix().flock(directory, LOCK_UN));
-			if (logDescriptor !== undefined) {
-				if (logLocked) retryPosix("flock", () => requirePosix().flock(logDescriptor as number, LOCK_UN));
-				closeQuietly(logDescriptor);
+			try {
+				if (completed) this.assertCanonicalDirectory(directory);
+			} finally {
+				if (directoryLocked) retryPosix("flock", () => requirePosix().flock(directory, LOCK_UN));
+				if (logDescriptor !== undefined) {
+					if (logLocked) retryPosix("flock", () => requirePosix().flock(logDescriptor as number, LOCK_UN));
+					closeQuietly(logDescriptor);
+				}
+				if (journalDescriptor !== undefined) closeQuietly(journalDescriptor);
+				closeQuietly(directory);
 			}
-			if (journalDescriptor !== undefined) closeQuietly(journalDescriptor);
-			closeQuietly(directory);
 		}
 	}
 
@@ -596,7 +678,7 @@ export class SecurePathScope {
 		eventId: string,
 		content: Buffer,
 	): void {
-		const state = journal.states.get(eventId);
+		const state = this.getClaimState(journalDescriptor, journal, eventId);
 		if (state === "done") return;
 		if (state === undefined) {
 			this.appendClaimJournalRecord(journalDescriptor, journal, { eventId, state: "pending" });
@@ -621,7 +703,15 @@ export class SecurePathScope {
 		const offset = canReadDelta ? (existing?.offset ?? 0) : 0;
 		const cache: ClaimJournalCache = canReadDelta
 			? (existing as ClaimJournalCache)
-			: { device: status.dev, inode: status.ino, offset: 0, mtimeNs: status.mtimeNs, states: new Map() };
+			: {
+					device: status.dev,
+					inode: status.ino,
+					offset: 0,
+					mtimeNs: status.mtimeNs,
+					bloom: new ClaimBloom(),
+					hotDone: new Map(),
+					pending: new Set(),
+				};
 		const size = Number(status.size);
 		if (!Number.isSafeInteger(size))
 			throw new SecureFsError("read_file", undefined, new Error("Claim journal is too large"));
@@ -657,8 +747,7 @@ export class SecurePathScope {
 			) {
 				throw new SecureFsError("read_file", undefined, new Error("Invalid claim journal record"));
 			}
-			const claim = record as ClaimJournalRecord;
-			cache.states.set(claim.eventId, claim.state);
+			applyClaimRecord(cache, record as ClaimJournalRecord);
 		}
 		cache.offset = offset + completeLength;
 		const refreshed = fstatSync(descriptor, { bigint: true });
@@ -666,16 +755,51 @@ export class SecurePathScope {
 		cache.inode = refreshed.ino;
 		cache.mtimeNs = refreshed.mtimeNs;
 		this.claimJournalCache.set(name, cache);
+		emitClaimCacheStats(cache);
 		return cache;
 	}
 
 	private appendClaimJournalRecord(descriptor: number, cache: ClaimJournalCache, record: ClaimJournalRecord): void {
 		const content = Buffer.from(`${JSON.stringify(record)}\n`);
 		appendAndSync(descriptor, content);
-		cache.states.set(record.eventId, record.state);
+		applyClaimRecord(cache, record);
 		cache.offset += content.byteLength;
 		cache.mtimeNs = fstatSync(descriptor, { bigint: true }).mtimeNs;
 		testHook?.({ stage: "claim_journal_appended" });
+		emitClaimCacheStats(cache);
+	}
+
+	private getClaimState(descriptor: number, cache: ClaimJournalCache, eventId: string): ClaimState | undefined {
+		if (cache.pending.has(eventId)) return "pending";
+		if (cache.hotDone.has(eventId)) {
+			rememberDone(cache, eventId);
+			return "done";
+		}
+		if (!cache.bloom.mightContain(eventId)) return undefined;
+
+		testHook?.({ stage: "claim_journal_target_scan" });
+		let state: ClaimState | undefined;
+		for (const line of readAll(descriptor).toString("utf8").split("\n")) {
+			if (!line) continue;
+			let record: ClaimJournalRecord;
+			try {
+				record = JSON.parse(line) as ClaimJournalRecord;
+			} catch (error) {
+				throw new SecureFsError("read_file", undefined, error);
+			}
+			if (record.eventId === eventId && (record.state === "pending" || record.state === "done")) {
+				state = record.state;
+			}
+		}
+		if (state === "done") {
+			cache.pending.delete(eventId);
+			cache.bloom.add(eventId);
+			rememberDone(cache, eventId);
+		} else if (state === "pending") {
+			cache.pending.add(eventId);
+		}
+		emitClaimCacheStats(cache);
+		return state;
 	}
 
 	private migrateLegacyClaims(
@@ -736,7 +860,7 @@ export class SecurePathScope {
 			}
 
 			for (const [legacyEventId, state] of migrated) {
-				const current = journal.states.get(legacyEventId);
+				const current = this.getClaimState(journalDescriptor, journal, legacyEventId);
 				if (current === "done" || current === state) continue;
 				this.appendClaimJournalRecord(journalDescriptor, journal, { eventId: legacyEventId, state });
 			}
@@ -770,13 +894,19 @@ export class SecurePathScope {
 		const directory = this.openDirectory(true);
 		if (directory === undefined) fail("open_directory");
 		testHook?.({ stage: "directory_opened" });
+		let completed = false;
 		try {
 			withNamedLock(directory, `.${name}.lock`, () => {
 				testHook?.({ stage: "snapshot_lock_acquired" });
 				atomicReplaceAt(directory, name, content, () => testHook?.({ stage: "snapshot_temp_synced" }));
 			});
+			completed = true;
 		} finally {
-			closeQuietly(directory);
+			try {
+				if (completed) this.assertCanonicalDirectory(directory);
+			} finally {
+				closeQuietly(directory);
+			}
 		}
 	}
 
@@ -926,6 +1056,22 @@ export class SecurePathScope {
 		} catch (error) {
 			closeQuietly(current);
 			throw error;
+		}
+	}
+
+	private assertCanonicalDirectory(expectedDescriptor: number): void {
+		const canonical = this.openDirectory(false);
+		if (canonical === undefined) {
+			throw new SecureFsError("open_directory", undefined, new Error("Secure directory path disappeared"));
+		}
+		try {
+			const expected = directoryIdentity(expectedDescriptor);
+			const current = directoryIdentity(canonical);
+			if (current.device !== expected.device || current.inode !== expected.inode) {
+				throw new SecureFsError("open_directory", undefined, new Error("Secure directory identity changed"));
+			}
+		} finally {
+			closeQuietly(canonical);
 		}
 	}
 

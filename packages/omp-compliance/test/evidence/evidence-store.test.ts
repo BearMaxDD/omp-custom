@@ -74,9 +74,11 @@ describe("EvidenceStore — 写入与重新读取", () => {
 	it("公共 append 连续写入 1000 个事件时复用 claim journal 增量缓存", async () => {
 		let fullReads = 0;
 		let deltaReads = 0;
+		let targetScans = 0;
 		setSecureFsTestHook((event) => {
 			if (event.stage === "claim_journal_full_read") fullReads += 1;
 			if (event.stage === "claim_journal_delta_read") deltaReads += 1;
+			if (event.stage === "claim_journal_target_scan") targetScans += 1;
 		});
 
 		for (let index = 0; index < 1_000; index += 1) {
@@ -93,7 +95,7 @@ describe("EvidenceStore — 写入与重新读取", () => {
 			.trim()
 			.split("\n");
 		const records = await store.readAll("task-1");
-		expect({ fullReads, deltaReads }).toEqual({ fullReads: 1, deltaReads: 0 });
+		expect({ fullReads, deltaReads, targetScans }).toEqual({ fullReads: 1, deltaReads: 0, targetScans: 0 });
 		expect(physicalLines).toHaveLength(1_000);
 		expect(records).toHaveLength(1_000);
 		expect(records[0]?.event).toBe("event-0");

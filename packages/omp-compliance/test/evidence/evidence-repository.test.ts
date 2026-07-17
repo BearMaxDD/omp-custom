@@ -105,6 +105,61 @@ describe("EvidenceRepository", () => {
 		expect(secondTask.events.readAll()).toEqual([{ eventId: secondEventId, type: "task-b" }]);
 	});
 
+	it("task/topic LRU 在 10 万逻辑 ID 下保持有界", () => {
+		const repository = new EvidenceRepository(temporaryRoot());
+		for (let index = 0; index < 50_000; index += 1) {
+			repository.task(`task-${index}`);
+			repository.topic(`topic-${index}`);
+		}
+		const caches = repository as unknown as {
+			taskRepositories: Map<string, EvidenceTaskRepository>;
+			topicRepositories: Map<string, unknown>;
+		};
+
+		expect(caches.taskRepositories.size).toBeLessThanOrEqual(64);
+		expect(caches.topicRepositories.size).toBeLessThanOrEqual(64);
+	});
+
+	it("LRU get 刷新顺序且淘汰后安全重建保持事件幂等", () => {
+		const root = temporaryRoot();
+		const repository = new EvidenceRepository(root);
+		const first = repository.task("task-0");
+		const evicted = repository.task("task-1");
+		const eventId = deterministicEvidenceEventId("lru-rebuild");
+		evicted.events.append({ eventId, type: "before-eviction" });
+		for (let index = 2; index < 64; index += 1) repository.task(`task-${index}`);
+		expect(repository.task("task-0")).toBe(first);
+		repository.task("task-64");
+
+		expect(repository.task("task-0")).toBe(first);
+		const rebuilt = repository.task("task-1");
+		expect(rebuilt).not.toBe(evicted);
+		rebuilt.events.append({ eventId, type: "before-eviction" });
+		expect(rebuilt.events.readAll()).toEqual([{ eventId, type: "before-eviction" }]);
+		expect(
+			readFileSync(join(root, "tasks", "task-1", "events.jsonl"), "utf8")
+				.trim()
+				.split("\n"),
+		).toHaveLength(1);
+	});
+
+	it("recover 扫描历史任务与专题时不污染 LRU 缓存", () => {
+		const root = temporaryRoot();
+		for (let index = 0; index < 256; index += 1) {
+			mkdirSync(join(root, "tasks", `task-${index}`), { recursive: true });
+			mkdirSync(join(root, "topics", `topic-${index}`), { recursive: true });
+		}
+		const repository = new EvidenceRepository(root);
+		repository.recover();
+		const caches = repository as unknown as {
+			taskRepositories: Map<string, EvidenceTaskRepository>;
+			topicRepositories: Map<string, unknown>;
+		};
+
+		expect(caches.taskRepositories.size).toBe(0);
+		expect(caches.topicRepositories.size).toBe(0);
+	});
+
 	it("recover 后保留任务与专题缓存并继续正确追加", () => {
 		const repository = new EvidenceRepository(temporaryRoot());
 		const task = repository.task("task-a");

@@ -52,6 +52,24 @@ interface RepositoryBoundary {
 	components: string[];
 }
 
+const REPOSITORY_CACHE_LIMIT = 64;
+
+function cachedRepository<T>(cache: Map<string, T>, id: string, create: () => T): T {
+	const existing = cache.get(id);
+	if (existing !== undefined) {
+		cache.delete(id);
+		cache.set(id, existing);
+		return existing;
+	}
+	const repository = create();
+	cache.set(id, repository);
+	if (cache.size > REPOSITORY_CACHE_LIMIT) {
+		const oldest = cache.keys().next().value;
+		if (oldest !== undefined) cache.delete(oldest);
+	}
+	return repository;
+}
+
 function nearestPlainDirectory(path: string): string {
 	let candidate = resolve(path);
 	for (;;) {
@@ -182,7 +200,6 @@ export class EvidenceTopicRepository {
 export class EvidenceRepository {
 	readonly root: string;
 	readonly overrides: EventLog;
-	private readonly trustedRoot?: string;
 	private readonly boundary: RepositoryBoundary;
 	private readonly tasksScope: SecurePathScope;
 	private readonly topicsScope: SecurePathScope;
@@ -192,8 +209,8 @@ export class EvidenceRepository {
 
 	constructor(root: string, trustedRoot?: string) {
 		this.root = resolve(root);
-		this.trustedRoot = trustedRoot === undefined ? undefined : resolve(trustedRoot);
-		this.boundary = repositoryBoundary(this.root, this.trustedRoot);
+		const resolvedTrustedRoot = trustedRoot === undefined ? undefined : resolve(trustedRoot);
+		this.boundary = repositoryBoundary(this.root, resolvedTrustedRoot);
 		this.tasksScope = new SecurePathScope(this.boundary.trustedRoot, [...this.boundary.components, "tasks"]);
 		this.topicsScope = new SecurePathScope(this.boundary.trustedRoot, [...this.boundary.components, "topics"]);
 		const rootScope = new SecurePathScope(this.boundary.trustedRoot, this.boundary.components);
@@ -206,20 +223,20 @@ export class EvidenceRepository {
 
 	task(taskId: string): EvidenceTaskRepository {
 		assertSafeTaskId(taskId);
-		const existing = this.taskRepositories.get(taskId);
-		if (existing) return existing;
-		const repository = new EvidenceTaskRepository(this.root, taskId, this.trustedRoot);
-		this.taskRepositories.set(taskId, repository);
-		return repository;
+		return cachedRepository(
+			this.taskRepositories,
+			taskId,
+			() => new EvidenceTaskRepository(this.root, taskId, this.boundary.trustedRoot),
+		);
 	}
 
 	topic(topicId: string): EvidenceTopicRepository {
 		assertSafeTopicId(topicId);
-		const existing = this.topicRepositories.get(topicId);
-		if (existing) return existing;
-		const repository = new EvidenceTopicRepository(this.root, topicId, this.trustedRoot);
-		this.topicRepositories.set(topicId, repository);
-		return repository;
+		return cachedRepository(
+			this.topicRepositories,
+			topicId,
+			() => new EvidenceTopicRepository(this.root, topicId, this.boundary.trustedRoot),
+		);
 	}
 
 	recover(): EvidenceRepositoryRecovery {
@@ -249,11 +266,15 @@ export class EvidenceRepository {
 			const cleanedTemporarySnapshots = this.rootSnapshots.flatMap((snapshot) => snapshot.recover());
 			cleanedTemporarySnapshots.push(
 				...taskIds.flatMap((taskId) => {
-					const task = this.task(taskId);
+					const task = new EvidenceTaskRepository(this.root, taskId, this.boundary.trustedRoot);
 					return [...task.state.recover(), ...task.contract.recover()];
 				}),
 			);
-			cleanedTemporarySnapshots.push(...topicIds.flatMap((topicId) => this.topic(topicId).recover()));
+			cleanedTemporarySnapshots.push(
+				...topicIds.flatMap((topicId) =>
+					new EvidenceTopicRepository(this.root, topicId, this.boundary.trustedRoot).recover(),
+				),
+			);
 			return { taskIds, topicIds, cleanedTemporarySnapshots };
 		} catch (error) {
 			if (error instanceof EvidencePersistenceError) throw error;
