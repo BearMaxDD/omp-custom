@@ -1,5 +1,10 @@
-import { createHash } from "node:crypto";
 import { basename, dirname, join } from "node:path";
+import {
+	type RecoveryTruncatedTailEvent,
+	createRecoveryTruncatedTailEvent,
+	deterministicEvidenceEventId,
+	isRecoveryTruncatedTailFor,
+} from "./recovery-record";
 import {
 	ClaimJournalCorruptionError,
 	EvidenceLogCorruptionError,
@@ -15,11 +20,7 @@ export interface EvidenceEvent {
 	[key: string]: unknown;
 }
 
-export interface EvidenceRecoveryEvent extends EvidenceEvent {
-	type: "recovery_truncated_tail";
-	timestamp: string;
-	truncatedBytes: number;
-}
+export type EvidenceRecoveryEvent = RecoveryTruncatedTailEvent;
 
 export type EvidencePersistenceOperation =
 	| "append_event"
@@ -48,25 +49,14 @@ export class EvidencePersistenceError extends Error {
 	}
 }
 
-export function deterministicEvidenceEventId(identity: string): string {
-	const bytes = createHash("sha256").update(identity).digest().subarray(0, 16);
-	bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x50;
-	bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80;
-	const hex = bytes.toString("hex");
-	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-}
+export { deterministicEvidenceEventId } from "./recovery-record";
 
 export function isEvidenceEventId(value: string): boolean {
 	return /^[0-9a-f]{8}-[0-9a-f]{4}-[457][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
 function recoveryEventFor(content: string, truncatedTail: string): EvidenceRecoveryEvent {
-	return {
-		eventId: deterministicEvidenceEventId(`recovery_truncated_tail\0${content}`),
-		type: "recovery_truncated_tail",
-		timestamp: new Date().toISOString(),
-		truncatedBytes: Buffer.byteLength(truncatedTail),
-	};
+	return createRecoveryTruncatedTailEvent(content, truncatedTail);
 }
 
 function recoveryRecordFor(content: string, truncatedTail: string): SecureRecoveryRecord {
@@ -106,6 +96,7 @@ function parseEvents<T extends EvidenceEvent>(content: string): ParsedEvents<T> 
 	const events: T[] = [];
 	const seen = new Set<string>();
 	let truncatedTail: string | undefined;
+	const contentBuffer = Buffer.from(content);
 	const lines = content.split("\n");
 	const finalLineIndex = lines.length - 1;
 	let offset = 0;
@@ -130,7 +121,11 @@ function parseEvents<T extends EvidenceEvent>(content: string): ParsedEvents<T> 
 			const next = lines[index + 1];
 			if (next !== undefined) {
 				try {
-					isAuditedTruncatedTail = (JSON.parse(next) as { type?: unknown }).type === "recovery_truncated_tail";
+					isAuditedTruncatedTail = isRecoveryTruncatedTailFor(
+						JSON.parse(next),
+						contentBuffer.subarray(0, lineOffset + Buffer.byteLength(line)),
+						Buffer.from(line),
+					);
 				} catch {
 					isAuditedTruncatedTail = false;
 				}

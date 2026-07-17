@@ -142,7 +142,7 @@ describe("EventLog", () => {
 			},
 			appendIdempotent(_name: string, _eventId: string, content: Buffer) {
 				const generated = JSON.parse(content.toString("utf8").trim()) as Record<string, unknown>;
-				const winner = { ...generated, timestamp: "2000-01-01T00:00:00.000Z", winner: "other-reader" };
+				const winner = { ...generated, timestamp: "2000-01-01T00:00:00.000Z" };
 				persisted = `${original}\n${JSON.stringify(winner)}\n`;
 			},
 		} as unknown as SecurePathScope;
@@ -665,6 +665,77 @@ describe("EventLog", () => {
 				expect(secureCause.cause).toMatchObject({
 					line: 2,
 					offset: Buffer.byteLength(`${first}\n`),
+					reason: "malformed_json",
+				});
+			}
+		}
+		expect(readFileSync(path, "utf8")).toBe(original);
+	});
+
+	it.each(
+		[
+			{
+				name: "伪 eventId",
+				mutate: (record: Record<string, unknown>) => ({
+					...record,
+					eventId: deterministicEvidenceEventId("forged-recovery-id"),
+				}),
+			},
+			{
+				name: "伪 truncatedBytes",
+				mutate: (record: Record<string, unknown>) => ({
+					...record,
+					truncatedBytes: (record.truncatedBytes as number) + 1,
+				}),
+			},
+			{
+				name: "缺少 timestamp",
+				mutate: (record: Record<string, unknown>) => {
+					const { timestamp: _timestamp, ...missingTimestamp } = record;
+					return missingTimestamp;
+				},
+			},
+			{
+				name: "非法 timestamp",
+				mutate: (record: Record<string, unknown>) => ({ ...record, timestamp: "not-an-iso-timestamp" }),
+			},
+			{
+				name: "关联到其他损坏内容",
+				mutate: (record: Record<string, unknown>) => ({
+					...record,
+					eventId: deterministicEvidenceEventId("recovery_truncated_tail\0different-corrupt-content"),
+				}),
+			},
+		].map(({ name, mutate }) => [name, mutate] as const),
+	)("伪造 recovery（%s）不能掩盖完整损坏行", (_name, mutate) => {
+		const path = join(temporaryRoot(), "events.jsonl");
+		const valid = JSON.stringify({ eventId: eventId("before-forged-recovery"), type: "valid" });
+		const malformed = '{"eventId":"broken"';
+		const recoverySource = `${valid}\n${malformed}`;
+		const genuineRecovery: Record<string, unknown> = {
+			eventId: deterministicEvidenceEventId(`recovery_truncated_tail\0${recoverySource}`),
+			type: "recovery_truncated_tail",
+			timestamp: "2026-07-18T00:00:00.000Z",
+			truncatedBytes: Buffer.byteLength(malformed),
+		};
+		const forged = mutate(genuineRecovery);
+		const original = `${recoverySource}\n${JSON.stringify(forged)}\n`;
+		writeFileSync(path, original, "utf8");
+		const log = new EventLog<TestEvent>(path);
+
+		for (const operation of [
+			() => log.readAll(),
+			() => log.append({ eventId: eventId("must-not-follow-forged-recovery"), type: "blocked" }),
+		]) {
+			try {
+				operation();
+				expect.unreachable("伪造 recovery 必须 fail-closed");
+			} catch (error) {
+				expect(error).toBeInstanceOf(EvidencePersistenceError);
+				const secureCause = (error as Error & { cause?: unknown }).cause as Error & { cause?: unknown };
+				expect(secureCause.cause).toMatchObject({
+					line: 2,
+					offset: Buffer.byteLength(`${valid}\n`),
 					reason: "malformed_json",
 				});
 			}

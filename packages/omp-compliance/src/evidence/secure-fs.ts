@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants, fstatSync, lstatSync, readdirSync, realpathSync } from "node:fs";
 import { constants as osConstants } from "node:os";
 import { basename, dirname, isAbsolute, parse, resolve, sep } from "node:path";
+import { isRecoveryTruncatedTailFor } from "./recovery-record";
 
 type SecureFsOperation =
 	| "open_directory"
@@ -773,8 +774,11 @@ export class SecurePathScope {
 				const next = lines[index + 1];
 				if (next !== undefined) {
 					try {
-						isAuditedTruncatedTail =
-							(JSON.parse(next.content) as { type?: unknown }).type === "recovery_truncated_tail";
+						isAuditedTruncatedTail = isRecoveryTruncatedTailFor(
+							JSON.parse(next.content),
+							preadAll(descriptor, 0, line.offset + Buffer.byteLength(line.content)),
+							Buffer.from(line.content),
+						);
 					} catch {
 						isAuditedTruncatedTail = false;
 					}
