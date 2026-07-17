@@ -806,6 +806,23 @@ describe("normalizeRemoteIdentity", () => {
 	});
 
 	it.each([
+		["127.1", "127.0.0.1"],
+		["2130706433", "127.0.0.1"],
+		["0x7f000001", "127.0.0.1"],
+	])("normalizes numeric IPv4 host %s identically for URL and SCP syntax", (host, canonicalHost) => {
+		const url = normalizeRemoteIdentity(`ssh://git@${host}/team/repo.git`);
+		const scp = normalizeRemoteIdentity(`git@${host}:team/repo.git`);
+
+		expect(url).toBe(`git-remote:v1://${canonicalHost}/team/repo`);
+		expect(scp).toBe(url);
+	});
+
+	it.each(["999.999.999.999", "256.1.1.1"])("rejects invalid numeric host %s in URL and SCP syntax", (host) => {
+		expect(normalizeRemoteIdentity(`ssh://git@${host}/team/repo.git`)).toBeUndefined();
+		expect(normalizeRemoteIdentity(`git@${host}:team/repo.git`)).toBeUndefined();
+	});
+
+	it.each([
 		"foo/team/repo",
 		"../team/repo",
 		"./team/repo",
@@ -897,6 +914,23 @@ describe("createProjectContext", () => {
 
 		expect(identity.status).toBe("project_mismatch");
 		expect(() => createProjectContext(identity, randomUUID(), root)).toThrow("OMP project context is invalid");
+	});
+
+	it("rejects a stale bound result after the repository remote changes", () => {
+		const root = initGit("https://github.com/acme/widget.git");
+		const staleBound = ProjectIdentityStore.open(root);
+		git(root, "remote", "set-url", "origin", "https://github.com/acme/other.git");
+
+		expect(ProjectIdentityStore.open(root).status).toBe("project_mismatch");
+		expect(() => createProjectContext(staleBound, randomUUID(), root)).toThrow("OMP project context is invalid");
+	});
+
+	it("accepts an older bound result when a fresh store open still matches", () => {
+		const root = initGit("https://github.com/acme/widget.git");
+		const olderBound = ProjectIdentityStore.open(root, { codebaseProjectId: "codebase-widget" });
+
+		expect(ProjectIdentityStore.open(root, { codebaseProjectId: "codebase-widget" }).status).toBe("bound");
+		expect(createProjectContext(olderBound, randomUUID(), root).projectId).toBe(olderBound.binding.projectId);
 	});
 
 	it("rejects a cwd outside the binding root", () => {

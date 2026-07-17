@@ -368,17 +368,29 @@ function isValidPort(value: string): boolean {
 }
 
 function normalizeRemoteHost(value: string): string | undefined {
-	if (!value.startsWith("[")) {
-		const normalized = (value.endsWith(".") ? value.slice(0, -1) : value).toLowerCase();
+	if (value.startsWith("[")) {
+		try {
+			const hostname = new URL(`http://${value}/`).hostname.toLowerCase();
+			return hostname.startsWith("[") && hostname.endsWith("]") ? hostname : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+	const withoutTerminationPoint = value.endsWith(".") ? value.slice(0, -1) : value;
+	if (!withoutTerminationPoint) return undefined;
+	try {
+		const normalized = new URL(`http://${withoutTerminationPoint}/`).hostname.toLowerCase();
+		if (/^[0-9.]+$/.test(normalized)) {
+			const octets = normalized.split(".");
+			return octets.length === 4 && octets.every((octet) => /^\d+$/.test(octet) && Number(octet) <= 255)
+				? normalized
+				: undefined;
+		}
 		if (!normalized || normalized.length > 253) return undefined;
 		const labels = normalized.split(".");
 		if (labels.some((label) => !label || label.length > 63 || !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label)))
 			return undefined;
 		return normalized;
-	}
-	try {
-		const hostname = new URL(`http://${value}/`).hostname.toLowerCase();
-		return hostname.startsWith("[") && hostname.endsWith("]") ? hostname : undefined;
 	} catch {
 		return undefined;
 	}

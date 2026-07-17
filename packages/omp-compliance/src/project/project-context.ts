@@ -1,6 +1,11 @@
 import { realpathSync } from "node:fs";
 import { isAbsolute, normalize, relative, sep } from "node:path";
-import { type ProjectIdentityResult, isBoundProjectIdentityResult, validateProjectBinding } from "./project-identity";
+import {
+	type ProjectIdentityResult,
+	ProjectIdentityStore,
+	isBoundProjectIdentityResult,
+	validateProjectBinding,
+} from "./project-identity";
 
 export interface ProjectContext {
 	readonly projectId: string;
@@ -29,6 +34,19 @@ export function createProjectContext(
 			!isUuid(sessionId) ||
 			canonicalPath(validatedBinding.canonicalRoot) !== validatedBinding.canonicalRoot ||
 			!isPathWithin(validatedBinding.canonicalRoot, canonicalCwd)
+		) {
+			throw new Error(PROJECT_CONTEXT_INVALID_ERROR);
+		}
+		const freshIdentity = ProjectIdentityStore.open(canonicalCwd, {
+			...(validatedBinding.codebaseProjectId === undefined
+				? {}
+				: { codebaseProjectId: validatedBinding.codebaseProjectId }),
+		});
+		if (
+			freshIdentity.status !== "bound" ||
+			freshIdentity.binding.projectId !== validatedBinding.projectId ||
+			freshIdentity.observedRoot !== validatedBinding.canonicalRoot ||
+			freshIdentity.observedRemote !== validatedBinding.gitRemoteIdentity
 		) {
 			throw new Error(PROJECT_CONTEXT_INVALID_ERROR);
 		}
