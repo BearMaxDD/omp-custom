@@ -42,6 +42,16 @@ afterEach(() => {
 });
 
 describe.skipIf(process.platform === "win32")("Evidence secure filesystem", () => {
+	async function appendInFreshProcess(path: string, eventId: string): Promise<void> {
+		const script = `
+			import { EventLog } from ${JSON.stringify(eventLogModule)};
+			new EventLog(process.argv[1]).append({ eventId: process.argv[2], type: "replacement-retry" });
+		`;
+		const child = Bun.spawn([process.execPath, "-e", script, path, eventId], { stderr: "pipe" });
+		const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+		expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+	}
+
 	it("writer 与 recover 共享快照锁且不会删除活跃临时文件", async () => {
 		const root = temporaryRoot();
 		const path = join(root, "state.json");
@@ -258,6 +268,71 @@ describe.skipIf(process.platform === "win32")("Evidence secure filesystem", () =
 		expect(existsSync(join(parked, kind === "state" ? "state.json" : "events.jsonl"))).toBeTrue();
 		expect(existsSync(kind === "state" ? task.paths.state : task.paths.events)).toBeFalse();
 	});
+
+	it("claim_created 后 events 规范文件被替换时失败，跨进程重试不重复", async () => {
+		const root = temporaryRoot();
+		const path = join(root, "events.jsonl");
+		const parked = join(root, "parked-events.jsonl");
+		const currentEventId = deterministicEvidenceEventId("events-file-replaced-after-claim");
+		let replaced = false;
+		setSecureFsTestHook((event) => {
+			if (event.stage !== "claim_created" || replaced) return;
+			replaced = true;
+			renameSync(path, parked);
+			writeFileSync(path, "", "utf8");
+		});
+
+		expect(() => new EventLog(path).append({ eventId: currentEventId, type: "replacement" })).toThrow(
+			EvidencePersistenceError,
+		);
+		expect(replaced).toBeTrue();
+		setSecureFsTestHook(undefined);
+		await appendInFreshProcess(path, currentEventId);
+
+		const canonical = readFileSync(path, "utf8")
+			.split("\n")
+			.filter((line) => line.includes(currentEventId));
+		expect(canonical).toHaveLength(1);
+		expect(
+			readFileSync(parked, "utf8")
+				.split("\n")
+				.filter((line) => line.includes(currentEventId)),
+		).toHaveLength(1);
+	});
+
+	it.each(["claim_created", "event_appended"] as const)(
+		"journal 在 %s 后被替换时失败，跨进程重试修复状态且日志不重复",
+		async (stage) => {
+			const root = temporaryRoot();
+			const path = join(root, "events.jsonl");
+			const journalPath = join(root, ".events.jsonl.claims.jsonl");
+			const parkedJournal = join(root, `parked-${stage}.claims.jsonl`);
+			const currentEventId = deterministicEvidenceEventId(`journal-replaced-${stage}`);
+			let replaced = false;
+			setSecureFsTestHook((event) => {
+				if (event.stage !== stage || replaced) return;
+				replaced = true;
+				renameSync(journalPath, parkedJournal);
+				writeFileSync(journalPath, "", "utf8");
+			});
+
+			expect(() => new EventLog(path).append({ eventId: currentEventId, type: "replacement" })).toThrow(
+				EvidencePersistenceError,
+			);
+			expect(replaced).toBeTrue();
+			setSecureFsTestHook(undefined);
+			await appendInFreshProcess(path, currentEventId);
+
+			const canonicalEvents = readFileSync(path, "utf8")
+				.split("\n")
+				.filter((line) => line.includes(currentEventId));
+			expect(canonicalEvents).toHaveLength(1);
+			const canonicalClaims = readFileSync(journalPath, "utf8")
+				.split("\n")
+				.filter((line) => line.includes(currentEventId));
+			expect(canonicalClaims.some((line) => JSON.parse(line).state === "done")).toBeTrue();
+		},
+	);
 
 	it("持锁进程崩溃后内核释放锁且后续追加可恢复", async () => {
 		const root = temporaryRoot();

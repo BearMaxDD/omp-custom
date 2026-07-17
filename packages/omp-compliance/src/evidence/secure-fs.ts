@@ -26,6 +26,18 @@ export class SecureFsError extends Error {
 	}
 }
 
+export class EvidenceLogCorruptionError extends Error {
+	constructor(
+		readonly line: number,
+		readonly offset: number,
+		readonly reason: "malformed_json",
+		cause?: unknown,
+	) {
+		super(`Evidence log contains a malformed complete line at line ${line}`, { cause });
+		this.name = "EvidenceLogCorruptionError";
+	}
+}
+
 export interface SecureFsTestEvent {
 	stage:
 		| "directory_opened"
@@ -45,6 +57,7 @@ export interface SecureFsTestEvent {
 		| "legacy_claims_persisted"
 		| "legacy_claims_migrated";
 	bloomBytes?: number;
+	pendingBloomBytes?: number;
 	hotSize?: number;
 	pendingSize?: number;
 }
@@ -213,6 +226,21 @@ function directoryIdentity(descriptor: number): { device: bigint; inode: bigint 
 	return process.platform === "darwin"
 		? { device: BigInt(status.readUInt32LE(0)), inode: status.readBigUInt64LE(8) }
 		: { device: status.readBigUInt64LE(0), inode: status.readBigUInt64LE(8) };
+}
+
+function regularFileIdentity(descriptor: number): { device: bigint; inode: bigint } {
+	const status = fstatSync(descriptor, { bigint: true });
+	if (!status.isFile()) {
+		throw new SecureFsError("open_file", undefined, new Error("Secure path is not a regular file"));
+	}
+	return { device: status.dev, inode: status.ino };
+}
+
+class CanonicalFileIdentityError extends Error {
+	constructor(readonly fileName: string) {
+		super(`Secure file identity changed: ${fileName}`);
+		this.name = "CanonicalFileIdentityError";
+	}
 }
 
 function openAt(directory: number, name: string, flags: number, mode = 0): number {
@@ -408,8 +436,16 @@ interface ClaimJournalCache {
 	offset: number;
 	mtimeNs: bigint;
 	bloom: ClaimBloom;
+	pendingBloom: ClaimBloom;
 	hotDone: Map<string, true>;
-	pending: Set<string>;
+	hotPending: Map<string, true>;
+}
+
+interface ValidatedLogCache {
+	device: bigint;
+	inode: bigint;
+	offset: number;
+	nextLine: number;
 }
 
 function rememberDone(cache: ClaimJournalCache, eventId: string): void {
@@ -421,13 +457,23 @@ function rememberDone(cache: ClaimJournalCache, eventId: string): void {
 	}
 }
 
+function rememberPending(cache: ClaimJournalCache, eventId: string): void {
+	cache.hotPending.delete(eventId);
+	cache.hotPending.set(eventId, true);
+	if (cache.hotPending.size > CLAIM_HOT_LIMIT) {
+		const oldest = cache.hotPending.keys().next().value;
+		if (oldest !== undefined) cache.hotPending.delete(oldest);
+	}
+}
+
 function applyClaimRecord(cache: ClaimJournalCache, record: ClaimJournalRecord): void {
 	if (record.state === "pending") {
-		cache.pending.add(record.eventId);
+		cache.pendingBloom.add(record.eventId);
+		rememberPending(cache, record.eventId);
 		cache.hotDone.delete(record.eventId);
 		return;
 	}
-	cache.pending.delete(record.eventId);
+	cache.hotPending.delete(record.eventId);
 	cache.bloom.add(record.eventId);
 	rememberDone(cache, record.eventId);
 }
@@ -436,8 +482,9 @@ function emitClaimCacheStats(cache: ClaimJournalCache): void {
 	testHook?.({
 		stage: "claim_journal_cache_stats",
 		bloomBytes: cache.bloom.byteLength,
+		pendingBloomBytes: cache.pendingBloom.byteLength,
 		hotSize: cache.hotDone.size,
-		pendingSize: cache.pending.size,
+		pendingSize: cache.hotPending.size,
 	});
 }
 
@@ -476,6 +523,7 @@ export class SecurePathScope {
 	private readonly anchorDevice: bigint;
 	private readonly anchorInode: bigint;
 	private readonly claimJournalCache = new Map<string, ClaimJournalCache>();
+	private readonly validatedLogCache = new Map<string, ValidatedLogCache>();
 
 	constructor(root: string, childDirectories: readonly string[] = []) {
 		const canonical = canonicalTrustedRoot(root);
@@ -565,7 +613,23 @@ export class SecurePathScope {
 		let journalDescriptor: number | undefined;
 		let directoryLocked = false;
 		let logLocked = false;
-		let completed = false;
+		const verifyCommittedFiles = (): void => {
+			try {
+				this.assertCanonicalFiles(directory, [
+					{ name, descriptor: logDescriptor as number },
+					{ name: journalName, descriptor: journalDescriptor as number },
+				]);
+			} catch (error) {
+				if (error instanceof CanonicalFileIdentityError && error.fileName === journalName) {
+					try {
+						this.reconcileCanonicalClaim(directory, name, journalName, logDescriptor as number, eventId);
+					} catch {
+						// Preserve the identity failure; reconciliation is best-effort and fail-closed.
+					}
+				}
+				throw error;
+			}
+		};
 		try {
 			if (retryPosix("flock", () => requirePosix().flock(directory, LOCK_EX)) < 0) fail("lock_file");
 			directoryLocked = true;
@@ -585,10 +649,16 @@ export class SecurePathScope {
 				journal,
 				logDescriptor,
 			);
+			this.validateCompleteLog(name, logDescriptor);
 
 			const initialState = this.getClaimState(journalDescriptor, journal, eventId);
 			if (initialState === "done") {
-				completed = true;
+				if (!fileContainsEventId(logDescriptor, eventId)) {
+					appendAndSync(logDescriptor, content);
+					testHook?.({ stage: "event_appended" });
+				}
+				this.validateCompleteLog(name, logDescriptor);
+				verifyCommittedFiles();
 				return;
 			}
 			if (initialState === undefined) {
@@ -598,7 +668,8 @@ export class SecurePathScope {
 
 			this.recoverUnterminatedTail(logDescriptor, journalDescriptor, journal, recoveryFactory);
 			if (this.getClaimState(journalDescriptor, journal, eventId) === "done") {
-				completed = true;
+				this.validateCompleteLog(name, logDescriptor);
+				verifyCommittedFiles();
 				return;
 			}
 			if (
@@ -606,26 +677,123 @@ export class SecurePathScope {
 				(migratedEventIds?.has(eventId) ?? fileContainsEventId(logDescriptor, eventId))
 			) {
 				this.appendClaimJournalRecord(journalDescriptor, journal, { eventId, state: "done" });
-				completed = true;
+				this.validateCompleteLog(name, logDescriptor);
+				verifyCommittedFiles();
 				return;
 			}
 
 			appendAndSync(logDescriptor, content);
 			testHook?.({ stage: "event_appended" });
 			this.appendClaimJournalRecord(journalDescriptor, journal, { eventId, state: "done" });
-			completed = true;
+			this.validateCompleteLog(name, logDescriptor);
+			verifyCommittedFiles();
 		} finally {
-			try {
-				if (completed) this.assertCanonicalDirectory(directory);
-			} finally {
-				if (directoryLocked) retryPosix("flock", () => requirePosix().flock(directory, LOCK_UN));
-				if (logDescriptor !== undefined) {
-					if (logLocked) retryPosix("flock", () => requirePosix().flock(logDescriptor as number, LOCK_UN));
-					closeQuietly(logDescriptor);
-				}
-				if (journalDescriptor !== undefined) closeQuietly(journalDescriptor);
-				closeQuietly(directory);
+			if (directoryLocked) retryPosix("flock", () => requirePosix().flock(directory, LOCK_UN));
+			if (logDescriptor !== undefined) {
+				if (logLocked) retryPosix("flock", () => requirePosix().flock(logDescriptor as number, LOCK_UN));
+				closeQuietly(logDescriptor);
 			}
+			if (journalDescriptor !== undefined) closeQuietly(journalDescriptor);
+			closeQuietly(directory);
+		}
+	}
+
+	private validateCompleteLog(name: string, descriptor: number): void {
+		const status = fstatSync(descriptor, { bigint: true });
+		const existing = this.validatedLogCache.get(name);
+		const canReadDelta =
+			existing !== undefined &&
+			existing.device === status.dev &&
+			existing.inode === status.ino &&
+			status.size >= BigInt(existing.offset);
+		const offset = canReadDelta ? (existing?.offset ?? 0) : 0;
+		const firstLine = canReadDelta ? (existing?.nextLine ?? 1) : 1;
+		const size = Number(status.size);
+		if (!Number.isSafeInteger(size))
+			throw new SecureFsError("read_file", undefined, new Error("Event log is too large"));
+		const unread = preadAll(descriptor, offset, size - offset);
+		const completeLength = unread.lastIndexOf(0x0a) + 1;
+		if (completeLength === 0) {
+			this.validatedLogCache.set(name, {
+				device: status.dev,
+				inode: status.ino,
+				offset,
+				nextLine: firstLine,
+			});
+			return;
+		}
+
+		const complete = unread.subarray(0, completeLength);
+		const lines: Array<{ content: string; offset: number; line: number }> = [];
+		let lineStart = 0;
+		let lineNumber = firstLine;
+		for (let index = 0; index < complete.byteLength; index += 1) {
+			if (complete[index] !== 0x0a) continue;
+			lines.push({
+				content: complete.subarray(lineStart, index).toString("utf8"),
+				offset: offset + lineStart,
+				line: lineNumber,
+			});
+			lineStart = index + 1;
+			lineNumber += 1;
+		}
+		for (const [index, line] of lines.entries()) {
+			if (!line.content.trim()) continue;
+			try {
+				JSON.parse(line.content);
+			} catch (error) {
+				let isAuditedTruncatedTail = false;
+				const next = lines[index + 1];
+				if (next !== undefined) {
+					try {
+						isAuditedTruncatedTail =
+							(JSON.parse(next.content) as { type?: unknown }).type === "recovery_truncated_tail";
+					} catch {
+						isAuditedTruncatedTail = false;
+					}
+				}
+				if (!isAuditedTruncatedTail) {
+					throw new SecureFsError(
+						"read_file",
+						undefined,
+						new EvidenceLogCorruptionError(line.line, line.offset, "malformed_json", error),
+					);
+				}
+			}
+		}
+		this.validatedLogCache.set(name, {
+			device: status.dev,
+			inode: status.ino,
+			offset: offset + completeLength,
+			nextLine: lineNumber,
+		});
+	}
+
+	private reconcileCanonicalClaim(
+		directory: number,
+		name: string,
+		journalName: string,
+		logDescriptor: number,
+		eventId: string,
+	): void {
+		let journalDescriptor: number | undefined;
+		try {
+			journalDescriptor = openAt(directory, journalName, constants.O_RDWR | constants.O_NOFOLLOW);
+			if (!fileContainsEventId(logDescriptor, eventId)) return;
+			const journal = this.refreshClaimJournal(journalName, journalDescriptor);
+			const state = this.getClaimState(journalDescriptor, journal, eventId);
+			if (state === undefined) {
+				this.appendClaimJournalRecord(journalDescriptor, journal, { eventId, state: "pending" });
+			}
+			if (state !== "done") {
+				this.appendClaimJournalRecord(journalDescriptor, journal, { eventId, state: "done" });
+			}
+			this.assertCanonicalFiles(directory, [
+				{ name, descriptor: logDescriptor },
+				{ name: journalName, descriptor: journalDescriptor },
+			]);
+		} finally {
+			if (journalDescriptor !== undefined) closeQuietly(journalDescriptor);
 		}
 	}
 
@@ -709,8 +877,9 @@ export class SecurePathScope {
 					offset: 0,
 					mtimeNs: status.mtimeNs,
 					bloom: new ClaimBloom(),
+					pendingBloom: new ClaimBloom(),
 					hotDone: new Map(),
-					pending: new Set(),
+					hotPending: new Map(),
 				};
 		const size = Number(status.size);
 		if (!Number.isSafeInteger(size))
@@ -770,12 +939,15 @@ export class SecurePathScope {
 	}
 
 	private getClaimState(descriptor: number, cache: ClaimJournalCache, eventId: string): ClaimState | undefined {
-		if (cache.pending.has(eventId)) return "pending";
 		if (cache.hotDone.has(eventId)) {
 			rememberDone(cache, eventId);
 			return "done";
 		}
-		if (!cache.bloom.mightContain(eventId)) return undefined;
+		if (cache.hotPending.has(eventId)) {
+			rememberPending(cache, eventId);
+			return "pending";
+		}
+		if (!cache.bloom.mightContain(eventId) && !cache.pendingBloom.mightContain(eventId)) return undefined;
 
 		testHook?.({ stage: "claim_journal_target_scan" });
 		let state: ClaimState | undefined;
@@ -792,11 +964,13 @@ export class SecurePathScope {
 			}
 		}
 		if (state === "done") {
-			cache.pending.delete(eventId);
+			cache.hotPending.delete(eventId);
 			cache.bloom.add(eventId);
 			rememberDone(cache, eventId);
 		} else if (state === "pending") {
-			cache.pending.add(eventId);
+			cache.pendingBloom.add(eventId);
+			rememberPending(cache, eventId);
+			cache.hotDone.delete(eventId);
 		}
 		emitClaimCacheStats(cache);
 		return state;
@@ -1069,6 +1243,44 @@ export class SecurePathScope {
 			const current = directoryIdentity(canonical);
 			if (current.device !== expected.device || current.inode !== expected.inode) {
 				throw new SecureFsError("open_directory", undefined, new Error("Secure directory identity changed"));
+			}
+		} finally {
+			closeQuietly(canonical);
+		}
+	}
+
+	private assertCanonicalFiles(
+		expectedDirectory: number,
+		files: ReadonlyArray<{ name: string; descriptor: number }>,
+	): void {
+		const canonical = this.openDirectory(false);
+		if (canonical === undefined) {
+			throw new SecureFsError("open_directory", undefined, new Error("Secure directory path disappeared"));
+		}
+		try {
+			const expectedDirectoryIdentity = directoryIdentity(expectedDirectory);
+			const canonicalDirectoryIdentity = directoryIdentity(canonical);
+			if (
+				canonicalDirectoryIdentity.device !== expectedDirectoryIdentity.device ||
+				canonicalDirectoryIdentity.inode !== expectedDirectoryIdentity.inode
+			) {
+				throw new SecureFsError("open_directory", undefined, new Error("Secure directory identity changed"));
+			}
+			for (const file of files) {
+				let canonicalFile: number | undefined;
+				try {
+					canonicalFile = openAt(canonical, file.name, constants.O_RDONLY | constants.O_NOFOLLOW);
+					const expected = regularFileIdentity(file.descriptor);
+					const current = regularFileIdentity(canonicalFile);
+					if (current.device !== expected.device || current.inode !== expected.inode) {
+						throw new CanonicalFileIdentityError(file.name);
+					}
+				} catch (error) {
+					if (error instanceof CanonicalFileIdentityError) throw error;
+					throw new CanonicalFileIdentityError(file.name);
+				} finally {
+					if (canonicalFile !== undefined) closeQuietly(canonicalFile);
+				}
 			}
 		} finally {
 			closeQuietly(canonical);

@@ -215,6 +215,57 @@ describe("EventLog", () => {
 		30_000,
 	);
 
+	it.each([20_000, 100_000])(
+		"%d 个孤立 pending 仅保留有界索引且首尾均可精确恢复",
+		(count) => {
+			const root = temporaryRoot();
+			const path = join(root, "events.jsonl");
+			const journalPath = join(root, ".events.jsonl.claims.jsonl");
+			const eventIds = Array.from({ length: count }, (_, index) => indexedEventId(index));
+			writeFileSync(path, "", "utf8");
+			writeFileSync(
+				journalPath,
+				eventIds.map((currentEventId) => `${JSON.stringify({ eventId: currentEventId, state: "pending" })}\n`).join(""),
+				"utf8",
+			);
+			let stats: { bloomBytes: number; pendingBloomBytes: number; hotSize: number; pendingSize: number } | undefined;
+			setSecureFsTestHook((event) => {
+				const detail = event as unknown as {
+					stage: string;
+					bloomBytes?: number;
+					pendingBloomBytes?: number;
+					hotSize?: number;
+					pendingSize?: number;
+				};
+				if (detail.stage !== "claim_journal_cache_stats") return;
+				stats = {
+					bloomBytes: detail.bloomBytes ?? -1,
+					pendingBloomBytes: detail.pendingBloomBytes ?? -1,
+					hotSize: detail.hotSize ?? -1,
+					pendingSize: detail.pendingSize ?? -1,
+				};
+			});
+
+			const log = new EventLog<TestEvent>(path);
+			log.append({ eventId: eventIds[0] as string, type: "pending-history" });
+			log.append({ eventId: eventIds.at(-1) as string, type: "pending-history" });
+			expect(stats).toEqual({
+				bloomBytes: 1024 * 1024,
+				pendingBloomBytes: 1024 * 1024,
+				hotSize: 2,
+				pendingSize: 4_094,
+			});
+
+			const reopened = new EventLog<TestEvent>(path);
+			reopened.append({ eventId: eventIds[0] as string, type: "pending-history" });
+			reopened.append({ eventId: eventIds.at(-1) as string, type: "pending-history" });
+			const physical = readFileSync(path, "utf8").trim().split("\n");
+			expect(physical.filter((line) => line.includes(eventIds[0] as string))).toHaveLength(1);
+			expect(physical.filter((line) => line.includes(eventIds.at(-1) as string))).toHaveLength(1);
+		},
+		30_000,
+	);
+
 	it("Bloom 对不同哈希分布的历史 eventId 不产生假阴性", () => {
 		const root = temporaryRoot();
 		const path = join(root, "events.jsonl");
@@ -505,6 +556,35 @@ describe("EventLog", () => {
 			expect(normalizedId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 		}
 		expect(secondRead).toEqual(firstRead);
+	});
+
+	it("完整损坏行不会吞掉其后的合法事件，并返回可审计位置", () => {
+		const path = join(temporaryRoot(), "events.jsonl");
+		const first = JSON.stringify({ eventId: eventId("before-malformed"), type: "valid" });
+		const malformed = '{"eventId":"broken"';
+		const last = JSON.stringify({ eventId: eventId("after-malformed"), type: "valid" });
+		const original = `${first}\n${malformed}\n${last}\n`;
+		writeFileSync(path, original, "utf8");
+		const log = new EventLog<TestEvent>(path);
+
+		for (const operation of [
+			() => log.readAll(),
+			() => log.append({ eventId: eventId("must-not-append"), type: "blocked" }),
+		]) {
+			try {
+				operation();
+				expect.unreachable("完整损坏行必须 fail-closed");
+			} catch (error) {
+				expect(error).toBeInstanceOf(EvidencePersistenceError);
+				const secureCause = (error as Error & { cause?: unknown }).cause as Error & { cause?: unknown };
+				expect(secureCause.cause).toMatchObject({
+					line: 2,
+					offset: Buffer.byteLength(`${first}\n`),
+					reason: "malformed_json",
+				});
+			}
+		}
+		expect(readFileSync(path, "utf8")).toBe(original);
 	});
 
 	it("忽略截断末行并只追加一次可审计 recovery 事件", () => {

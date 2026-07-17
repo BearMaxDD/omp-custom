@@ -1,5 +1,11 @@
 import { createHash } from "node:crypto";
-import { SecurePathScope, type SecureRecoveryRecord, secureFileName } from "./secure-fs";
+import {
+	EvidenceLogCorruptionError,
+	SecureFsError,
+	SecurePathScope,
+	type SecureRecoveryRecord,
+	secureFileName,
+} from "./secure-fs";
 
 export interface EvidenceEvent {
 	eventId: string;
@@ -82,8 +88,11 @@ function parseEvents<T extends EvidenceEvent>(content: string): ParsedEvents<T> 
 	let truncatedTail: string | undefined;
 	const lines = content.split("\n");
 	const finalLineIndex = lines.length - 1;
+	let offset = 0;
 
 	for (const [index, line] of lines.entries()) {
+		const lineOffset = offset;
+		offset += Buffer.byteLength(line) + (index < finalLineIndex ? 1 : 0);
 		if (!line.trim()) continue;
 		try {
 			const event = JSON.parse(line) as Partial<T>;
@@ -92,8 +101,27 @@ function parseEvents<T extends EvidenceEvent>(content: string): ParsedEvents<T> 
 			if (seen.has(eventId)) continue;
 			seen.add(eventId);
 			events.push({ ...event, eventId } as T);
-		} catch {
-			if (index === finalLineIndex && !content.endsWith("\n")) truncatedTail = line;
+		} catch (error) {
+			if (index === finalLineIndex && !content.endsWith("\n")) {
+				truncatedTail = line;
+				continue;
+			}
+			let isAuditedTruncatedTail = false;
+			const next = lines[index + 1];
+			if (next !== undefined) {
+				try {
+					isAuditedTruncatedTail = (JSON.parse(next) as { type?: unknown }).type === "recovery_truncated_tail";
+				} catch {
+					isAuditedTruncatedTail = false;
+				}
+			}
+			if (!isAuditedTruncatedTail) {
+				throw new SecureFsError(
+					"read_file",
+					undefined,
+					new EvidenceLogCorruptionError(index + 1, lineOffset, "malformed_json", error),
+				);
+			}
 		}
 	}
 
