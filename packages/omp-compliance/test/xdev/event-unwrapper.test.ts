@@ -126,4 +126,45 @@ describe("unwrapToolResultEvent", () => {
 			),
 		).toBeNull();
 	});
+
+	it("details.xdev.args 与原始参数不一致时 fail closed", () => {
+		expect(
+			unwrapToolResultEvent({
+				type: "tool_result",
+				toolName: "write",
+				toolCallId: "outer-args-mismatch",
+				input: { path: "xd://search_graph", content: '{"query":"outer"}' },
+				content: [{ type: "text", text: "ok" }],
+				isError: false,
+				details: { xdev: { tool: "search_graph", mode: "execute", args: { query: "inner" } } },
+			}),
+		).toBeNull();
+	});
+
+	it("循环 result args 不抛异常并 fail closed", () => {
+		const cyclic: Record<string, unknown> = {};
+		cyclic.self = cyclic;
+		expect(() =>
+			unwrapToolResultEvent({
+				type: "tool_result",
+				toolName: "write",
+				toolCallId: "outer-cyclic",
+				input: { path: "xd://search_graph", content: "{}" },
+				content: [{ type: "text", text: "bad" }],
+				isError: true,
+				details: { xdev: { tool: "search_graph", mode: "execute", args: cyclic } },
+			}),
+		).not.toThrow();
+		expect(
+			unwrapToolResultEvent({
+				type: "tool_result",
+				toolName: "write",
+				toolCallId: "outer-cyclic",
+				input: { path: "xd://search_graph", content: "{}" },
+				content: [{ type: "text", text: "bad" }],
+				isError: true,
+				details: { xdev: { tool: "search_graph", mode: "execute", args: cyclic } },
+			}),
+		).toBeNull();
+	});
 });

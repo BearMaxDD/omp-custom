@@ -7,8 +7,8 @@
  *
  * Only these tool names are recognized:
  *   - index_repository, index_status     (indexing)
- *   - search_graph, search_code          (search)
- *   - get_code_snippet, trace_path       (source/call-chain)
+ *   - get_architecture, search_graph, search_code, trace_path,
+ *     get_code_snippet, query_graph      (read-only queries)
  *
  * The normalizer NEVER matches based on natural language output
  * (e.g. standalone "search_graph" in a response). Only the server
@@ -21,10 +21,21 @@ import type { CodebaseMemoryEvidence, ToolCallRecord, ToolResultRecord } from ".
 const RECOGNIZED_TOOLS: ReadonlySet<string> = new Set([
 	"index_repository",
 	"index_status",
+	"get_architecture",
 	"search_graph",
 	"search_code",
 	"get_code_snippet",
 	"trace_path",
+	"query_graph",
+]);
+
+const QUERY_TOOLS: ReadonlySet<string> = new Set([
+	"get_architecture",
+	"search_graph",
+	"search_code",
+	"get_code_snippet",
+	"trace_path",
+	"query_graph",
 ]);
 
 /** The MCP server name expected for codebase-memory tools. */
@@ -113,18 +124,13 @@ export function normalizeCodebaseMemory(paired: PairedInput | SingleInput): {
 
 		const success = result?.success ?? false;
 
-		// Extract references from result text for search / snippet tools
-		if (result && shortName !== "index_repository" && shortName !== "index_status") {
+		// Failed and missing results never establish retrieval evidence.
+		if (result?.success === true && QUERY_TOOLS.has(shortName)) {
 			const refs = extractReferences(result.resultRef);
 			allRefs.push(...refs);
 		}
 
-		if (
-			shortName === "search_graph" ||
-			shortName === "search_code" ||
-			shortName === "get_code_snippet" ||
-			shortName === "trace_path"
-		) {
+		if (result?.success === true && QUERY_TOOLS.has(shortName)) {
 			queryNames.push(shortName);
 		}
 

@@ -80,7 +80,7 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 		expect(params.meta).toMatch(/^\{object:\d+\}$/);
 	});
 
-	it("没有 result 的 call 在 codebaseMemory 中正常出现，但无结果引用", () => {
+	it("没有成功 result 的 call 不进入 codebaseMemory 查询", () => {
 		collector.recordCall({
 			toolName: "search_code",
 			toolCallId: "c4",
@@ -88,8 +88,7 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 			params: { query: "find" },
 		});
 		const snap = collector.snapshot();
-		// Should appear in queries even without a result
-		expect(snap.codebaseMemory.queries).toContain("search_code");
+		expect(snap.codebaseMemory.queries).not.toContain("search_code");
 	});
 
 	it("空 resultRef 不产生 codebase 引用", () => {
@@ -148,6 +147,14 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 		expect(snap.codebaseMemory.references).toEqual(["packages/omp-compliance/src/signals/types.ts"]);
 	});
 
+	it("同一关联 id 和工具但参数不同的外层与内层调用不会合并", () => {
+		collector.recordCall(makeCall("write", { path: "xd://search_graph", content: '{"query":"outer"}' }, "same-id"));
+		collector.recordCall(makeCall("mcp__codebase_memory_mcp__search_graph", { query: "inner" }, "same-id"));
+		const snap = collector.snapshot();
+		expect(snap.calls).toHaveLength(2);
+		expect(snap.calls.map((call) => call.params.query)).toEqual(["outer", "inner"]);
+	});
+
 	it("外层与内层 id 不同时按 parent 关联去重并重关联结果", () => {
 		collector.recordCall(makeCall("write", { path: "xd://search_graph", content: '{"query":"parented"}' }, "outer"));
 		collector.recordCall({
@@ -179,14 +186,107 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 		expect(snap.calls.map((call) => call.toolCallId)).toEqual(["xd-a", "xd-b"]);
 	});
 
-	it("help、畸形 xd 和未知工具不会进入 Evidence", () => {
+	it("help 不计 Evidence，畸形 URI 与未知工具记录 invalid_xdev_event", () => {
 		collector.recordCall(makeCall("write", { path: "xd://search_graph", content: "help" }, "help"));
 		collector.recordCall(makeCall("write", { path: "xd://search_graph?x=1", content: "{}" }, "query"));
 		collector.recordCall(makeCall("write", { path: "xd://unknown", content: "{}" }, "unknown"));
 
 		const snap = collector.snapshot();
-		expect(snap.calls).toHaveLength(0);
+		expect(snap.calls).toHaveLength(2);
+		expect(snap.calls.map((call) => call.toolName)).toEqual(["invalid_xdev_event", "invalid_xdev_event"]);
+		expect(snap.calls.map((call) => call.params.reason)).toEqual(["invalid_xdev_uri", "unknown_tool"]);
+		expect(snap.results.every((result) => result.success === false)).toBe(true);
 		expect(snap.codebaseMemory).toEqual({ indexReady: false, queries: [], references: [] });
+	});
+
+	it.each([
+		["malformed_json", { path: "xd://search_graph", content: "{" }],
+		["invalid_content", { path: "xd://search_graph", content: [] }],
+	])("调用异常 %s 记录 invalid_xdev_event", (reason, input) => {
+		collector.recordCall(makeCall("write", input, `invalid-${reason}`));
+		const snap = collector.snapshot();
+		expect(snap.calls[0]).toMatchObject({ toolName: "invalid_xdev_event", params: { reason } });
+		expect(snap.results[0]).toMatchObject({ success: false, toolCallId: `invalid-${reason}` });
+		expect(snap.codebaseMemory.queries).toEqual([]);
+	});
+
+	it.each([
+		["missing_xdev_details", undefined],
+		["tool_mismatch", { xdev: { tool: "trace_path", mode: "execute", args: { query: "a" } } }],
+		["args_mismatch", { xdev: { tool: "search_graph", mode: "execute", args: { query: "b" } } }],
+	])("结果异常 %s 替换为 invalid_xdev_event", (reason, details) => {
+		collector.recordCall(
+			makeCall("write", { path: "xd://search_graph", content: '{"query":"a"}' }, `result-${reason}`),
+		);
+		collector.recordResult({
+			type: "tool_result",
+			toolName: "write",
+			toolCallId: `result-${reason}`,
+			input: { path: "xd://search_graph", content: '{"query":"a"}' },
+			content: [{ type: "text", text: "bad" }],
+			isError: false,
+			details,
+		} as ToolResultEvent);
+		const snap = collector.snapshot();
+		expect(snap.calls[0]).toMatchObject({ toolName: "invalid_xdev_event", params: { reason } });
+		expect(snap.results[0]).toMatchObject({ success: false });
+		expect(snap.codebaseMemory.queries).toEqual([]);
+	});
+
+	it("循环 xd result args 记录 invalid 且不抛异常", () => {
+		const cyclic: Record<string, unknown> = {};
+		cyclic.self = cyclic;
+		collector.recordCall(makeCall("write", { path: "xd://search_graph", content: "{}" }, "cyclic-result"));
+		expect(() =>
+			collector.recordResult({
+				type: "tool_result",
+				toolName: "write",
+				toolCallId: "cyclic-result",
+				input: { path: "xd://search_graph", content: "{}" },
+				content: [{ type: "text", text: "bad" }],
+				isError: true,
+				details: { xdev: { tool: "search_graph", mode: "execute", args: cyclic } },
+			} as ToolResultEvent),
+		).not.toThrow();
+		expect(collector.snapshot().calls[0]).toMatchObject({
+			toolName: "invalid_xdev_event",
+			params: { reason: "unserializable_args" },
+		});
+	});
+
+	it("同步限制 2048 条并丢弃淘汰调用的迟到内层事件和结果", () => {
+		for (let index = 0; index < 2050; index++) {
+			const id = `bounded-${index}`;
+			const query = `query-${index}`;
+			collector.recordCall(makeCall("write", { path: "xd://search_graph", content: JSON.stringify({ query }) }, id));
+			collector.recordResult({
+				type: "tool_result",
+				toolName: "write",
+				toolCallId: id,
+				input: { path: "xd://search_graph", content: JSON.stringify({ query }) },
+				content: [{ type: "text", text: "ok" }],
+				isError: false,
+				details: { xdev: { tool: "search_graph", mode: "execute", args: { query } } },
+			} as ToolResultEvent);
+		}
+		let snap = collector.snapshot();
+		expect(snap.calls.length).toBeLessThanOrEqual(2048);
+		expect(snap.results.length).toBeLessThanOrEqual(2048);
+		expect(snap.calls.some((call) => call.toolCallId === "bounded-0")).toBe(false);
+
+		collector.recordCall(makeCall("mcp__codebase_memory_mcp__search_graph", { query: "query-0" }, "bounded-0"));
+		collector.recordResult(makeResult("bounded-0", "packages/late.ts"));
+		snap = collector.snapshot();
+		expect(snap.calls.some((call) => call.toolCallId === "bounded-0")).toBe(false);
+		expect(snap.results.some((result) => result.toolCallId === "bounded-0")).toBe(false);
+
+		collector.recordCall({
+			toolName: "search_graph",
+			toolCallId: "independent-new",
+			serverName: "codebase-memory-mcp",
+			params: { query: "new" },
+		});
+		expect(collector.snapshot().calls.some((call) => call.toolCallId === "independent-new")).toBe(true);
 	});
 
 	it("reset 清空去重关联，后续相同 id 可重新记录", () => {

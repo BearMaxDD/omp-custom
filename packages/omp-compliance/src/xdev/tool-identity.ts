@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
 	CANONICAL_CODEBASE_SERVER_ID,
 	type CodebaseToolAccess,
@@ -11,6 +12,7 @@ export interface CanonicalToolIdentity {
 	toolName: string;
 	qualifiedName: string;
 	args: Record<string, unknown>;
+	argsFingerprint: `sha256:${string}`;
 	access: CodebaseToolAccess;
 }
 
@@ -24,6 +26,51 @@ const HELP_CONTENT_RE = /^(?:|\?|help|describe)$/i;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function canonicalizeJsonValue(value: unknown, ancestors: Set<object>): string | null {
+	if (value === null) return "null";
+	if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
+	if (typeof value === "number") return Number.isFinite(value) ? JSON.stringify(value) : null;
+	if (typeof value !== "object") return null;
+	if (ancestors.has(value)) return null;
+	ancestors.add(value);
+	try {
+		if (Array.isArray(value)) {
+			if (Object.keys(value).some((key, index) => key !== String(index))) return null;
+			const items: string[] = [];
+			for (const item of value) {
+				const canonical = canonicalizeJsonValue(item, ancestors);
+				if (canonical === null) return null;
+				items.push(canonical);
+			}
+			return `[${items.join(",")}]`;
+		}
+		const prototype = Object.getPrototypeOf(value);
+		if (prototype !== Object.prototype && prototype !== null) return null;
+		if (Object.getOwnPropertySymbols(value).length > 0) return null;
+		const fields: string[] = [];
+		for (const key of Object.keys(value).sort()) {
+			const canonical = canonicalizeJsonValue((value as Record<string, unknown>)[key], ancestors);
+			if (canonical === null) return null;
+			fields.push(`${JSON.stringify(key)}:${canonical}`);
+		}
+		return `{${fields.join(",")}}`;
+	} catch {
+		return null;
+	} finally {
+		ancestors.delete(value);
+	}
+}
+
+export function canonicalJson(value: unknown): string | null {
+	return canonicalizeJsonValue(value, new Set());
+}
+
+export function canonicalArgsFingerprint(value: unknown): `sha256:${string}` | null {
+	const canonical = canonicalJson(value);
+	if (canonical === null) return null;
+	return `sha256:${createHash("sha256").update(canonical, "utf8").digest("hex")}`;
 }
 
 function parseXdevArgs(args: unknown): { toolName: string; args: Record<string, unknown> } | null {
@@ -55,12 +102,10 @@ function parseMcpFqn(toolName: string): { serverId: string; toolName: string } |
 	if (!toolName.startsWith("mcp__")) return null;
 	for (const serverId of ["codebase-memory-mcp", "codebase_memory_mcp", "codebase-memory"] as const) {
 		const serverPart = sanitizedServerId(serverId);
-		for (const delimiter of ["__", "_"] as const) {
-			const prefix = `mcp__${serverPart}${delimiter}`;
-			if (!toolName.startsWith(prefix)) continue;
-			const candidate = toolName.slice(prefix.length);
-			if (codebaseToolAccess(candidate)) return { serverId, toolName: candidate };
-		}
+		const prefix = `mcp__${serverPart}__`;
+		if (!toolName.startsWith(prefix)) continue;
+		const candidate = toolName.slice(prefix.length);
+		if (codebaseToolAccess(candidate)) return { serverId, toolName: candidate };
 	}
 	return null;
 }
@@ -71,13 +116,15 @@ function identity(
 	args: Record<string, unknown>,
 ): CanonicalToolIdentity | null {
 	const access = codebaseToolAccess(toolName);
-	if (!access) return null;
+	const argsFingerprint = canonicalArgsFingerprint(args);
+	if (!access || !argsFingerprint) return null;
 	return {
 		transport,
 		serverId: CANONICAL_CODEBASE_SERVER_ID,
 		toolName,
 		qualifiedName: `${CANONICAL_CODEBASE_SERVER_ID}.${toolName}`,
 		args,
+		argsFingerprint,
 		access,
 	};
 }

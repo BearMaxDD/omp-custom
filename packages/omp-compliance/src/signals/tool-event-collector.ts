@@ -19,7 +19,8 @@ import type {
 	ToolCallEvent,
 	ToolResultEvent,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
-import { unwrapToolCallEvent, unwrapToolResultEvent } from "../xdev/event-unwrapper";
+import { type InvalidXdevReason, classifyToolCallEvent, classifyToolResultEvent } from "../xdev/event-unwrapper";
+import type { CanonicalToolIdentity } from "../xdev/tool-identity";
 import { normalizeCodebaseMemory } from "./codebase-memory";
 import { normalizeTaskDelegation } from "./task-delegation";
 import type { EvidenceSnapshot, ToolCallRecord, ToolResultRecord } from "./types";
@@ -56,11 +57,12 @@ function isOfficialToolResultEvent(event: ToolResultEvent | LegacySyntheticToolR
 }
 
 export class ToolEventCollector {
-	private static readonly CORRELATION_CACHE_LIMIT = 2048;
+	private static readonly MAX_RECORDS = 2048;
 	private calls: Map<string, ToolCallRecord> = new Map();
 	private results: Map<string, ToolResultRecord> = new Map();
 	private canonicalCallIds: Map<string, string> = new Map();
 	private callAliases: Map<string, string> = new Map();
+	private tombstones: Set<string> = new Set();
 
 	/**
 	 * Record a tool_call event.
@@ -88,39 +90,36 @@ export class ToolEventCollector {
 			input = event.params ?? {};
 		}
 
-		const isXdevCandidate =
-			toolName === "write" &&
-			typeof (input as Record<string, unknown>).path === "string" &&
-			((input as Record<string, unknown>).path as string).trim().toLowerCase().startsWith("xd://");
-		const unwrapped = unwrapToolCallEvent(event);
-		if (isXdevCandidate && !unwrapped) return;
-		if (unwrapped) {
-			const dedupeKey = `${unwrapped.correlationId}\u0000${unwrapped.identity.qualifiedName}`;
+		const classified = classifyToolCallEvent(event);
+		if (classified.kind === "invalid_xdev") {
+			this.recordInvalidXdev(classified.toolCallId, classified.reason, context);
+			return;
+		}
+		if (classified.kind === "valid") {
+			const unwrapped = classified.event;
+			const dedupeKey = this.dedupeKey(unwrapped.correlationId, unwrapped.identity);
+			const aliasKey = this.aliasKey(unwrapped.toolCallId, unwrapped.identity);
+			if (
+				this.tombstones.has(this.retiredDedupeKey(dedupeKey)) ||
+				this.tombstones.has(this.retiredAliasKey(aliasKey))
+			) {
+				return;
+			}
 			const existingId = this.canonicalCallIds.get(dedupeKey);
 			if (existingId) {
-				this.setBounded(this.callAliases, toolCallId, existingId);
+				this.setAlias(aliasKey, existingId);
+				if (unwrapped.toolCallId !== existingId) this.setRawAlias(unwrapped.toolCallId, existingId);
 				return;
 			}
-			// An FQN is an identity hint, not standalone server provenance. It may
-			// dedupe against a previously validated xd outer event, but cannot create
-			// trusted Evidence without explicit server metadata of its own.
-			if (unwrapped.identity.transport === "mcp" && serverName === undefined) {
-				this.calls.set(toolCallId, {
-					toolName,
-					toolCallId,
-					params: this.truncateParams(input),
-					cwd: context?.cwd,
-					sessionId: context?.sessionManager.getSessionId(),
-					timestamp: new Date().toISOString(),
-				});
-				return;
-			}
-			toolCallId = unwrapped.correlationId;
+			toolCallId = this.availableStorageId(unwrapped.correlationId, unwrapped.identity.argsFingerprint);
 			toolName = unwrapped.identity.toolName;
 			serverName = "codebase-memory";
 			input = unwrapped.identity.args;
-			this.setBounded(this.canonicalCallIds, dedupeKey, toolCallId);
-			this.setBounded(this.callAliases, unwrapped.toolCallId, toolCallId);
+			this.canonicalCallIds.set(dedupeKey, toolCallId);
+			this.setAlias(aliasKey, toolCallId);
+			if (unwrapped.toolCallId !== toolCallId) this.setRawAlias(unwrapped.toolCallId, toolCallId);
+		} else if (this.isXdevCandidate(toolName, input)) {
+			return;
 		}
 
 		this.calls.set(toolCallId, {
@@ -132,6 +131,7 @@ export class ToolEventCollector {
 			sessionId: context?.sessionManager.getSessionId(),
 			timestamp: new Date().toISOString(),
 		});
+		this.enforceCallLimit();
 	}
 
 	/**
@@ -142,8 +142,6 @@ export class ToolEventCollector {
 	 * large blobs in memory).
 	 */
 	recordResult(event: ToolResultEvent | LegacySyntheticToolResultEvent, _context?: ExtensionContext): void {
-		const ref = this.extractResultRef(event);
-		const details = this.extractStructuredDetails(event);
 		let toolCallId: string;
 		let isError: boolean;
 		if (isOfficialToolResultEvent(event)) {
@@ -154,21 +152,38 @@ export class ToolEventCollector {
 			isError = event.isError === true || event.success === false;
 		}
 
-		const input = isOfficialToolResultEvent(event) ? event.input : undefined;
-		const isXdevCandidate =
-			(isOfficialToolResultEvent(event) ? event.toolName : undefined) === "write" &&
-			typeof input?.path === "string" &&
-			input.path.trim().toLowerCase().startsWith("xd://");
-		if (isXdevCandidate) {
-			const canonicalId = this.callAliases.get(toolCallId) ?? toolCallId;
-			const expectedCall = this.calls.get(canonicalId);
-			const unwrapped = unwrapToolResultEvent(
-				event,
-				expectedCall ? `codebase-memory-mcp.${expectedCall.toolName}` : undefined,
-			);
-			if (!unwrapped) return;
+		let identity: CanonicalToolIdentity | undefined;
+		if (isOfficialToolResultEvent(event) && this.isXdevCandidate(event.toolName, event.input)) {
+			const classified = classifyToolResultEvent(event);
+			if (classified.kind === "invalid_xdev") {
+				const callClassified = classifyToolCallEvent({ ...event, type: "tool_call" });
+				const existingId =
+					callClassified.kind === "valid"
+						? this.resolveStorageId(toolCallId, callClassified.event.identity)
+						: (this.callAliases.get(this.rawAliasKey(toolCallId)) ??
+							(this.calls.has(toolCallId) ? toolCallId : undefined));
+				this.recordInvalidXdev(toolCallId, classified.reason, undefined, existingId);
+				return;
+			}
+			if (classified.kind === "ignored") return;
+			identity = classified.event.identity;
+		} else if (isOfficialToolResultEvent(event)) {
+			const classified = classifyToolCallEvent({ ...event, type: "tool_call" });
+			if (classified.kind === "valid") identity = classified.event.identity;
 		}
-		toolCallId = this.callAliases.get(toolCallId) ?? toolCallId;
+
+		const resolvedId = identity
+			? this.resolveStorageId(toolCallId, identity)
+			: (this.callAliases.get(this.rawAliasKey(toolCallId)) ?? toolCallId);
+		if (
+			this.tombstones.has(this.retiredIdKey(resolvedId)) ||
+			this.tombstones.has(this.retiredAliasKey(this.rawAliasKey(toolCallId)))
+		) {
+			return;
+		}
+		toolCallId = resolvedId;
+		const ref = this.extractResultRef(event);
+		const details = this.extractStructuredDetails(event);
 
 		this.results.set(toolCallId, {
 			toolCallId,
@@ -177,6 +192,7 @@ export class ToolEventCollector {
 			details,
 			timestamp: new Date().toISOString(),
 		});
+		this.enforceResultLimit();
 	}
 
 	/**
@@ -213,15 +229,157 @@ export class ToolEventCollector {
 		this.results.clear();
 		this.canonicalCallIds.clear();
 		this.callAliases.clear();
+		this.tombstones.clear();
 	}
 
 	// ─── Private helpers ────────────────────────────────────────
 
-	private setBounded(map: Map<string, string>, key: string, value: string): void {
-		map.set(key, value);
-		if (map.size <= ToolEventCollector.CORRELATION_CACHE_LIMIT) return;
-		const oldest = map.keys().next().value;
-		if (oldest !== undefined) map.delete(oldest);
+	private isXdevCandidate(toolName: string, input: object): boolean {
+		return (
+			toolName === "write" &&
+			typeof (input as Record<string, unknown>).path === "string" &&
+			((input as Record<string, unknown>).path as string).trim().toLowerCase().startsWith("xd://")
+		);
+	}
+
+	private dedupeKey(correlationId: string, identity: CanonicalToolIdentity): string {
+		return `${correlationId}\u0000${identity.qualifiedName}\u0000${identity.argsFingerprint}`;
+	}
+
+	private aliasKey(toolCallId: string, identity: CanonicalToolIdentity): string {
+		return `${toolCallId}\u0000${identity.qualifiedName}\u0000${identity.argsFingerprint}`;
+	}
+
+	private rawAliasKey(toolCallId: string): string {
+		return `raw:${toolCallId}`;
+	}
+
+	private retiredDedupeKey(key: string): string {
+		return `dedupe:${key}`;
+	}
+
+	private retiredAliasKey(key: string): string {
+		return `alias:${key}`;
+	}
+
+	private retiredIdKey(key: string): string {
+		return `id:${key}`;
+	}
+
+	private availableStorageId(correlationId: string, fingerprint: string): string {
+		if (!this.calls.has(correlationId)) return correlationId;
+		const base = `${correlationId}#${fingerprint.slice("sha256:".length, "sha256:".length + 12)}`;
+		let candidate = base;
+		let suffix = 1;
+		while (this.calls.has(candidate)) candidate = `${base}-${suffix++}`;
+		return candidate;
+	}
+
+	private resolveStorageId(toolCallId: string, identity: CanonicalToolIdentity): string {
+		const aliasKey = this.aliasKey(toolCallId, identity);
+		return (
+			this.callAliases.get(aliasKey) ??
+			this.canonicalCallIds.get(this.dedupeKey(toolCallId, identity)) ??
+			this.callAliases.get(this.rawAliasKey(toolCallId)) ??
+			toolCallId
+		);
+	}
+
+	private setAlias(key: string, storageId: string): void {
+		this.callAliases.set(key, storageId);
+		while (this.callAliases.size > ToolEventCollector.MAX_RECORDS) {
+			const oldest = this.callAliases.keys().next().value;
+			if (oldest === undefined) break;
+			const oldestStorageId = this.callAliases.get(oldest);
+			if (oldestStorageId && this.calls.has(oldestStorageId)) {
+				this.evictCall(oldestStorageId);
+			} else {
+				this.callAliases.delete(oldest);
+				this.addTombstone(this.retiredAliasKey(oldest));
+			}
+		}
+	}
+
+	private setRawAlias(toolCallId: string, storageId: string): void {
+		const key = this.rawAliasKey(toolCallId);
+		const existing = this.callAliases.get(key);
+		if (existing && existing !== storageId) {
+			this.callAliases.delete(key);
+			return;
+		}
+		this.setAlias(key, storageId);
+	}
+
+	private addTombstone(key: string): void {
+		this.tombstones.add(key);
+		while (this.tombstones.size > ToolEventCollector.MAX_RECORDS) {
+			const oldest = this.tombstones.values().next().value;
+			if (oldest === undefined) break;
+			this.tombstones.delete(oldest);
+		}
+	}
+
+	private removeIndexesForStorage(storageId: string, retire: boolean): void {
+		for (const [key, value] of this.canonicalCallIds) {
+			if (value !== storageId) continue;
+			this.canonicalCallIds.delete(key);
+			if (retire) this.addTombstone(this.retiredDedupeKey(key));
+		}
+		for (const [key, value] of this.callAliases) {
+			if (value !== storageId) continue;
+			this.callAliases.delete(key);
+			if (retire) this.addTombstone(this.retiredAliasKey(key));
+		}
+		if (retire) this.addTombstone(this.retiredIdKey(storageId));
+	}
+
+	private evictCall(storageId: string): void {
+		this.calls.delete(storageId);
+		this.results.delete(storageId);
+		this.removeIndexesForStorage(storageId, true);
+	}
+
+	private enforceCallLimit(): void {
+		while (this.calls.size > ToolEventCollector.MAX_RECORDS) {
+			const oldest = this.calls.keys().next().value;
+			if (oldest === undefined) break;
+			this.evictCall(oldest);
+		}
+	}
+
+	private enforceResultLimit(): void {
+		while (this.results.size > ToolEventCollector.MAX_RECORDS) {
+			const oldest = this.results.keys().next().value;
+			if (oldest === undefined) break;
+			this.results.delete(oldest);
+		}
+	}
+
+	private recordInvalidXdev(
+		toolCallId: string,
+		reason: InvalidXdevReason,
+		context?: ExtensionContext,
+		existingStorageId?: string,
+	): void {
+		const storageId = existingStorageId ?? this.availableStorageId(toolCallId, reason);
+		if (existingStorageId) this.removeIndexesForStorage(existingStorageId, true);
+		this.calls.set(storageId, {
+			toolName: "invalid_xdev_event",
+			toolCallId: storageId,
+			params: { reason },
+			cwd: context?.cwd,
+			sessionId: context?.sessionManager.getSessionId(),
+			timestamp: new Date().toISOString(),
+		});
+		this.results.set(storageId, {
+			toolCallId: storageId,
+			success: false,
+			resultRef: reason,
+			details: { reason },
+			timestamp: new Date().toISOString(),
+		});
+		this.enforceCallLimit();
+		this.enforceResultLimit();
 	}
 
 	/**
