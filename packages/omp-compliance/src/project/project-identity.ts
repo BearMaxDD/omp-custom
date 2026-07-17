@@ -49,8 +49,10 @@ const LOCK_RECOVERY_GRACE_MS = 1_000;
 const LOCK_OWNER_LEASE_MS = 30_000;
 const LOCK_TIMESTAMP_TOLERANCE_MS = 5_000;
 const MAX_PROBEABLE_PID = 2_147_483_647;
+const REMOTE_IDENTITY_PREFIX = "git-remote:v1://";
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
 const SLEEP_BUFFER = new Int32Array(new SharedArrayBuffer(4));
+let LOCK_WAIT_OBSERVER_FOR_TESTS: (() => void) | undefined;
 const PROJECT_IDENTITY_RESULTS = new WeakSet<object>();
 const BINDING_KEYS = new Set([
 	"schemaVersion",
@@ -164,6 +166,10 @@ export function isBoundProjectIdentityResult(value: unknown): value is ProjectId
 	return isRecord(value) && PROJECT_IDENTITY_RESULTS.has(value) && value.status === "bound";
 }
 
+export function setProjectIdentityLockWaitObserverForTests(observer: (() => void) | undefined): void {
+	LOCK_WAIT_OBSERVER_FOR_TESTS = observer;
+}
+
 function canonicalPath(path: string): string {
 	return normalize(realpathSync(path)).split(sep).join("/");
 }
@@ -260,7 +266,7 @@ function readGitRemoteIdentity(root: string): string | undefined {
 	if (!names.length) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
 	const remoteName = names.includes("origin") ? "origin" : names[0];
 	const remoteUrl = remoteName ? runGit(root, ["config", "--local", "--get", `remote.${remoteName}.url`]) : undefined;
-	const identity = remoteUrl ? normalizeRemoteIdentity(remoteUrl) : undefined;
+	const identity = remoteUrl ? normalizeObservedRemoteIdentity(remoteUrl) : undefined;
 	if (!identity) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
 	return identity;
 }
@@ -269,19 +275,26 @@ export function normalizeRemoteIdentity(remoteUrl: string): string | undefined {
 	if (typeof remoteUrl !== "string") return undefined;
 	const trimmed = remoteUrl.trim();
 	if (!trimmed || /[\0\s]/.test(trimmed) || /%(?:25|2f|5c)/i.test(trimmed)) return undefined;
+	if (trimmed.startsWith(REMOTE_IDENTITY_PREFIX)) return parseCanonicalRemoteIdentity(trimmed);
+	return normalizeObservedRemoteIdentity(trimmed);
+}
 
+function normalizeObservedRemoteIdentity(remoteUrl: string): string | undefined {
+	const trimmed = remoteUrl.trim();
+	if (
+		!trimmed ||
+		/[\0\s]/.test(trimmed) ||
+		/%(?:25|2f|5c)/i.test(trimmed) ||
+		trimmed.startsWith(REMOTE_IDENTITY_PREFIX) ||
+		isAbsolute(trimmed) ||
+		/^[A-Za-z]:[\\/]/.test(trimmed) ||
+		trimmed.startsWith("\\\\")
+	)
+		return undefined;
 	let host: string;
 	let path: string;
 	let sshUsername: string | undefined;
-	const canonical = trimmed.match(/^(?:([A-Za-z0-9._-]+)@)?(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(?:!(\d+))?\/(.+)$/);
-	if (canonical?.[2] && canonical[4]) {
-		if (canonical[3] && !isValidPort(canonical[3])) return undefined;
-		sshUsername = canonical[1];
-		const canonicalHost = normalizeRemoteHost(canonical[2]);
-		if (!canonicalHost) return undefined;
-		host = `${canonicalHost}${canonical[3] ? `!${canonical[3]}` : ""}`;
-		path = canonical[4];
-	} else if (!trimmed.includes("://")) {
+	if (!trimmed.includes("://")) {
 		const scpLike = trimmed.match(/^(?:([A-Za-z0-9._-]+)@)?(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):([^?#]+)$/);
 		if (!scpLike?.[2] || !scpLike[3] || scpLike[3].includes("@")) return undefined;
 		sshUsername = scpLike[1];
@@ -307,6 +320,29 @@ export function normalizeRemoteIdentity(remoteUrl: string): string | undefined {
 		}
 	}
 
+	return formatCanonicalRemoteIdentity(sshUsername, host, path);
+}
+
+function parseCanonicalRemoteIdentity(value: string): string | undefined {
+	const canonical = value.match(
+		/^git-remote:v1:\/\/(?:([A-Za-z0-9._-]+)@)?(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(?:!(\d+))?\/(.+)$/,
+	);
+	if (!canonical?.[2] || !canonical[4] || (canonical[3] && !isValidPort(canonical[3]))) return undefined;
+	const host = normalizeRemoteHost(canonical[2]);
+	if (!host) return undefined;
+	const normalized = formatCanonicalRemoteIdentity(
+		canonical[1],
+		`${host}${canonical[3] ? `!${canonical[3]}` : ""}`,
+		canonical[4],
+	);
+	return normalized === value ? normalized : undefined;
+}
+
+function formatCanonicalRemoteIdentity(
+	sshUsername: string | undefined,
+	host: string,
+	path: string,
+): string | undefined {
 	try {
 		const segments = path
 			.replace(/^\/+|\/+$/g, "")
@@ -315,13 +351,12 @@ export function normalizeRemoteIdentity(remoteUrl: string): string | undefined {
 		if (
 			segments.length < 2 ||
 			segments.some((segment) => !segment || segment === "." || segment === ".." || /[\0/\\\s?#]/.test(segment))
-		) {
+		)
 			return undefined;
-		}
 		segments[segments.length - 1] = segments.at(-1)?.replace(/\.git$/i, "") ?? "";
 		if (!segments.at(-1)) return undefined;
 		const userPrefix = sshUsername && sshUsername !== "git" ? `${sshUsername}@` : "";
-		return `${userPrefix}${host}/${segments.join("/")}`;
+		return `${REMOTE_IDENTITY_PREFIX}${userPrefix}${host}/${segments.join("/")}`;
 	} catch {
 		return undefined;
 	}
@@ -333,7 +368,14 @@ function isValidPort(value: string): boolean {
 }
 
 function normalizeRemoteHost(value: string): string | undefined {
-	if (!value.startsWith("[")) return value.toLowerCase();
+	if (!value.startsWith("[")) {
+		const normalized = (value.endsWith(".") ? value.slice(0, -1) : value).toLowerCase();
+		if (!normalized || normalized.length > 253) return undefined;
+		const labels = normalized.split(".");
+		if (labels.some((label) => !label || label.length > 63 || !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label)))
+			return undefined;
+		return normalized;
+	}
 	try {
 		const hostname = new URL(`http://${value}/`).hostname.toLowerCase();
 		return hostname.startsWith("[") && hostname.endsWith("]") ? hostname : undefined;
@@ -467,6 +509,7 @@ function acquireLock(
 				}
 			}
 			if (Date.now() >= deadline) throw new Error("Timed out acquiring OMP project identity lock");
+			LOCK_WAIT_OBSERVER_FOR_TESTS?.();
 			Atomics.wait(SLEEP_BUFFER, 0, 0, 10);
 		}
 	}
@@ -897,7 +940,7 @@ function isCanonicalRoot(value: unknown): value is string {
 }
 
 function isCanonicalRemoteIdentity(value: unknown): value is string {
-	return isNonEmptyString(value) && normalizeRemoteIdentity(value) === value;
+	return isNonEmptyString(value) && parseCanonicalRemoteIdentity(value) === value;
 }
 
 export function validateProjectBinding(value: unknown): Readonly<ProjectBinding> {

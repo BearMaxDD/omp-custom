@@ -55,6 +55,19 @@ function bindingPath(root: string): string {
 	return join(root, ".omp", "compliance", "project.json");
 }
 
+function lockWaitScript(root: string, readyPath: string, operation: string): string {
+	const modulePath = join(import.meta.dir, "../../src/project/project-identity.ts");
+	return `import { writeFileSync } from "node:fs"; import { ProjectIdentityStore, setProjectIdentityLockWaitObserverForTests } from ${JSON.stringify(modulePath)}; const root = ${JSON.stringify(root)}; let ready = false; setProjectIdentityLockWaitObserverForTests(() => { if (!ready) { ready = true; writeFileSync(${JSON.stringify(readyPath)}, "ready"); } }); ${operation}`;
+}
+
+async function waitForLockWait(readyPath: string): Promise<void> {
+	const deadline = Date.now() + 5_000;
+	while (!existsSync(readyPath)) {
+		if (Date.now() >= deadline) throw new Error(`Child did not enter the lock wait path: ${readyPath}`);
+		await Bun.sleep(5);
+	}
+}
+
 function readBinding(root: string): ProjectBinding {
 	return JSON.parse(readFileSync(bindingPath(root), "utf8")) as ProjectBinding;
 }
@@ -99,7 +112,7 @@ describe("ProjectIdentityStore", () => {
 		expect(first.status).toBe("bound");
 		expect(first.binding.projectId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
 		expect(second.binding.projectId).toBe(first.binding.projectId);
-		expect(first.binding.gitRemoteIdentity).toBe("github.com/acme/platform/widget");
+		expect(first.binding.gitRemoteIdentity).toBe("git-remote:v1://github.com/acme/platform/widget");
 		expect(existsSync(`${bindingPath(root)}.tmp`)).toBe(false);
 	});
 
@@ -137,9 +150,9 @@ describe("ProjectIdentityStore", () => {
 
 		const reopened = ProjectIdentityStore.open(root);
 
-		expect(initial.binding.gitRemoteIdentity).toBe("alice@git.example.com/repos/widget");
+		expect(initial.binding.gitRemoteIdentity).toBe("git-remote:v1://alice@git.example.com/repos/widget");
 		expect(reopened.status).toBe("project_mismatch");
-		expect(reopened.observedRemote).toBe("bob@git.example.com/repos/widget");
+		expect(reopened.observedRemote).toBe("git-remote:v1://bob@git.example.com/repos/widget");
 		expect(reopened.binding.projectId).toBe(initial.binding.projectId);
 	});
 
@@ -150,8 +163,8 @@ describe("ProjectIdentityStore", () => {
 
 		const reopened = ProjectIdentityStore.open(root);
 
-		expect(initial.binding.gitRemoteIdentity).toBe("git.example.com!2222/team/repo");
-		expect(reopened.observedRemote).toBe("git.example.com/2222/team/repo");
+		expect(initial.binding.gitRemoteIdentity).toBe("git-remote:v1://git.example.com!2222/team/repo");
+		expect(reopened.observedRemote).toBe("git-remote:v1://git.example.com/2222/team/repo");
 		expect(reopened.status).toBe("project_mismatch");
 	});
 
@@ -205,7 +218,7 @@ describe("ProjectIdentityStore", () => {
 			process.env.GIT_WORK_TREE = rootB;
 			const result = ProjectIdentityStore.open(rootA);
 			expect(result.binding.canonicalRoot).toBe(realpathSync(rootA));
-			expect(result.binding.gitRemoteIdentity).toBe("git.example.com/team/a");
+			expect(result.binding.gitRemoteIdentity).toBe("git-remote:v1://git.example.com/team/a");
 		} finally {
 			if (originalGitDir === undefined) Reflect.deleteProperty(process.env, "GIT_DIR");
 			else process.env.GIT_DIR = originalGitDir;
@@ -252,7 +265,7 @@ describe("ProjectIdentityStore", () => {
 			process.env.GIT_CONFIG_GLOBAL = globalConfig;
 			const first = ProjectIdentityStore.open(root);
 			expect(first.status).toBe("bound");
-			expect(first.binding.gitRemoteIdentity).toBe("local.example/team/widget");
+			expect(first.binding.gitRemoteIdentity).toBe("git-remote:v1://local.example/team/widget");
 		} finally {
 			if (originalGlobalConfig === undefined) Reflect.deleteProperty(process.env, "GIT_CONFIG_GLOBAL");
 			else process.env.GIT_CONFIG_GLOBAL = originalGlobalConfig;
@@ -260,18 +273,18 @@ describe("ProjectIdentityStore", () => {
 
 		const reopened = ProjectIdentityStore.open(root);
 		expect(reopened.status).toBe("bound");
-		expect(reopened.observedRemote).toBe("local.example/team/widget");
+		expect(reopened.observedRemote).toBe("git-remote:v1://local.example/team/widget");
 	});
 
 	it("prefers origin and otherwise sorts local remote names", () => {
 		const withOrigin = initGit("https://git.example.com/team/origin.git");
 		git(withOrigin, "remote", "add", "aaa", "https://git.example.com/team/aaa.git");
-		expect(ProjectIdentityStore.open(withOrigin).observedRemote).toBe("git.example.com/team/origin");
+		expect(ProjectIdentityStore.open(withOrigin).observedRemote).toBe("git-remote:v1://git.example.com/team/origin");
 
 		const withoutOrigin = initGit();
 		git(withoutOrigin, "remote", "add", "zeta", "https://git.example.com/team/zeta.git");
 		git(withoutOrigin, "remote", "add", "alpha", "https://git.example.com/team/alpha.git");
-		expect(ProjectIdentityStore.open(withoutOrigin).observedRemote).toBe("git.example.com/team/alpha");
+		expect(ProjectIdentityStore.open(withoutOrigin).observedRemote).toBe("git-remote:v1://git.example.com/team/alpha");
 	});
 
 	it("does not infer identity after moving a project without a remote", () => {
@@ -287,15 +300,22 @@ describe("ProjectIdentityStore", () => {
 		expect(reopened.binding.projectId).toBe(initial.binding.projectId);
 	});
 
-	it.each(["not-a-remote", "https://host.example/org/%ZZrepo.git", "https://host.example/org/%252Frepo.git"])(
-		"refuses a configured remote that cannot form a canonical identity: %s",
-		(remote) => {
-			const root = initGit(remote);
+	it.each([
+		"not-a-remote",
+		"foo/team/repo",
+		"../team/repo",
+		"./team/repo",
+		"/srv/git/team/repo.git",
+		"file:///srv/git/team/repo.git",
+		"git-remote:v1://git.example.com/team/repo",
+		"https://host.example/org/%ZZrepo.git",
+		"https://host.example/org/%252Frepo.git",
+	])("refuses a configured remote that cannot form a canonical identity: %s", (remote) => {
+		const root = initGit(remote);
 
-			expect(() => ProjectIdentityStore.open(root)).toThrow(PROJECT_IDENTITY_INVALID_ERROR);
-			expect(existsSync(bindingPath(root))).toBe(false);
-		},
-	);
+		expect(() => ProjectIdentityStore.open(root)).toThrow(PROJECT_IDENTITY_INVALID_ERROR);
+		expect(existsSync(bindingPath(root))).toBe(false);
+	});
 
 	it("creates exactly one identity in 20 concurrent first-open rounds", async () => {
 		const modulePath = join(import.meta.dir, "../../src/project/project-identity.ts");
@@ -361,6 +381,7 @@ describe("ProjectIdentityStore", () => {
 		["non-ISO createdAt", { createdAt: "2026-01-01" }],
 		["relative canonical root", { canonicalRoot: "repo" }],
 		["empty remote", { gitRemoteIdentity: "" }],
+		["legacy unprefixed remote", { gitRemoteIdentity: "git.example.com/team/repo" }],
 		["empty codebase project", { codebaseProjectId: "" }],
 		["invalid rebound time", { reboundAt: "yesterday" }],
 	])("rejects identity JSON with %s", (_case, override) => {
@@ -430,10 +451,10 @@ describe("ProjectIdentityStore", () => {
 		mkdirSync(directory, { recursive: true });
 		writeFileSync(lockPath, '{"token":');
 		const before = statSync(lockPath);
-		const modulePath = join(import.meta.dir, "../../src/project/project-identity.ts");
-		const script = `import { ProjectIdentityStore } from ${JSON.stringify(modulePath)}; ProjectIdentityStore.open(${JSON.stringify(root)});`;
+		const readyPath = join(root, ".malformed-lock-wait-ready");
+		const script = lockWaitScript(root, readyPath, "ProjectIdentityStore.open(root);");
 		const child = Bun.spawn([process.execPath, "-e", script], { stderr: "pipe", stdout: "pipe" });
-		await Bun.sleep(100);
+		await waitForLockWait(readyPath);
 		const after = statSync(lockPath);
 		child.kill();
 		await child.exited;
@@ -518,10 +539,10 @@ describe("ProjectIdentityStore", () => {
 			JSON.stringify({ token: randomUUID(), pid: Number.MAX_SAFE_INTEGER, createdAt: new Date().toISOString() }),
 		);
 		const before = statSync(lockPath);
-		const modulePath = join(import.meta.dir, "../../src/project/project-identity.ts");
-		const script = `import { ProjectIdentityStore } from ${JSON.stringify(modulePath)}; ProjectIdentityStore.open(${JSON.stringify(root)});`;
+		const readyPath = join(root, ".unknown-owner-lock-wait-ready");
+		const script = lockWaitScript(root, readyPath, "ProjectIdentityStore.open(root);");
 		const child = Bun.spawn([process.execPath, "-e", script], { stderr: "pipe", stdout: "pipe" });
-		await Bun.sleep(100);
+		await waitForLockWait(readyPath);
 		const after = statSync(lockPath);
 		child.kill();
 		await child.exited;
@@ -538,10 +559,10 @@ describe("ProjectIdentityStore", () => {
 		const lockPath = join(directory, ".project.lock");
 		const token = randomUUID();
 		writeFileSync(lockPath, JSON.stringify({ token, pid: process.pid, createdAt: new Date(0).toISOString() }));
-		const modulePath = join(import.meta.dir, "../../src/project/project-identity.ts");
-		const script = `import { ProjectIdentityStore } from ${JSON.stringify(modulePath)}; ProjectIdentityStore.open(${JSON.stringify(root)});`;
+		const readyPath = join(root, ".live-owner-lock-wait-ready");
+		const script = lockWaitScript(root, readyPath, "ProjectIdentityStore.open(root);");
 		const child = Bun.spawn([process.execPath, "-e", script], { stderr: "pipe", stdout: "pipe" });
-		await Bun.sleep(100);
+		await waitForLockWait(readyPath);
 		child.kill();
 		await child.exited;
 
@@ -558,10 +579,10 @@ describe("ProjectIdentityStore", () => {
 			join(directory, ".project.lock"),
 			JSON.stringify({ token: randomUUID(), pid: process.pid, createdAt: new Date().toISOString() }),
 		);
-		const modulePath = join(import.meta.dir, "../../src/project/project-identity.ts");
-		const script = `import { ProjectIdentityStore } from ${JSON.stringify(modulePath)}; ProjectIdentityStore.open(${JSON.stringify(root)});`;
+		const readyPath = join(root, ".replace-storage-lock-wait-ready");
+		const script = lockWaitScript(root, readyPath, "ProjectIdentityStore.open(root);");
 		const child = Bun.spawn([process.execPath, "-e", script], { stderr: "pipe", stdout: "pipe" });
-		await Bun.sleep(100);
+		await waitForLockWait(readyPath);
 		renameSync(ompDirectory, join(root, ".omp-replaced"));
 		mkdirSync(directory, { recursive: true });
 		const stderr = await new Response(child.stderr).text();
@@ -581,10 +602,14 @@ describe("ProjectIdentityStore", () => {
 			join(directory, ".project.lock"),
 			JSON.stringify({ token: randomUUID(), pid: process.pid, createdAt: new Date().toISOString() }),
 		);
-		const modulePath = join(import.meta.dir, "../../src/project/project-identity.ts");
-		const script = `import { ProjectIdentityStore } from ${JSON.stringify(modulePath)}; try { ProjectIdentityStore.open(${JSON.stringify(root)}); } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exit(2); }`;
+		const readyPath = join(root, ".remove-storage-lock-wait-ready");
+		const script = lockWaitScript(
+			root,
+			readyPath,
+			"try { ProjectIdentityStore.open(root); } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exit(2); }",
+		);
 		const child = Bun.spawn([process.execPath, "-e", script], { stderr: "pipe", stdout: "pipe" });
-		await Bun.sleep(100);
+		await waitForLockWait(readyPath);
 		renameSync(ompDirectory, join(root, ".omp-disappeared"));
 		const stderr = await new Response(child.stderr).text();
 
@@ -609,10 +634,10 @@ describe("ProjectIdentityStore", () => {
 			canonicalRoot: realpathSync(root),
 			createdAt: new Date().toISOString(),
 		} as const;
-		const modulePath = join(import.meta.dir, "../../src/project/project-identity.ts");
-		const script = `import { ProjectIdentityStore } from ${JSON.stringify(modulePath)}; console.log(ProjectIdentityStore.open(${JSON.stringify(root)}).binding.projectId);`;
+		const readyPath = join(root, ".publish-binding-lock-wait-ready");
+		const script = lockWaitScript(root, readyPath, "console.log(ProjectIdentityStore.open(root).binding.projectId);");
 		const child = Bun.spawn([process.execPath, "-e", script], { stderr: "pipe", stdout: "pipe" });
-		await Bun.sleep(100);
+		await waitForLockWait(readyPath);
 		writeFileSync(bindingPath(root), `${JSON.stringify(expected)}\n`);
 		unlinkSync(lockPath);
 		const stdout = await new Response(child.stdout).text();
@@ -691,13 +716,13 @@ describe("ProjectIdentityStore", () => {
 
 describe("normalizeRemoteIdentity", () => {
 	it.each([
-		["https://github.com/acme/platform/widget.git", "github.com/acme/platform/widget"],
-		["ssh://git@github.com/acme/platform/widget.git", "github.com/acme/platform/widget"],
-		["ssh://git@github.com:22/acme/platform/widget.git", "github.com/acme/platform/widget"],
-		["git@github.com:acme/platform/widget.git", "github.com/acme/platform/widget"],
-		["https://github.com:443/acme/platform/widget.git", "github.com/acme/platform/widget"],
-		["ssh://git@[2001:db8::1]:2222/acme/widget.git", "[2001:db8::1]!2222/acme/widget"],
-		["https://GitHub.COM/acme/%77idget.git", "github.com/acme/widget"],
+		["https://github.com/acme/platform/widget.git", "git-remote:v1://github.com/acme/platform/widget"],
+		["ssh://git@github.com/acme/platform/widget.git", "git-remote:v1://github.com/acme/platform/widget"],
+		["ssh://git@github.com:22/acme/platform/widget.git", "git-remote:v1://github.com/acme/platform/widget"],
+		["git@github.com:acme/platform/widget.git", "git-remote:v1://github.com/acme/platform/widget"],
+		["https://github.com:443/acme/platform/widget.git", "git-remote:v1://github.com/acme/platform/widget"],
+		["ssh://git@[2001:db8::1]:2222/acme/widget.git", "git-remote:v1://[2001:db8::1]!2222/acme/widget"],
+		["https://GitHub.COM/acme/%77idget.git", "git-remote:v1://github.com/acme/widget"],
 	])("normalizes %s", (remote, expected) => {
 		const canonical = normalizeRemoteIdentity(remote);
 
@@ -708,8 +733,8 @@ describe("normalizeRemoteIdentity", () => {
 	it("keeps host, port, and the full namespace collision-resistant", () => {
 		const urlPort = normalizeRemoteIdentity("ssh://git@git.example.com:2222/team/repo.git");
 		const scpPath = normalizeRemoteIdentity("git@git.example.com:2222/team/repo.git");
-		expect(urlPort).toBe("git.example.com!2222/team/repo");
-		expect(scpPath).toBe("git.example.com/2222/team/repo");
+		expect(urlPort).toBe("git-remote:v1://git.example.com!2222/team/repo");
+		expect(scpPath).toBe("git-remote:v1://git.example.com/2222/team/repo");
 		expect(urlPort).not.toBe(scpPath);
 		expect(normalizeRemoteIdentity(urlPort as string)).toBe(urlPort);
 		expect(normalizeRemoteIdentity(scpPath as string)).toBe(scpPath);
@@ -730,8 +755,8 @@ describe("normalizeRemoteIdentity", () => {
 		const git = normalizeRemoteIdentity("git@git.example.com:repos/widget.git");
 		const https = normalizeRemoteIdentity("https://git.example.com/repos/widget.git");
 
-		expect(alice).toBe("alice@git.example.com/repos/widget");
-		expect(bob).toBe("bob@git.example.com/repos/widget");
+		expect(alice).toBe("git-remote:v1://alice@git.example.com/repos/widget");
+		expect(bob).toBe("git-remote:v1://bob@git.example.com/repos/widget");
 		expect(alice).not.toBe(bob);
 		expect(git).toBe(https);
 		expect(normalizeRemoteIdentity(alice as string)).toBe(alice);
@@ -742,7 +767,7 @@ describe("normalizeRemoteIdentity", () => {
 		const url = normalizeRemoteIdentity("ssh://git@[2001:db8::1]/team/repo.git");
 		const scp = normalizeRemoteIdentity("git@[2001:0db8:0:0:0:0:0:1]:team/repo.git");
 
-		expect(url).toBe("[2001:db8::1]/team/repo");
+		expect(url).toBe("git-remote:v1://[2001:db8::1]/team/repo");
 		expect(scp).toBe(url);
 		expect(normalizeRemoteIdentity(url as string)).toBe(url);
 	});
@@ -751,12 +776,42 @@ describe("normalizeRemoteIdentity", () => {
 		const explicit = normalizeRemoteIdentity("git://git.example.com:9418/team/repo.git");
 		const implicit = normalizeRemoteIdentity("git://git.example.com/team/repo.git");
 
-		expect(explicit).toBe("git.example.com/team/repo");
+		expect(explicit).toBe("git-remote:v1://git.example.com/team/repo");
 		expect(implicit).toBe(explicit);
 		expect(normalizeRemoteIdentity(explicit as string)).toBe(explicit);
 	});
 
+	it("keeps canonical syntax disjoint from relative paths and raw network observations", () => {
+		const canonical = normalizeRemoteIdentity("ssh://git@foo/team/repo.git");
+
+		expect(canonical).toBe("git-remote:v1://foo/team/repo");
+		expect(normalizeRemoteIdentity(canonical as string)).toBe(canonical);
+		expect(normalizeRemoteIdentity("foo/team/repo")).toBeUndefined();
+	});
+
+	it("normalizes one DNS termination point and validates every DNS label", () => {
+		expect(normalizeRemoteIdentity("https://git.example.com./team/repo.git")).toBe(
+			normalizeRemoteIdentity("https://git.example.com/team/repo.git"),
+		);
+		for (const remote of [
+			"ssh://git@./team/repo.git",
+			"ssh://git@../team/repo.git",
+			"https://git..example.com/team/repo.git",
+			"https://-git.example.com/team/repo.git",
+			"https://git-.example.com/team/repo.git",
+			"https://git_example.com/team/repo.git",
+		]) {
+			expect(normalizeRemoteIdentity(remote)).toBeUndefined();
+		}
+	});
+
 	it.each([
+		"foo/team/repo",
+		"../team/repo",
+		"./team/repo",
+		"/srv/git/team/repo.git",
+		"C:/git/team/repo.git",
+		"file:///srv/git/team/repo.git",
 		"https://user:password@host.example/org/repo.git",
 		"user:password@host.example:org/repo.git",
 		"https://host.example/org/%2Frepo.git",
@@ -792,7 +847,7 @@ describe("createProjectContext", () => {
 		expect(context).toEqual({
 			projectId: identity.binding.projectId,
 			root: identity.binding.canonicalRoot,
-			remote: "github.com/acme/widget",
+			remote: "git-remote:v1://github.com/acme/widget",
 			codebaseProject: "codebase-acme-widget",
 			sessionId,
 			cwd,
