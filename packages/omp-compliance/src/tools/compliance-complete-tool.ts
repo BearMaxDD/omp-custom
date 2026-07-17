@@ -80,7 +80,10 @@ export function validateCompletionParams(raw: Record<string, unknown>): Validati
  *     transition to advisor_reviewing
  *  3. Returns { status: "advisor_reviewing", completionSnapshot }
  */
-export function registerComplianceCompleteTool(api: ExtensionAPI, runtime: ComplianceRuntime): void {
+export function registerComplianceCompleteTool(
+	api: Pick<ExtensionAPI, "registerTool">,
+	runtime: ComplianceRuntime,
+): void {
 	const tool: ToolDefinition = {
 		name: "compliance_complete",
 		label: "Compliance Complete",

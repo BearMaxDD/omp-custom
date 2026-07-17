@@ -24,19 +24,18 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "@oh-my-pi/pi-coding-agent/advisor/index";
 import { ComplianceReviewRegistry } from "../../src/advisor/review-envelope";
 import { EvidenceStore } from "../../src/evidence/evidence-store";
 import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
-import type { ExtensionAPI } from "../../src/types";
-import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "../../src/types";
 import { FakeAdvisor } from "../support/fake-advisor";
 import { FakeCodebaseMemory } from "../support/fake-codebase-memory";
 import { FakeTaskTool } from "../support/fake-task-tool";
 
 // ─── Minimal API for runtime tests ───────────────────────────────────
 
-class TestAPI implements ExtensionAPI {
+class TestAPI {
 	public sentMessages: unknown[] = [];
 	public entries: Array<{ type: string; data?: unknown }> = [];
 

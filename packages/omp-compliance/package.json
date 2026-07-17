@@ -13,7 +13,7 @@
     "extensions": ["./dist/extension.js"]
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "rm -rf dist && tsgo -p tsconfig.json",
     "bundle:omp": "bun build src/extension.ts --target=bun --format=esm --banner='// @ts-nocheck' --outfile=dist/extension.bundle.js",
     "check": "cd ../.. && biome check packages/omp-compliance/src packages/omp-compliance/test",
     "test": "bun test --preload ./test/setup.ts"
@@ -22,14 +22,11 @@
     "@oh-my-pi/pi-coding-agent": ">=17.0.1 <18"
   },
   "devDependencies": {
-    "@oh-my-pi/pi-coding-agent": "link:@oh-my-pi/pi-coding-agent",
+    "@oh-my-pi/pi-coding-agent": "file:/Users/mima1234/Code/super/.worktrees/oh-my-pi-v17-advisor-protocol/packages/coding-agent",
     "@oh-my-pi/pi-agent-core": "17.0.1",
     "@biomejs/biome": "^1.9.4",
     "@types/bun": "^1.2.0",
+    "@typescript/native-preview": "7.0.0-dev.20260707.2",
     "typescript": "^5.7.0"
-  },
-  "ompCustom": {
-    "hostSource": "/Users/mima1234/Code/super/.worktrees/oh-my-pi-v17-advisor-protocol",
-    "hostCommit": "2adbf91f6d73534342f194f99b1a305db37ae1cf"
   }
 }

@@ -14,8 +14,15 @@
  *  - When the task is stalled, automatic injection stops.
  */
 
+import type { CustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
 import type { SHA256Hash } from "../contract/types";
-import type { CustomMessagePayload, ExtensionAPI } from "../types";
+
+export interface RemediationMessageHost {
+	sendMessage<T = unknown>(
+		message: CustomMessagePayload<T>,
+		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+	): void;
+}
 
 // ─── Remediation Parameters ─────────────────────────────────────────
 
@@ -47,7 +54,7 @@ export interface RemediationPayload {
  * @param payload — remediation data (taskId, contractHash, findings)
  * @returns true if the message was sent, false if conditions not met
  */
-export function injectRemediation(api: ExtensionAPI, payload: RemediationPayload): boolean {
+export function injectRemediation(api: RemediationMessageHost, payload: RemediationPayload): boolean {
 	// Guard: no findings → nothing to inject
 	if (!payload.findings || payload.findings.length === 0) {
 		return false;

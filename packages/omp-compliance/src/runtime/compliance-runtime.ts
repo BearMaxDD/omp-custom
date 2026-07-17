@@ -11,6 +11,8 @@
  */
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
+import type { AdvisorReviewReceipt } from "@oh-my-pi/pi-coding-agent/advisor/index";
+import type { CustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { buildCompletionContext } from "../advisor/completion-context";
 import { renderCompletionRules } from "../advisor/default-rule-pack";
 import { createEnvelope } from "../advisor/review-envelope";
@@ -28,7 +30,6 @@ import type { CollectorRuntime } from "../signals/collector-runtime";
 import type { EvidenceSnapshot } from "../signals/types";
 import { transition } from "../state/task-state-machine";
 import type { TaskState } from "../state/types";
-import type { AdvisorReviewReceipt, ExtensionAPI } from "../types";
 import type { CompletionSnapshot } from "./completion-gate";
 import { buildCompletionSnapshot } from "./completion-gate";
 
@@ -40,6 +41,13 @@ const _TASK_STATE_KEY = "_runtime_task_state";
 export interface VerificationRecord {
 	command: string;
 	exitCode: number;
+}
+
+export interface ComplianceRuntimeHost {
+	sendMessage<T = unknown>(
+		message: CustomMessagePayload<T>,
+		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+	): void;
 }
 
 /**
@@ -57,7 +65,7 @@ export class ComplianceRuntime {
 	constructor(
 		private readonly getEvidenceStore: () => EvidenceStore,
 		private readonly collector: CollectorRuntime,
-		private readonly api: ExtensionAPI,
+		private readonly api: ComplianceRuntimeHost,
 		private readonly repoRoot: string,
 		private readonly reviewDeps: ComplianceReviewDependencies,
 	) {}

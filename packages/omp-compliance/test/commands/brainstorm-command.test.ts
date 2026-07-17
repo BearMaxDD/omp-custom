@@ -91,7 +91,7 @@ describe("registerBrainstormCommand", () => {
 		const cmd = commands.find((c) => c.name === "brainstorm");
 		expect(cmd).toBeDefined();
 		expect(cmd?.description).toBeTruthy();
-		expect(cmd?.completions).toEqual(["status", "history", "retry", "park"]);
+		expect(cmd?.completions).toEqual(["status", "history", "retry", "park"].map((value) => ({ value, label: value })));
 	});
 
 	it("shows status with current topic info", async () => {

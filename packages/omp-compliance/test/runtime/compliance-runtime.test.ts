@@ -2,17 +2,17 @@ import { beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "@oh-my-pi/pi-coding-agent/advisor/index";
 import { ComplianceReviewRegistry } from "../../src/advisor/review-envelope";
 import type { ComplianceReviewDependencies } from "../../src/advisor/review-envelope";
 import { EvidenceStore } from "../../src/evidence/evidence-store";
 import { buildCompletionSnapshot } from "../../src/runtime/completion-gate";
 import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
-import type { AdvisorReviewReceipt, AdvisorReviewRequest, ExtensionAPI } from "../../src/types";
 
 // ─── Minimal Fake API for runtime tests ─────────────────────────────
 
-class MinimalAPI implements ExtensionAPI {
+class MinimalAPI {
 	public sentMessages: unknown[] = [];
 	public entries: Array<{ type: string; data?: unknown }> = [];
 

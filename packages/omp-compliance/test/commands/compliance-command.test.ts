@@ -2,18 +2,18 @@ import { beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "@oh-my-pi/pi-coding-agent/advisor/index";
+import type { RegisteredCommand } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { ComplianceReviewRegistry } from "../../src/advisor/review-envelope";
 import type { ComplianceReviewDependencies } from "../../src/advisor/review-envelope";
 import { registerComplianceCommand } from "../../src/commands/compliance-command";
 import { EvidenceStore } from "../../src/evidence/evidence-store";
 import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
-import type { ExtensionAPI } from "../../src/types";
-import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "../../src/types";
 
 // ─── Fake ExtensionAPI for command testing ──────────────────────────
 
-class FakeCommandAPI implements ExtensionAPI {
+class FakeCommandAPI {
 	public readonly sentMessages: unknown[] = [];
 	public readonly entries: Array<{ type: string; data?: unknown }> = [];
 	public readonly logs: string[] = [];
@@ -27,11 +27,14 @@ class FakeCommandAPI implements ExtensionAPI {
 		name: string,
 		options: {
 			description?: string;
-			getArgumentCompletions?: () => string[];
-			handler: (args: string[]) => Promise<void> | void;
+			getArgumentCompletions?: RegisteredCommand["getArgumentCompletions"];
+			handler: RegisteredCommand["handler"];
 		},
 	): void {
-		this.registeredCommands.push({ name, handler: options.handler as (args: string[]) => Promise<void> });
+		this.registeredCommands.push({
+			name,
+			handler: (args) => options.handler(args.join(" "), {} as Parameters<RegisteredCommand["handler"]>[1]),
+		});
 	}
 
 	on(): void {
@@ -56,8 +59,8 @@ class FakeCommandAPI implements ExtensionAPI {
 		debug: () => {},
 	};
 
-	toAPI(): ExtensionAPI {
-		return this as unknown as ExtensionAPI;
+	toAPI(): FakeCommandAPI {
+		return this;
 	}
 }
 

@@ -1,11 +1,11 @@
 import { beforeEach, describe, expect, it } from "bun:test";
+import type { CustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
 import type { SHA256Hash } from "../../src/contract/types";
 import { injectRemediation } from "../../src/remediation/inject-required-fix";
-import type { CustomMessagePayload, ExtensionAPI } from "../../src/types";
 
 // ─── Fake API that captures sent messages ───────────────────────────
 
-class FakeRemediationAPI implements ExtensionAPI {
+class FakeRemediationAPI {
 	public sent: Array<{ message: unknown; options?: { deliverAs?: string; triggerTurn?: boolean } }> = [];
 
 	registerTool(): void {}

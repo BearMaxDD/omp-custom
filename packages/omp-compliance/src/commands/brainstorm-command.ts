@@ -24,12 +24,15 @@ import type { TopicCoordinator } from "../brainstorm/topic-coordinator";
  */
 /** Lazy getter for TopicCoordinator — avoids FS side effects at registration time. */
 type CoordinatorGetter = () => TopicCoordinator;
-export function registerBrainstormCommand(api: ExtensionAPI, getCoordinator: CoordinatorGetter): void {
+export function registerBrainstormCommand(
+	api: Pick<ExtensionAPI, "registerCommand">,
+	getCoordinator: CoordinatorGetter,
+): void {
 	api.registerCommand("brainstorm", {
 		description:
 			"Manage brainstorm topics. " +
 			"Usage: /brainstorm status | history <topic_id> | retry <topic_id> | park <topic_id>",
-		getArgumentCompletions: () => ["status", "history", "retry", "park"],
+		getArgumentCompletions: () => ["status", "history", "retry", "park"].map((value) => ({ value, label: value })),
 		handler: async (rawArgs: string) => {
 			const args: string[] = Array.isArray(rawArgs)
 				? (rawArgs as string[])

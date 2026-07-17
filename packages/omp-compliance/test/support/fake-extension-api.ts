@@ -1,3 +1,4 @@
+import type { TSchema } from "@oh-my-pi/pi-ai";
 import type {
 	AdvisorBeforeRunEvent,
 	AdvisorReviewReceipt,
@@ -5,11 +6,12 @@ import type {
 	AdvisorRunAugmentation,
 } from "@oh-my-pi/pi-coding-agent/advisor/index";
 import type {
-	ExtensionAPI,
 	ExtensionContext,
+	RegisteredCommand,
 	ToolDefinition,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { CustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
+import type { ComplianceExtensionHost } from "../../src/extension";
 
 /**
  * A minimal fake implementation of ExtensionAPI for testing.
@@ -27,7 +29,7 @@ export class FakeExtensionAPI {
 		_request: AdvisorReviewRequest,
 	) => ({ status: "accepted", reviewId: _request.reviewId });
 
-	registerTool(tool: ToolDefinition): void {
+	registerTool<TParams extends TSchema = TSchema, TDetails = unknown>(tool: ToolDefinition<TParams, TDetails>): void {
 		this.tools.push(tool.name);
 		this.toolDefinitions.push(tool as ToolDefinition);
 	}
@@ -36,8 +38,8 @@ export class FakeExtensionAPI {
 		name: string,
 		_options: {
 			description?: string;
-			getArgumentCompletions?: () => string[];
-			handler: (args: string[]) => Promise<void> | void;
+			getArgumentCompletions?: RegisteredCommand["getArgumentCompletions"];
+			handler: RegisteredCommand["handler"];
 		},
 	): void {
 		this.commands.push(name);
@@ -73,6 +75,10 @@ export class FakeExtensionAPI {
 		return [...this.commands];
 	}
 
+	getAllTools(): string[] {
+		return [...this.tools];
+	}
+
 	/** Return the set of events that have at least one handler bound. */
 	getBoundEvents(): string[] {
 		return Array.from(this.eventHandlers.keys());
@@ -93,7 +99,7 @@ export class FakeExtensionAPI {
 		for (const handler of handlers) {
 			const result = await handler(fullEvent, {
 				sessionManager: { getSessionId: () => fullEvent.primarySessionId },
-			} as unknown as ExtensionContext);
+			} as ExtensionContext);
 			if (result !== undefined) return result as AdvisorRunAugmentation;
 		}
 		return undefined;
@@ -138,14 +144,14 @@ export class FakeExtensionAPI {
 		return blocked;
 	}
 
-	/** Convert to the ExtensionAPI interface for use by extension activate(). */
-	toAPI(): ExtensionAPI {
+	/** Convert to the narrow set of official host capabilities consumed by activate(). */
+	toAPI(): ComplianceExtensionHost {
 		return {
 			registerTool: this.registerTool.bind(this),
 			registerCommand: this.registerCommand.bind(this),
-			on: this.on.bind(this),
+			on: this.on.bind(this) as ComplianceExtensionHost["on"],
 			sendMessage: this.sendMessage.bind(this),
-			appendEntry: this.appendEntry.bind(this),
+			getAllTools: this.getAllTools.bind(this),
 			requestAdvisorReview: this.requestAdvisorReview.bind(this),
 			logger: {
 				info: () => {},
@@ -153,6 +159,6 @@ export class FakeExtensionAPI {
 				error: () => {},
 				debug: () => {},
 			},
-		} as unknown as ExtensionAPI;
+		};
 	}
 }

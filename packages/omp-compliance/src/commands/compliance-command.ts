@@ -24,11 +24,15 @@ import { toStatusViewModel } from "../status/status-view-model";
  *   status               — show current task status (read-only)
  *   history              — show chronological event history (read-only)
  */
-export function registerComplianceCommand(api: ExtensionAPI, runtime: ComplianceRuntime): void {
+export function registerComplianceCommand(
+	api: Pick<ExtensionAPI, "logger" | "registerCommand">,
+	runtime: ComplianceRuntime,
+): void {
 	api.registerCommand("compliance", {
 		description:
 			"Manage compliance tasks. " + "Usage: /compliance start <tdd.md> | stop | resume <task_id> | status | history",
-		getArgumentCompletions: () => ["start", "stop", "resume", "status", "history"],
+		getArgumentCompletions: () =>
+			["start", "stop", "resume", "status", "history"].map((value) => ({ value, label: value })),
 		handler: async (rawArgs: string) => {
 			const args: string[] = Array.isArray(rawArgs)
 				? (rawArgs as string[])

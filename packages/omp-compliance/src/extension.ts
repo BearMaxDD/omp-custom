@@ -3,8 +3,24 @@ import type {
 	AdvisorBeforeRunEvent,
 	AdvisorReviewReceipt,
 	AdvisorReviewRequest,
+	AdvisorRunAugmentation,
 } from "@oh-my-pi/pi-coding-agent/advisor/index";
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type {
+	AgentEndEvent,
+	BeforeAgentStartEvent,
+	BeforeAgentStartEventResult,
+	ExtensionAPI,
+	ExtensionHandler,
+	RegisteredCommand,
+	SessionStartEvent,
+	SessionSwitchEvent,
+	ToolCallEvent,
+	ToolCallEventResult,
+	ToolResultEvent,
+	ToolResultEventResult,
+	TurnEndEvent,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { CustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { createComplianceAdvisorHook } from "./advisor/compliance-advisor-hook";
 import { ComplianceReviewRegistry } from "./advisor/review-envelope";
 import type { ComplianceReviewDependencies } from "./advisor/review-envelope";
@@ -25,6 +41,34 @@ import { registerComplianceCompleteTool } from "./tools/compliance-complete-tool
 
 /** Default compliance store directory within the repo. */
 const DEFAULT_COMPLIANCE_DIR = ".omp/compliance";
+
+/** Host capabilities consumed by this extension, expressed with official v17 contracts. */
+export interface ComplianceExtensionHost {
+	logger: ExtensionAPI["logger"];
+	registerTool: ExtensionAPI["registerTool"];
+	registerCommand(
+		name: string,
+		options: {
+			description?: string;
+			getArgumentCompletions?: RegisteredCommand["getArgumentCompletions"];
+			handler: RegisteredCommand["handler"];
+		},
+	): void;
+	on(event: "session_start", handler: ExtensionHandler<SessionStartEvent>): void;
+	on(event: "session_switch", handler: ExtensionHandler<SessionSwitchEvent>): void;
+	on(event: "advisor_before_run", handler: ExtensionHandler<AdvisorBeforeRunEvent, AdvisorRunAugmentation>): void;
+	on(event: "before_agent_start", handler: ExtensionHandler<BeforeAgentStartEvent, BeforeAgentStartEventResult>): void;
+	on(event: "tool_call", handler: ExtensionHandler<ToolCallEvent, ToolCallEventResult>): void;
+	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): void;
+	on(event: "turn_end", handler: ExtensionHandler<TurnEndEvent>): void;
+	on(event: "agent_end", handler: ExtensionHandler<AgentEndEvent>): void;
+	sendMessage<T = unknown>(
+		message: CustomMessagePayload<T>,
+		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+	): void;
+	getAllTools(): string[];
+	requestAdvisorReview?(request: AdvisorReviewRequest): Promise<AdvisorReviewReceipt>;
+}
 
 /**
  * Create a memoized EvidenceStore factory.
@@ -67,7 +111,7 @@ function createLazyBrainstormInfra(repoRoot: string): () => { coordinator: Topic
  * Does NOT create the evidence store or topic store directories on
  * activation — they are created lazily on first operation.
  */
-export default function activate(api: ExtensionAPI): void {
+export default function activate(api: ComplianceExtensionHost): void {
 	// Repo root: conventions assume cwd is repo root at activation
 	const repoRoot = process.cwd();
 
@@ -131,7 +175,7 @@ export default function activate(api: ExtensionAPI): void {
 	};
 
 	// ── Single advisor_before_run handler (compliance first, then brainstorm) ──
-	api.on("advisor_before_run", (e: AdvisorBeforeRunEvent) => {
+	api.on("advisor_before_run", (e) => {
 		// Compliance hook first (no lazy init needed)
 		const complianceResult = createComplianceAdvisorHook(registry, runtime)(e);
 		if (complianceResult) return complianceResult;
@@ -189,8 +233,8 @@ export default function activate(api: ExtensionAPI): void {
 	);
 
 	// ── Passive event handlers ──
-	api.on("tool_call", (event) => collector.recordToolCall(event as unknown as Record<string, unknown>));
-	api.on("tool_result", (event) => collector.recordToolResult(event as unknown as Record<string, unknown>));
-	api.on("turn_end", (event) => collector.recordTurnEnd(event as unknown as Record<string, unknown>));
+	api.on("tool_call", (event) => collector.recordToolCall({ ...event }));
+	api.on("tool_result", (event) => collector.recordToolResult({ ...event }));
+	api.on("turn_end", (event) => collector.recordTurnEnd({ ...event }));
 	api.on("agent_end", () => collector.refreshPresentation());
 }

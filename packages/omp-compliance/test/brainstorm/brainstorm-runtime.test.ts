@@ -10,13 +10,13 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "@oh-my-pi/pi-coding-agent/advisor/index";
 import { BrainstormRuntime } from "../../src/brainstorm/brainstorm-runtime";
 import { BrainstormReviewRegistry } from "../../src/brainstorm/review-registry";
 import { TopicCoordinator } from "../../src/brainstorm/topic-coordinator";
 import { TopicStore } from "../../src/brainstorm/topic-store";
 import type { BrainstormTopicReadyInput } from "../../src/brainstorm/types";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
-import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "../../src/types";
 import { FakeCodebaseMemory } from "../support/fake-codebase-memory";
 import { validTopicInput } from "./fixtures";
 

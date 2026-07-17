@@ -1,9 +1,12 @@
 import { beforeEach, describe, expect, it, spyOn } from "bun:test";
+import type {
+	AdvisorBeforeRunEvent,
+	AdvisorRunAugmentation as AdvisorBeforeRunResult,
+} from "@oh-my-pi/pi-coding-agent/advisor/index";
 import { createComplianceAdvisorHook } from "../../src/advisor/compliance-advisor-hook";
 import { ComplianceReviewRegistry, createEnvelope } from "../../src/advisor/review-envelope";
 import type { ComplianceReviewEnvelope } from "../../src/advisor/review-envelope";
 import type { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
-import type { AdvisorBeforeRunEvent, AdvisorBeforeRunResult } from "../../src/types";
 
 // ─── Helpers ────────────────────────────────────────────────────────
 

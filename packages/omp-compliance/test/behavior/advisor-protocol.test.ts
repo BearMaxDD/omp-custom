@@ -18,6 +18,7 @@ import { beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "@oh-my-pi/pi-coding-agent/advisor/index";
 import { ComplianceReviewRegistry } from "../../src/advisor/review-envelope";
 import { VerdictValidationError, parseVerdict } from "../../src/advisor/verdict-schema";
 import type { VerdictContext } from "../../src/advisor/verdict-schema";
@@ -27,8 +28,6 @@ import type { SHA256Hash } from "../../src/contract/types";
 import { EvidenceStore } from "../../src/evidence/evidence-store";
 import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
-import type { ExtensionAPI } from "../../src/types";
-import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "../../src/types";
 import { FakeAdvisor } from "../support/fake-advisor";
 
 // ─── Test Helper Types ──────────────────────────────────────────────
@@ -41,7 +40,7 @@ interface ProtocolFixture {
 
 // ─── Minimal API ─────────────────────────────────────────────────────
 
-class MinimalTestAPI implements ExtensionAPI {
+class MinimalTestAPI {
 	public sentMessages: unknown[] = [];
 
 	registerTool(): void {}

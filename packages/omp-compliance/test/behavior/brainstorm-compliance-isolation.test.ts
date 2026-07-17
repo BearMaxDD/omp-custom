@@ -2,7 +2,6 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI } from "../../src/types";
 import { FakeExtensionAPI } from "../support/fake-extension-api";
 
 describe("brainstorm + compliance isolation — activate", () => {
@@ -23,7 +22,7 @@ describe("brainstorm + compliance isolation — activate", () => {
 	it("activate creates neither .omp/compliance nor .omp/compliance/brainstorm", async () => {
 		const api = new FakeExtensionAPI();
 		const activate = (await import("../../src/extension")).default;
-		activate(api.toAPI() as unknown as ExtensionAPI);
+		activate(api.toAPI());
 
 		expect(existsSync(join(tmpDir, ".omp/compliance"))).toBe(false);
 		expect(existsSync(join(tmpDir, ".omp/compliance/brainstorm"))).toBe(false);
@@ -32,7 +31,7 @@ describe("brainstorm + compliance isolation — activate", () => {
 	it("registers all expected brainstorm tools and commands", async () => {
 		const api = new FakeExtensionAPI();
 		const activate = (await import("../../src/extension")).default;
-		activate(api.toAPI() as unknown as ExtensionAPI);
+		activate(api.toAPI());
 
 		// Compliance registrations
 		expect(api.getRegisteredCommands()).toContain("compliance");
@@ -54,7 +53,7 @@ describe("brainstorm + compliance isolation — activate", () => {
 	it("advisor_before_run: compliance_review matches compliance hook", async () => {
 		const api = new FakeExtensionAPI();
 		const activate = (await import("../../src/extension")).default;
-		activate(api.toAPI() as unknown as ExtensionAPI);
+		activate(api.toAPI());
 
 		const result = await api.fireAdvisorBeforeRun({
 			trigger: "compliance_review",
@@ -68,7 +67,7 @@ describe("brainstorm + compliance isolation — activate", () => {
 	it("advisor_before_run: brainstorm_review matches brainstorm hook", async () => {
 		const api = new FakeExtensionAPI();
 		const activate = (await import("../../src/extension")).default;
-		activate(api.toAPI() as unknown as ExtensionAPI);
+		activate(api.toAPI());
 
 		const result = await api.fireAdvisorBeforeRun({
 			trigger: "brainstorm_review",
@@ -82,7 +81,7 @@ describe("brainstorm + compliance isolation — activate", () => {
 	it("supports session lifecycle events without error", async () => {
 		const api = new FakeExtensionAPI();
 		const activate = (await import("../../src/extension")).default;
-		activate(api.toAPI() as unknown as ExtensionAPI);
+		activate(api.toAPI());
 
 		// Simulate session_start — should not throw
 		const sessionContext = {

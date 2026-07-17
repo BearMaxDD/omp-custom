@@ -17,9 +17,11 @@ import { execFileSync } from "node:child_process";
  * Each test expects the CORRECT behavior (hook returns result, receipt
  * accepted). Current code returns undefined → test fails RED.
  */
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { AdvisorBeforeRunEvent } from "@oh-my-pi/pi-coding-agent/advisor/index";
 import { createComplianceAdvisorHook } from "../../src/advisor/compliance-advisor-hook";
 import { ComplianceReviewRegistry, createEnvelope } from "../../src/advisor/review-envelope";
 import { createBrainstormAdvisorHook } from "../../src/brainstorm/advisor-hook";
@@ -27,8 +29,10 @@ import { BrainstormReviewRegistry } from "../../src/brainstorm/review-registry";
 import { TopicCoordinator } from "../../src/brainstorm/topic-coordinator";
 import { TopicStore } from "../../src/brainstorm/topic-store";
 import activate from "../../src/extension";
-import type { AdvisorBeforeRunEvent } from "../../src/types";
 import { FakeExtensionAPI } from "../support/fake-extension-api";
+
+const HOST_PACKAGE = "/Users/mima1234/Code/super/.worktrees/oh-my-pi-v17-advisor-protocol/packages/coding-agent";
+const HOST_HEAD = "2adbf91f6d73534342f194f99b1a305db37ae1cf";
 
 const tmpDir = mkdtempSync(join(tmpdir(), "omp-contract-"));
 const store = new TopicStore(tmpDir);
@@ -44,24 +48,32 @@ afterAll(() => {
 
 describe("upstream API contract — REAL shapes", () => {
 	describe("OMP v17 extension contract", () => {
-		it("declares the v17 peer window and pins the development host commit", () => {
+		it("resolves the v17 development dependency from the pinned Host worktree", () => {
 			const packageJson = JSON.parse(readFileSync(join(import.meta.dir, "../../package.json"), "utf8")) as {
 				peerDependencies?: Record<string, string>;
 				devDependencies?: Record<string, string>;
-				ompCustom?: { hostSource?: string; hostCommit?: string };
 			};
 
 			expect(packageJson.peerDependencies?.["@oh-my-pi/pi-coding-agent"]).toBe(">=17.0.1 <18");
-			expect(packageJson.devDependencies?.["@oh-my-pi/pi-coding-agent"]).toBe("link:@oh-my-pi/pi-coding-agent");
-			expect(packageJson.ompCustom?.hostSource).toBe(
-				"/Users/mima1234/Code/super/.worktrees/oh-my-pi-v17-advisor-protocol",
+			expect(packageJson.devDependencies?.["@oh-my-pi/pi-coding-agent"]).toBe(`file:${HOST_PACKAGE}`);
+
+			const resolvedPackageJson = realpathSync(
+				fileURLToPath(import.meta.resolve("@oh-my-pi/pi-coding-agent/package.json")),
 			);
-			expect(packageJson.ompCustom?.hostCommit).toBe("2adbf91f6d73534342f194f99b1a305db37ae1cf");
+			expect(readFileSync(resolvedPackageJson, "utf8")).toBe(readFileSync(join(HOST_PACKAGE, "package.json"), "utf8"));
+			const resolvedTypes = join(dirname(resolvedPackageJson), "src/extensibility/extensions/types.ts");
+			expect(readFileSync(resolvedTypes, "utf8")).toBe(
+				readFileSync(join(HOST_PACKAGE, "src/extensibility/extensions/types.ts"), "utf8"),
+			);
+			const lockfile = readFileSync(join(import.meta.dir, "../../../../bun.lock"), "utf8");
+			expect(lockfile).toContain(
+				"@oh-my-pi/pi-coding-agent@file:../oh-my-pi-v17-advisor-protocol/packages/coding-agent",
+			);
 			expect(
-				execFileSync("git", ["-C", packageJson.ompCustom?.hostSource ?? "", "rev-parse", "HEAD"], {
+				execFileSync("git", ["-C", HOST_PACKAGE, "rev-parse", "HEAD"], {
 					encoding: "utf8",
 				}).trim(),
-			).toBe(packageJson.ompCustom?.hostCommit);
+			).toBe(HOST_HEAD);
 		});
 
 		it("registers all public tools with the v17 execute contract", () => {
@@ -80,9 +92,11 @@ describe("upstream API contract — REAL shapes", () => {
 			}
 		});
 
-		it("does not copy v16 Extension API types into the compliance package", () => {
-			const source = readFileSync(join(import.meta.dir, "../../src/types.ts"), "utf8");
-			for (const copiedType of [
+		it("does not re-export or alias Host protocol types", () => {
+			const typesPath = join(import.meta.dir, "../../src/types.ts");
+			const typesSource = existsSync(typesPath) ? readFileSync(typesPath, "utf8") : "";
+			const indexSource = readFileSync(join(import.meta.dir, "../../src/index.ts"), "utf8");
+			for (const hostType of [
 				"ExtensionAPI",
 				"ExtensionContext",
 				"ExtensionHandler",
@@ -95,8 +109,19 @@ describe("upstream API contract — REAL shapes", () => {
 				"AdvisorReviewRequest",
 				"AdvisorReviewReceipt",
 			]) {
-				expect(source).not.toMatch(new RegExp(`export\\s+(?:interface|type)\\s+${copiedType}\\b`));
+				expect(typesSource).not.toMatch(new RegExp(`\\b${hostType}\\b`));
+				expect(indexSource).not.toMatch(new RegExp(`\\b${hostType}\\b`));
 			}
+			expect(indexSource).not.toContain('from "./types"');
+		});
+
+		it("keeps the Fake and event bridge free of double-assertion signature escapes", () => {
+			const fakeSource = readFileSync(join(import.meta.dir, "../support/fake-extension-api.ts"), "utf8");
+			const extensionSource = readFileSync(join(import.meta.dir, "../../src/extension.ts"), "utf8");
+
+			expect(fakeSource).not.toMatch(/as\s+unknown\s+as/);
+			expect(extensionSource).not.toMatch(/as\s+unknown\s+as/);
+			expect(fakeSource).toContain('handler: RegisteredCommand["handler"]');
 		});
 	});
 

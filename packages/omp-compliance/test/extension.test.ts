@@ -2,11 +2,11 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "@oh-my-pi/pi-coding-agent/advisor/index";
 import { ComplianceReviewRegistry } from "../src/advisor/review-envelope";
 import { EvidenceStore } from "../src/evidence/evidence-store";
 import { ComplianceRuntime } from "../src/runtime/compliance-runtime";
 import { CollectorRuntime } from "../src/signals/collector-runtime";
-import type { AdvisorReviewReceipt, AdvisorReviewRequest, ExtensionAPI } from "../src/types";
 import { FakeExtensionAPI } from "./support/fake-extension-api";
 
 /** Minimal TDD fixture for start tests. */
@@ -42,7 +42,7 @@ describe("extension activate — no lazy file side-effects", () => {
 	it("activate 后不创建 .omp/compliance 目录", async () => {
 		const api = new FakeExtensionAPI();
 		const activate = (await import("../src/extension")).default;
-		activate(api.toAPI() as unknown as ExtensionAPI);
+		activate(api.toAPI());
 
 		expect(existsSync(join(tmpDir, ".omp/compliance"))).toBe(false);
 	});
@@ -50,7 +50,7 @@ describe("extension activate — no lazy file side-effects", () => {
 	it("activate 后不创建 .omp/compliance/brainstorm 目录", async () => {
 		const api = new FakeExtensionAPI();
 		const activate = (await import("../src/extension")).default;
-		activate(api.toAPI() as unknown as ExtensionAPI);
+		activate(api.toAPI());
 
 		expect(existsSync(join(tmpDir, ".omp/compliance/brainstorm"))).toBe(false);
 	});
@@ -58,7 +58,7 @@ describe("extension activate — no lazy file side-effects", () => {
 	it("activate 后 Brainstorm 工具和命令已注册", async () => {
 		const api = new FakeExtensionAPI();
 		const activate = (await import("../src/extension")).default;
-		activate(api.toAPI() as unknown as ExtensionAPI);
+		activate(api.toAPI());
 
 		expect(api.getRegisteredCommands()).toContain("brainstorm");
 		expect(api.getRegisteredTools()).toContain("brainstorm_topic_ready");
@@ -68,7 +68,7 @@ describe("extension activate — no lazy file side-effects", () => {
 	it("activate 后 advisor_before_run 已绑定", async () => {
 		const api = new FakeExtensionAPI();
 		const activate = (await import("../src/extension")).default;
-		activate(api.toAPI() as unknown as ExtensionAPI);
+		activate(api.toAPI());
 
 		expect(api.getBoundEvents()).toContain("advisor_before_run");
 	});
@@ -76,7 +76,7 @@ describe("extension activate — no lazy file side-effects", () => {
 	it("activate 后 before_agent_start 会注入专题自动评审提示", async () => {
 		const api = new FakeExtensionAPI();
 		const activate = (await import("../src/extension")).default;
-		activate(api.toAPI() as unknown as ExtensionAPI);
+		activate(api.toAPI());
 
 		expect(api.getBoundEvents()).toContain("before_agent_start");
 		const handlers = api.eventHandlers.get("before_agent_start") ?? [];
@@ -98,7 +98,7 @@ describe("extension activate — no lazy file side-effects", () => {
 		const collector = new CollectorRuntime();
 		const api = new FakeExtensionAPI();
 		const registry = new ComplianceReviewRegistry();
-		const runtime = new ComplianceRuntime(() => store, collector, api.toAPI() as unknown as ExtensionAPI, tmpDir, {
+		const runtime = new ComplianceRuntime(() => store, collector, api.toAPI(), tmpDir, {
 			sessionId: () => "test-session",
 			registry,
 			requestAdvisorReview: (_req: AdvisorReviewRequest) =>

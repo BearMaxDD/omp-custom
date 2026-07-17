@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import type { AdvisorBeforeRunEvent } from "@oh-my-pi/pi-coding-agent/advisor/index";
 import { createBrainstormAdvisorHook } from "../../src/brainstorm/advisor-hook";
 import { BRAINSTORM_READ_ONLY_TOOL_NAMES, isCodebaseReadOnlyName } from "../../src/brainstorm/advisor-rules";
 import { renderDecisionCard } from "../../src/brainstorm/decision-card";
@@ -7,7 +8,6 @@ import type { BrainstormReviewEnvelope } from "../../src/brainstorm/review-regis
 import { BrainstormReviewError } from "../../src/brainstorm/review-schema";
 import type { TopicCoordinator } from "../../src/brainstorm/topic-coordinator";
 import type { BrainstormTopicState } from "../../src/brainstorm/types";
-import type { AdvisorBeforeRunEvent } from "../../src/types";
 
 function makeEnvelope(overrides: Partial<BrainstormReviewEnvelope> = {}): BrainstormReviewEnvelope {
 	return Object.freeze({
