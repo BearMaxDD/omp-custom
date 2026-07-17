@@ -52,7 +52,7 @@ export class EvidencePersistenceError extends Error {
 export { deterministicEvidenceEventId } from "./recovery-record";
 
 export function isEvidenceEventId(value: string): boolean {
-	return /^[0-9a-f]{8}-[0-9a-f]{4}-[457][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+	return /^[0-9a-f]{8}-[0-9a-f]{4}-[457][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
 }
 
 function recoveryEventFor(content: Buffer, truncatedTail: Buffer): EvidenceRecoveryEvent {
@@ -167,7 +167,7 @@ export class EventLog<T extends EvidenceEvent = EvidenceEvent> {
 			throw new EvidencePersistenceError(
 				"validate_event_id",
 				this.path,
-				new Error("Evidence eventId must be an RFC UUID v4, v5, or v7"),
+				new Error("Evidence eventId must be a canonical lowercase RFC UUID v4, v5, or v7"),
 			);
 		}
 		try {

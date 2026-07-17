@@ -17,7 +17,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { EventLog, EvidencePersistenceError, deterministicEvidenceEventId } from "../../src/evidence/event-log";
+import {
+	EventLog,
+	EvidencePersistenceError,
+	deterministicEvidenceEventId,
+	isEvidenceEventId,
+} from "../../src/evidence/event-log";
 import * as secureFsSource from "../../src/evidence/secure-fs";
 import { type SecurePathScope, setSecureFsTestHook } from "../../src/evidence/secure-fs";
 
@@ -81,6 +86,12 @@ afterEach(() => {
 });
 
 describe("EventLog", () => {
+	it("仅接受规范小写 RFC UUID v4/v5/v7", () => {
+		const lowercase = "550e8400-e29b-41d4-a716-446655440000";
+		expect(isEvidenceEventId(lowercase)).toBeTrue();
+		expect(isEvidenceEventId(lowercase.toUpperCase())).toBeFalse();
+	});
+
 	it.each([
 		"event-1",
 		"550e8400-e29b-11d4-a716-446655440000",
@@ -102,6 +113,24 @@ describe("EventLog", () => {
 		const path = join(temporaryRoot(), "events.jsonl");
 		new EventLog<TestEvent>(path).append({ eventId, type: "completion" });
 		expect(new EventLog<TestEvent>(path).readAll()).toEqual([{ eventId, type: "completion" }]);
+	});
+
+	it("大写 UUID append 以 validate_event_id 拒绝且不新增物理日志", () => {
+		const path = join(temporaryRoot(), "events.jsonl");
+		const lowercase = "550e8400-e29b-41d4-a716-446655440000";
+		const uppercase = lowercase.toUpperCase();
+		const log = new EventLog<TestEvent>(path);
+		log.append({ eventId: lowercase, type: "lowercase" });
+		const before = readFileSync(path);
+
+		try {
+			log.append({ eventId: uppercase, type: "uppercase" });
+			expect.unreachable("大写 UUID 必须在持久化前被拒绝");
+		} catch (error) {
+			expect(error).toBeInstanceOf(EvidencePersistenceError);
+			expect(error).toMatchObject({ operation: "validate_event_id", path });
+		}
+		expect(readFileSync(path)).toEqual(before);
 	});
 
 	it("正常唯一事件追加不读取或解析既有日志", () => {
@@ -824,6 +853,24 @@ describe("EventLog", () => {
 			expect(normalizedId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 		}
 		expect(secondRead).toEqual(firstRead);
+	});
+
+	it("读取同一 UUID 的大小写记录时仅小写作为直接幂等键，大写按完整原始行稳定规范化", () => {
+		const path = join(temporaryRoot(), "events.jsonl");
+		const lowercase = "550e8400-e29b-41d4-a716-446655440000";
+		const uppercase = lowercase.toUpperCase();
+		const lowercaseLine = JSON.stringify({ eventId: lowercase, type: "lowercase" });
+		const uppercaseLine = JSON.stringify({ eventId: uppercase, type: "legacy-uppercase" });
+		writeFileSync(path, `${lowercaseLine}\n${uppercaseLine}\n${uppercaseLine}\n`, "utf8");
+		const expectedLegacyId = deterministicEvidenceEventId(`legacy_event\0${uppercaseLine}`);
+
+		const first = new EventLog<TestEvent>(path).readAll();
+		const second = new EventLog<TestEvent>(path).readAll();
+
+		expect(first.map((event) => event.eventId)).toEqual([lowercase, expectedLegacyId]);
+		expect(first.some((event) => event.eventId === uppercase)).toBeFalse();
+		expect(expectedLegacyId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+		expect(second).toEqual(first);
 	});
 
 	it("完整损坏行不会吞掉其后的合法事件，并返回可审计位置", () => {
