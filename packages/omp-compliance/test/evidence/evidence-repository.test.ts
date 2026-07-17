@@ -87,6 +87,47 @@ describe("EvidenceRepository", () => {
 		expect(existsSync(task.paths.reviews)).toBe(false);
 	});
 
+	it("同一任务和专题复用仓库实例且不同标识保持隔离", () => {
+		const repository = new EvidenceRepository(temporaryRoot());
+		const firstTask = repository.task("task-a");
+		const secondTask = repository.task("task-b");
+		const firstTopic = repository.topic("topic-a");
+
+		expect(repository.task("task-a")).toBe(firstTask);
+		expect(repository.topic("topic-a")).toBe(firstTopic);
+		expect(secondTask).not.toBe(firstTask);
+
+		const firstEventId = deterministicEvidenceEventId("cache-task-a");
+		const secondEventId = deterministicEvidenceEventId("cache-task-b");
+		firstTask.events.append({ eventId: firstEventId, type: "task-a" });
+		secondTask.events.append({ eventId: secondEventId, type: "task-b" });
+		expect(firstTask.events.readAll()).toEqual([{ eventId: firstEventId, type: "task-a" }]);
+		expect(secondTask.events.readAll()).toEqual([{ eventId: secondEventId, type: "task-b" }]);
+	});
+
+	it("recover 后保留任务与专题缓存并继续正确追加", () => {
+		const repository = new EvidenceRepository(temporaryRoot());
+		const task = repository.task("task-a");
+		const topic = repository.topic("topic-a");
+		const firstTaskEventId = deterministicEvidenceEventId("recover-cache-task-first");
+		const secondTaskEventId = deterministicEvidenceEventId("recover-cache-task-second");
+		const firstTopicEventId = deterministicEvidenceEventId("recover-cache-topic-first");
+		const secondTopicEventId = deterministicEvidenceEventId("recover-cache-topic-second");
+		task.events.append({ eventId: firstTaskEventId, type: "before-recover" });
+		topic.events.append({ eventId: firstTopicEventId, type: "before-recover" });
+
+		const recovery = repository.recover();
+		expect(recovery.taskIds).toEqual(["task-a"]);
+		expect(recovery.topicIds).toEqual(["topic-a"]);
+		expect(repository.task("task-a")).toBe(task);
+		expect(repository.topic("topic-a")).toBe(topic);
+
+		task.events.append({ eventId: secondTaskEventId, type: "after-recover" });
+		topic.events.append({ eventId: secondTopicEventId, type: "after-recover" });
+		expect(task.events.readAll().map((event) => event.eventId)).toEqual([firstTaskEventId, secondTaskEventId]);
+		expect(topic.events.readAll().map((event) => event.eventId)).toEqual([firstTopicEventId, secondTopicEventId]);
+	});
+
 	it("兼容任意 basePath 时从最近已存在普通父目录锚定", () => {
 		const root = join(temporaryRoot(), "missing-parent", "repository");
 		const task = new EvidenceRepository(root).task("task-1");

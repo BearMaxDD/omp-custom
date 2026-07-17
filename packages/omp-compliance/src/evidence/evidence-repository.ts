@@ -187,6 +187,8 @@ export class EvidenceRepository {
 	private readonly tasksScope: SecurePathScope;
 	private readonly topicsScope: SecurePathScope;
 	private readonly rootSnapshots: SnapshotStore[];
+	private readonly taskRepositories = new Map<string, EvidenceTaskRepository>();
+	private readonly topicRepositories = new Map<string, EvidenceTopicRepository>();
 
 	constructor(root: string, trustedRoot?: string) {
 		this.root = resolve(root);
@@ -204,12 +206,20 @@ export class EvidenceRepository {
 
 	task(taskId: string): EvidenceTaskRepository {
 		assertSafeTaskId(taskId);
-		return new EvidenceTaskRepository(this.root, taskId, this.trustedRoot);
+		const existing = this.taskRepositories.get(taskId);
+		if (existing) return existing;
+		const repository = new EvidenceTaskRepository(this.root, taskId, this.trustedRoot);
+		this.taskRepositories.set(taskId, repository);
+		return repository;
 	}
 
 	topic(topicId: string): EvidenceTopicRepository {
 		assertSafeTopicId(topicId);
-		return new EvidenceTopicRepository(this.root, topicId, this.trustedRoot);
+		const existing = this.topicRepositories.get(topicId);
+		if (existing) return existing;
+		const repository = new EvidenceTopicRepository(this.root, topicId, this.trustedRoot);
+		this.topicRepositories.set(topicId, repository);
+		return repository;
 	}
 
 	recover(): EvidenceRepositoryRecovery {

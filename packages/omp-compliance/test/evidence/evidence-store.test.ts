@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { EvidencePersistenceError } from "../../src/evidence/event-log";
 import { type EvidenceRecord, EvidenceStore } from "../../src/evidence/evidence-store";
+import { setSecureFsTestHook } from "../../src/evidence/secure-fs";
 
 const roots: string[] = [];
 
@@ -70,6 +71,35 @@ describe("EvidenceStore — 写入与重新读取", () => {
 		expect(records[2].event).toBe("completed");
 	});
 
+	it("公共 append 连续写入 1000 个事件时复用 claim journal 增量缓存", async () => {
+		let fullReads = 0;
+		let deltaReads = 0;
+		setSecureFsTestHook((event) => {
+			if (event.stage === "claim_journal_full_read") fullReads += 1;
+			if (event.stage === "claim_journal_delta_read") deltaReads += 1;
+		});
+
+		for (let index = 0; index < 1_000; index += 1) {
+			await store.append(
+				makeRecord({
+					timestamp: new Date(Date.UTC(2025, 0, 1, 0, 0, index)).toISOString(),
+					event: `event-${index}`,
+					signalDigest: `digest-${index}`,
+				}),
+			);
+		}
+
+		const physicalLines = readFileSync(join(storeRoot, "tasks", "task-1", "events.jsonl"), "utf8")
+			.trim()
+			.split("\n");
+		const records = await store.readAll("task-1");
+		expect({ fullReads, deltaReads }).toEqual({ fullReads: 1, deltaReads: 0 });
+		expect(physicalLines).toHaveLength(1_000);
+		expect(records).toHaveLength(1_000);
+		expect(records[0]?.event).toBe("event-0");
+		expect(records.at(-1)?.event).toBe("event-999");
+	});
+
 	it("returns empty array for unknown task", async () => {
 		const records = await store.readAll("nonexistent");
 		expect(records).toEqual([]);
@@ -111,6 +141,7 @@ describe("EvidenceStore — 关键写失败", () => {
 });
 
 afterEach(() => {
+	setSecureFsTestHook(undefined);
 	for (const root of roots.splice(0)) {
 		rmSync(root, { recursive: true, force: true });
 	}
