@@ -73,6 +73,10 @@ const REDIRECTING_GIT_ENVIRONMENT_KEYS = new Set([
 	"GIT_DISCOVERY_ACROSS_FILESYSTEM",
 	"GIT_PREFIX",
 	"GIT_QUARANTINE_PATH",
+	"GIT_CONFIG",
+	"GIT_CONFIG_GLOBAL",
+	"GIT_CONFIG_SYSTEM",
+	"GIT_CONFIG_NOSYSTEM",
 	"GIT_CONFIG_COUNT",
 ]);
 
@@ -204,6 +208,8 @@ function createGitEnvironment(): NodeJS.ProcessEnv {
 			delete env[key];
 		}
 	}
+	env.GIT_CONFIG_NOSYSTEM = "1";
+	env.GIT_CONFIG_GLOBAL = process.platform === "win32" ? "NUL" : "/dev/null";
 	return env;
 }
 
@@ -236,16 +242,24 @@ function hasGitMarker(cwd: string): boolean {
 }
 
 function readGitRemoteIdentity(root: string): string | undefined {
-	const remoteNames = runGit(root, ["remote"]);
-	if (remoteNames === undefined) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
-	const names = remoteNames
+	const configuredRemotes = executeGit(root, [
+		"config",
+		"--local",
+		"--name-only",
+		"--get-regexp",
+		"^remote\\..*\\.url$",
+	]);
+	if (configuredRemotes.status === 1 && !configuredRemotes.stdout && !configuredRemotes.stderr) return undefined;
+	if (configuredRemotes.status !== 0) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
+	const names = configuredRemotes.stdout
 		.split("\n")
-		.map((name) => name.trim())
-		.filter(Boolean)
+		.map((key) => key.match(/^remote\.(.+)\.url$/)?.[1])
+		.filter((name): name is string => Boolean(name))
+		.filter((name, index, all) => all.indexOf(name) === index)
 		.sort();
-	if (!names.length) return undefined;
+	if (!names.length) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
 	const remoteName = names.includes("origin") ? "origin" : names[0];
-	const remoteUrl = remoteName ? runGit(root, ["remote", "get-url", remoteName]) : undefined;
+	const remoteUrl = remoteName ? runGit(root, ["config", "--local", "--get", `remote.${remoteName}.url`]) : undefined;
 	const identity = remoteUrl ? normalizeRemoteIdentity(remoteUrl) : undefined;
 	if (!identity) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
 	return identity;

@@ -239,6 +239,41 @@ describe("ProjectIdentityStore", () => {
 		expect(existsSync(bindingPath(rootB))).toBe(false);
 	});
 
+	it("ignores global insteadOf rewrites and persists the local remote URL identity", () => {
+		const root = initGit("https://local.example/team/widget.git");
+		const globalConfig = join(tempProject(), "global.gitconfig");
+		execFileSync(
+			"git",
+			["config", "--file", globalConfig, "url.https://polluted.example/mirror/.insteadOf", "https://local.example/"],
+			{ encoding: "utf8" },
+		);
+		const originalGlobalConfig = process.env.GIT_CONFIG_GLOBAL;
+		try {
+			process.env.GIT_CONFIG_GLOBAL = globalConfig;
+			const first = ProjectIdentityStore.open(root);
+			expect(first.status).toBe("bound");
+			expect(first.binding.gitRemoteIdentity).toBe("local.example/team/widget");
+		} finally {
+			if (originalGlobalConfig === undefined) Reflect.deleteProperty(process.env, "GIT_CONFIG_GLOBAL");
+			else process.env.GIT_CONFIG_GLOBAL = originalGlobalConfig;
+		}
+
+		const reopened = ProjectIdentityStore.open(root);
+		expect(reopened.status).toBe("bound");
+		expect(reopened.observedRemote).toBe("local.example/team/widget");
+	});
+
+	it("prefers origin and otherwise sorts local remote names", () => {
+		const withOrigin = initGit("https://git.example.com/team/origin.git");
+		git(withOrigin, "remote", "add", "aaa", "https://git.example.com/team/aaa.git");
+		expect(ProjectIdentityStore.open(withOrigin).observedRemote).toBe("git.example.com/team/origin");
+
+		const withoutOrigin = initGit();
+		git(withoutOrigin, "remote", "add", "zeta", "https://git.example.com/team/zeta.git");
+		git(withoutOrigin, "remote", "add", "alpha", "https://git.example.com/team/alpha.git");
+		expect(ProjectIdentityStore.open(withoutOrigin).observedRemote).toBe("git.example.com/team/alpha");
+	});
+
 	it("does not infer identity after moving a project without a remote", () => {
 		const original = initGit();
 		const initial = ProjectIdentityStore.open(original);
