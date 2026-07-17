@@ -3,7 +3,7 @@ import { type Hash, createHash, randomUUID } from "node:crypto";
 import { constants, fstatSync, lstatSync, readdirSync, realpathSync } from "node:fs";
 import { constants as osConstants } from "node:os";
 import { basename, dirname, isAbsolute, parse, resolve, sep } from "node:path";
-import { isRecoveryTruncatedTailFor } from "./recovery-record";
+import { createRecoveryTruncatedTailHasher, isRecoveryTruncatedTailForDigest } from "./recovery-record";
 
 type SecureFsOperation =
 	| "open_directory"
@@ -36,7 +36,7 @@ export class ClaimJournalCorruptionError extends Error {
 		readonly path: string,
 		readonly line: number,
 		readonly offset: number,
-		readonly reason: "malformed_claim_json" | "invalid_claim_record" | "claim_line_too_long",
+		readonly reason: "malformed_claim_json" | "invalid_claim_record" | "claim_line_too_long" | "claim_prefix_changed",
 		cause?: unknown,
 	) {
 		super(`Claim journal is corrupt at line ${line}`, { cause });
@@ -48,7 +48,7 @@ export class EvidenceLogCorruptionError extends Error {
 	constructor(
 		readonly line: number,
 		readonly offset: number,
-		readonly reason: "malformed_json",
+		readonly reason: "malformed_json" | "event_line_too_long" | "event_prefix_changed",
 		cause?: unknown,
 	) {
 		super(`Evidence log contains a malformed complete line at line ${line}`, { cause });
@@ -73,6 +73,7 @@ export interface SecureFsTestEvent {
 		| "claim_journal_cache_stats"
 		| "claim_journal_target_scan"
 		| "claim_journal_stream_stats"
+		| "event_log_stream_stats"
 		| "legacy_claims_persisted"
 		| "legacy_claims_migrated";
 	bloomBytes?: number;
@@ -81,6 +82,7 @@ export interface SecureFsTestEvent {
 	pendingSize?: number;
 	maxReadChunkBytes?: number;
 	maxCarryBytes?: number;
+	scannedBytes?: number;
 }
 
 // Claims remain append-only for crash auditability. Memory is bounded; persisted history grows linearly.
@@ -360,6 +362,153 @@ function hashFilePrefix(descriptor: number, length: number): Buffer {
 	return hash.digest();
 }
 
+interface JsonlStreamResult {
+	trailingBytes: number;
+	nextLine: number;
+	maxReadChunkBytes: number;
+	maxCarryBytes: number;
+}
+
+interface JsonlLine {
+	content: Buffer;
+	line: number;
+	offset: number;
+}
+
+function streamJsonl(
+	descriptor: number,
+	start: number,
+	end: number,
+	firstLine: number,
+	onLine: (line: JsonlLine) => void,
+	onLineTooLong: (line: number, offset: number) => never,
+): JsonlStreamResult {
+	let position = start;
+	let carry = Buffer.alloc(0);
+	let carryOffset = start;
+	let lineNumber = firstLine;
+	let maxReadChunkBytes = 0;
+	let maxCarryBytes = 0;
+	while (position < end) {
+		const chunk = preadAll(
+			descriptor,
+			position,
+			Math.min(CLAIM_JOURNAL_CAPACITY_POLICY.readChunkBytes, end - position),
+		);
+		if (chunk.byteLength === 0) fail("read_file");
+		maxReadChunkBytes = Math.max(maxReadChunkBytes, chunk.byteLength);
+		position += chunk.byteLength;
+		const combined = carry.byteLength === 0 ? chunk : Buffer.concat([carry, chunk]);
+		let lineStart = 0;
+		for (;;) {
+			const newline = combined.indexOf(0x0a, lineStart);
+			if (newline < 0) break;
+			if (newline - lineStart > CLAIM_JOURNAL_CAPACITY_POLICY.maxLineBytes) {
+				onLineTooLong(lineNumber, carryOffset + lineStart);
+			}
+			onLine({ content: combined.subarray(lineStart, newline), line: lineNumber, offset: carryOffset + lineStart });
+			lineNumber += 1;
+			lineStart = newline + 1;
+		}
+		carry = Buffer.from(combined.subarray(lineStart));
+		carryOffset += lineStart;
+		maxCarryBytes = Math.max(maxCarryBytes, carry.byteLength);
+		if (carry.byteLength > CLAIM_JOURNAL_CAPACITY_POLICY.maxLineBytes) {
+			onLineTooLong(lineNumber, carryOffset);
+		}
+	}
+	return {
+		trailingBytes: carry.byteLength,
+		nextLine: lineNumber,
+		maxReadChunkBytes,
+		maxCarryBytes,
+	};
+}
+
+interface EvidenceLogScanResult extends JsonlStreamResult {
+	found: boolean;
+	physicalHash: Hash;
+	recoveryHash: Hash;
+}
+
+function scanEvidenceLog(
+	descriptor: number,
+	start: number,
+	end: number,
+	firstLine: number,
+	physicalHash: Hash,
+	recoveryHash: Hash,
+	targetEventId?: string,
+	onEvent?: (event: { eventId?: unknown }) => void,
+): EvidenceLogScanResult {
+	let found = false;
+	let malformed: { content: Buffer; line: number; offset: number; cause: unknown; recoveryDigest: Buffer } | undefined;
+	const result = streamJsonl(
+		descriptor,
+		start,
+		end,
+		firstLine,
+		(line) => {
+			const decoded = line.content.toString("utf8");
+			if (malformed !== undefined) {
+				let recovery: unknown;
+				try {
+					recovery = JSON.parse(decoded);
+				} catch {
+					recovery = undefined;
+				}
+				if (!isRecoveryTruncatedTailForDigest(recovery, malformed.recoveryDigest, malformed.content.byteLength)) {
+					throw new SecureFsError(
+						"read_file",
+						undefined,
+						new EvidenceLogCorruptionError(malformed.line, malformed.offset, "malformed_json", malformed.cause),
+					);
+				}
+				if ((recovery as { eventId?: unknown }).eventId === targetEventId) found = true;
+				onEvent?.(recovery as { eventId?: unknown });
+				malformed = undefined;
+			} else if (decoded.trim()) {
+				try {
+					const event = JSON.parse(decoded) as { eventId?: unknown };
+					if (event.eventId === targetEventId) found = true;
+					onEvent?.(event);
+				} catch (error) {
+					malformed = {
+						content: Buffer.from(line.content),
+						line: line.line,
+						offset: line.offset,
+						cause: error,
+						recoveryDigest: recoveryHash.copy().update(line.content).digest(),
+					};
+				}
+			}
+			physicalHash.update(line.content).update("\n");
+			recoveryHash.update(line.content).update("\n");
+		},
+		(line, offset) => {
+			throw new SecureFsError(
+				"read_file",
+				undefined,
+				new EvidenceLogCorruptionError(line, offset, "event_line_too_long"),
+			);
+		},
+	);
+	if (malformed !== undefined) {
+		throw new SecureFsError(
+			"read_file",
+			undefined,
+			new EvidenceLogCorruptionError(malformed.line, malformed.offset, "malformed_json", malformed.cause),
+		);
+	}
+	testHook?.({
+		stage: "event_log_stream_stats",
+		maxReadChunkBytes: result.maxReadChunkBytes,
+		maxCarryBytes: result.maxCarryBytes,
+		scannedBytes: end - start,
+	});
+	return { ...result, found, physicalHash, recoveryHash };
+}
+
 function appendAndSync(descriptor: number, content: Buffer): void {
 	if (Number(retryPosix("lseek", () => requirePosix().lseek(descriptor, 0, SEEK_END))) < 0) fail("write_file");
 	writeAll(descriptor, content);
@@ -367,17 +516,10 @@ function appendAndSync(descriptor: number, content: Buffer): void {
 }
 
 function fileContainsEventId(descriptor: number, eventId: string): boolean {
-	const content = readAll(descriptor).toString("utf8");
-	for (const line of content.split("\n")) {
-		if (!line.trim()) continue;
-		try {
-			const event = JSON.parse(line) as { eventId?: unknown };
-			if (event.eventId === eventId) return true;
-		} catch {
-			// Truncated or malformed lines are not committed events.
-		}
-	}
-	return false;
+	const size = Number(fstatSync(descriptor, { bigint: true }).size);
+	if (!Number.isSafeInteger(size)) throw new SecureFsError("read_file", undefined, new Error("Event log is too large"));
+	return scanEvidenceLog(descriptor, 0, size, 1, createHash("sha256"), createRecoveryTruncatedTailHasher(), eventId)
+		.found;
 }
 
 function atomicReplaceAt(directory: number, name: string, content: Buffer, afterTemporarySync?: () => void): void {
@@ -480,6 +622,8 @@ interface ClaimJournalCache {
 	offset: number;
 	nextLine: number;
 	mtimeNs: bigint;
+	ctimeNs: bigint;
+	prefixHash: Hash;
 	bloom: ClaimBloom;
 	pendingBloom: ClaimBloom;
 	hotDone: Map<string, true>;
@@ -494,6 +638,36 @@ interface ValidatedLogCache {
 	ctimeNs: bigint;
 	mtimeNs: bigint;
 	prefixHash: Hash;
+	recoveryHash: Hash;
+}
+
+interface FileGeneration {
+	device: bigint;
+	inode: bigint;
+	size: bigint;
+	ctimeNs: bigint;
+	mtimeNs: bigint;
+}
+
+function fileGeneration(descriptor: number): FileGeneration {
+	const status = fstatSync(descriptor, { bigint: true });
+	return {
+		device: status.dev,
+		inode: status.ino,
+		size: status.size,
+		ctimeNs: status.ctimeNs,
+		mtimeNs: status.mtimeNs,
+	};
+}
+
+function sameGeneration(left: FileGeneration, right: FileGeneration): boolean {
+	return (
+		left.device === right.device &&
+		left.inode === right.inode &&
+		left.size === right.size &&
+		left.ctimeNs === right.ctimeNs &&
+		left.mtimeNs === right.mtimeNs
+	);
 }
 
 function rememberDone(cache: ClaimJournalCache, eventId: string): void {
@@ -662,6 +836,12 @@ export class SecurePathScope {
 		let journalDescriptor: number | undefined;
 		let directoryLocked = false;
 		let logLocked = false;
+		let committedLogGeneration: FileGeneration | undefined;
+		const appendEvent = (): void => {
+			appendAndSync(logDescriptor as number, content);
+			committedLogGeneration = fileGeneration(logDescriptor as number);
+			testHook?.({ stage: "event_appended" });
+		};
 		const verifyCommittedFiles = (): void => {
 			try {
 				this.assertCanonicalFiles(directory, [
@@ -703,10 +883,9 @@ export class SecurePathScope {
 			const initialState = this.getClaimState(journalDescriptor, journal, eventId);
 			if (initialState === "done") {
 				if (!fileContainsEventId(logDescriptor, eventId)) {
-					appendAndSync(logDescriptor, content);
-					testHook?.({ stage: "event_appended" });
+					appendEvent();
 				}
-				this.validateCompleteLog(name, logDescriptor, true);
+				this.validateCompleteLog(name, logDescriptor, committedLogGeneration);
 				verifyCommittedFiles();
 				return;
 			}
@@ -717,7 +896,7 @@ export class SecurePathScope {
 
 			this.recoverUnterminatedTail(logDescriptor, journalDescriptor, journal, recoveryFactory);
 			if (this.getClaimState(journalDescriptor, journal, eventId) === "done") {
-				this.validateCompleteLog(name, logDescriptor, true);
+				this.validateCompleteLog(name, logDescriptor);
 				verifyCommittedFiles();
 				return;
 			}
@@ -726,15 +905,14 @@ export class SecurePathScope {
 				(migratedEventIds?.has(eventId) ?? fileContainsEventId(logDescriptor, eventId))
 			) {
 				this.appendClaimJournalRecord(journalDescriptor, journal, { eventId, state: "done" });
-				this.validateCompleteLog(name, logDescriptor, true);
+				this.validateCompleteLog(name, logDescriptor);
 				verifyCommittedFiles();
 				return;
 			}
 
-			appendAndSync(logDescriptor, content);
-			testHook?.({ stage: "event_appended" });
+			appendEvent();
 			this.appendClaimJournalRecord(journalDescriptor, journal, { eventId, state: "done" });
-			this.validateCompleteLog(name, logDescriptor, true);
+			this.validateCompleteLog(name, logDescriptor, committedLogGeneration);
 			verifyCommittedFiles();
 		} finally {
 			if (directoryLocked) retryPosix("flock", () => requirePosix().flock(directory, LOCK_UN));
@@ -747,96 +925,49 @@ export class SecurePathScope {
 		}
 	}
 
-	private validateCompleteLog(name: string, descriptor: number, trustedAppend = false): void {
+	private validateCompleteLog(name: string, descriptor: number, committedGeneration?: FileGeneration): void {
 		const status = fstatSync(descriptor, { bigint: true });
 		const existing = this.validatedLogCache.get(name);
-		let canReadDelta =
+		const canReadDelta =
 			existing !== undefined &&
 			existing.device === status.dev &&
 			existing.inode === status.ino &&
 			status.size >= BigInt(existing.offset);
-		if (
-			canReadDelta &&
-			existing !== undefined &&
-			!trustedAppend &&
-			(existing.ctimeNs !== status.ctimeNs || existing.mtimeNs !== status.mtimeNs)
-		) {
-			canReadDelta = hashFilePrefix(descriptor, existing.offset).equals(existing.prefixHash.copy().digest());
+		if (canReadDelta && existing !== undefined) {
+			const metadataChanged = existing.ctimeNs !== status.ctimeNs || existing.mtimeNs !== status.mtimeNs;
+			const committedGenerationStillCurrent =
+				committedGeneration !== undefined && sameGeneration(fileGeneration(descriptor), committedGeneration);
+			if (
+				metadataChanged &&
+				!committedGenerationStillCurrent &&
+				!hashFilePrefix(descriptor, existing.offset).equals(existing.prefixHash.copy().digest())
+			) {
+				const size = Number(status.size);
+				if (!Number.isSafeInteger(size)) {
+					throw new SecureFsError("read_file", undefined, new Error("Event log is too large"));
+				}
+				scanEvidenceLog(descriptor, 0, size, 1, createHash("sha256"), createRecoveryTruncatedTailHasher());
+				throw new SecureFsError("read_file", undefined, new EvidenceLogCorruptionError(1, 0, "event_prefix_changed"));
+			}
 		}
 		const offset = canReadDelta ? (existing?.offset ?? 0) : 0;
 		const firstLine = canReadDelta ? (existing?.nextLine ?? 1) : 1;
 		const prefixHash = canReadDelta && existing ? existing.prefixHash.copy() : createHash("sha256");
+		const recoveryHash = canReadDelta && existing ? existing.recoveryHash.copy() : createRecoveryTruncatedTailHasher();
 		const size = Number(status.size);
 		if (!Number.isSafeInteger(size))
 			throw new SecureFsError("read_file", undefined, new Error("Event log is too large"));
-		const unread = preadAll(descriptor, offset, size - offset);
-		const completeLength = unread.lastIndexOf(0x0a) + 1;
-		if (completeLength === 0) {
-			const refreshed = fstatSync(descriptor, { bigint: true });
-			this.validatedLogCache.set(name, {
-				device: refreshed.dev,
-				inode: refreshed.ino,
-				offset,
-				nextLine: firstLine,
-				ctimeNs: refreshed.ctimeNs,
-				mtimeNs: refreshed.mtimeNs,
-				prefixHash,
-			});
-			return;
-		}
-
-		const complete = unread.subarray(0, completeLength);
-		const lines: Array<{ content: Buffer; offset: number; line: number }> = [];
-		let lineStart = 0;
-		let lineNumber = firstLine;
-		for (let index = 0; index < complete.byteLength; index += 1) {
-			if (complete[index] !== 0x0a) continue;
-			lines.push({
-				content: complete.subarray(lineStart, index),
-				offset: offset + lineStart,
-				line: lineNumber,
-			});
-			lineStart = index + 1;
-			lineNumber += 1;
-		}
-		for (const [index, line] of lines.entries()) {
-			const decoded = line.content.toString("utf8");
-			if (!decoded.trim()) continue;
-			try {
-				JSON.parse(decoded);
-			} catch (error) {
-				let isAuditedTruncatedTail = false;
-				const next = lines[index + 1];
-				if (next !== undefined) {
-					try {
-						isAuditedTruncatedTail = isRecoveryTruncatedTailFor(
-							JSON.parse(next.content.toString("utf8")),
-							preadAll(descriptor, 0, line.offset + line.content.byteLength),
-							line.content,
-						);
-					} catch {
-						isAuditedTruncatedTail = false;
-					}
-				}
-				if (!isAuditedTruncatedTail) {
-					throw new SecureFsError(
-						"read_file",
-						undefined,
-						new EvidenceLogCorruptionError(line.line, line.offset, "malformed_json", error),
-					);
-				}
-			}
-		}
-		prefixHash.update(complete);
+		const scan = scanEvidenceLog(descriptor, offset, size, firstLine, prefixHash, recoveryHash);
 		const refreshed = fstatSync(descriptor, { bigint: true });
 		this.validatedLogCache.set(name, {
 			device: refreshed.dev,
 			inode: refreshed.ino,
-			offset: offset + completeLength,
-			nextLine: lineNumber,
+			offset: size - scan.trailingBytes,
+			nextLine: scan.nextLine,
 			ctimeNs: refreshed.ctimeNs,
 			mtimeNs: refreshed.mtimeNs,
-			prefixHash,
+			prefixHash: scan.physicalHash,
+			recoveryHash: scan.recoveryHash,
 		});
 	}
 
@@ -937,8 +1068,19 @@ export class SecurePathScope {
 			existing !== undefined &&
 			existing.device === status.dev &&
 			existing.inode === status.ino &&
-			status.size >= BigInt(existing.offset) &&
-			(status.size > BigInt(existing.offset) || existing.mtimeNs === status.mtimeNs);
+			status.size >= BigInt(existing.offset);
+		const size = Number(status.size);
+		if (!Number.isSafeInteger(size))
+			throw new SecureFsError("read_file", undefined, new Error("Claim journal is too large"));
+		if (
+			canReadDelta &&
+			existing !== undefined &&
+			(existing.ctimeNs !== status.ctimeNs || existing.mtimeNs !== status.mtimeNs) &&
+			!hashFilePrefix(descriptor, existing.offset).equals(existing.prefixHash.copy().digest())
+		) {
+			this.streamClaimJournal(name, descriptor, 0, size, 1, () => undefined);
+			this.throwClaimJournalCorruption(name, 1, 0, "claim_prefix_changed");
+		}
 		const offset = canReadDelta ? (existing?.offset ?? 0) : 0;
 		const cache: ClaimJournalCache = canReadDelta
 			? (existing as ClaimJournalCache)
@@ -949,19 +1091,20 @@ export class SecurePathScope {
 					offset: 0,
 					nextLine: 1,
 					mtimeNs: status.mtimeNs,
+					ctimeNs: status.ctimeNs,
+					prefixHash: createHash("sha256"),
 					bloom: new ClaimBloom(),
 					pendingBloom: new ClaimBloom(),
 					hotDone: new Map(),
 					hotPending: new Map(),
 				};
-		const size = Number(status.size);
-		if (!Number.isSafeInteger(size))
-			throw new SecureFsError("read_file", undefined, new Error("Claim journal is too large"));
+		const prefixHash = canReadDelta && existing ? existing.prefixHash.copy() : createHash("sha256");
 		if (offset === 0) testHook?.({ stage: "claim_journal_full_read" });
 		else if (size > offset) testHook?.({ stage: "claim_journal_delta_read" });
 
-		const streamed = this.streamClaimJournal(name, descriptor, offset, size, cache.nextLine, (record) => {
-			applyClaimRecord(cache, record);
+		const streamed = this.streamClaimJournal(name, descriptor, offset, size, cache.nextLine, (record, line) => {
+			if (record !== undefined) applyClaimRecord(cache, record);
+			prefixHash.update(line.content).update("\n");
 		});
 		const committedLength = size - streamed.trailingBytes;
 		if (streamed.trailingBytes > 0) {
@@ -977,6 +1120,8 @@ export class SecurePathScope {
 		cache.device = refreshed.dev;
 		cache.inode = refreshed.ino;
 		cache.mtimeNs = refreshed.mtimeNs;
+		cache.ctimeNs = refreshed.ctimeNs;
+		cache.prefixHash = prefixHash;
 		this.claimJournalCache.set(name, cache);
 		emitClaimCacheStats(cache);
 		return cache;
@@ -988,47 +1133,28 @@ export class SecurePathScope {
 		start: number,
 		end: number,
 		firstLine: number,
-		onRecord: (record: ClaimJournalRecord) => void,
-	): { trailingBytes: number; nextLine: number } {
-		let position = start;
-		let carry = Buffer.alloc(0);
-		let carryOffset = start;
-		let lineNumber = firstLine;
-		let maxReadChunkBytes = 0;
-		let maxCarryBytes = 0;
-		while (position < end) {
-			const chunk = preadAll(
-				descriptor,
-				position,
-				Math.min(CLAIM_JOURNAL_CAPACITY_POLICY.readChunkBytes, end - position),
-			);
-			if (chunk.byteLength === 0) fail("read_file");
-			maxReadChunkBytes = Math.max(maxReadChunkBytes, chunk.byteLength);
-			position += chunk.byteLength;
-			const combined = carry.byteLength === 0 ? chunk : Buffer.concat([carry, chunk]);
-			let lineStart = 0;
-			for (;;) {
-				const newline = combined.indexOf(0x0a, lineStart);
-				if (newline < 0) break;
-				const lineLength = newline - lineStart;
-				if (lineLength > CLAIM_JOURNAL_CAPACITY_POLICY.maxLineBytes) {
-					this.throwClaimJournalCorruption(name, lineNumber, carryOffset + lineStart, "claim_line_too_long");
-				}
-				const line = combined.subarray(lineStart, newline);
-				if (line.byteLength > 0)
-					onRecord(this.parseClaimJournalRecord(name, line, lineNumber, carryOffset + lineStart));
-				lineNumber += 1;
-				lineStart = newline + 1;
-			}
-			carry = Buffer.from(combined.subarray(lineStart));
-			carryOffset += lineStart;
-			maxCarryBytes = Math.max(maxCarryBytes, carry.byteLength);
-			if (carry.byteLength > CLAIM_JOURNAL_CAPACITY_POLICY.maxLineBytes) {
-				this.throwClaimJournalCorruption(name, lineNumber, carryOffset, "claim_line_too_long");
-			}
-		}
-		testHook?.({ stage: "claim_journal_stream_stats", maxReadChunkBytes, maxCarryBytes });
-		return { trailingBytes: carry.byteLength, nextLine: lineNumber };
+		onRecord: (record: ClaimJournalRecord | undefined, line: JsonlLine) => void,
+	): JsonlStreamResult {
+		const result = streamJsonl(
+			descriptor,
+			start,
+			end,
+			firstLine,
+			(line) =>
+				onRecord(
+					line.content.byteLength > 0
+						? this.parseClaimJournalRecord(name, line.content, line.line, line.offset)
+						: undefined,
+					line,
+				),
+			(line, offset) => this.throwClaimJournalCorruption(name, line, offset, "claim_line_too_long"),
+		);
+		testHook?.({
+			stage: "claim_journal_stream_stats",
+			maxReadChunkBytes: result.maxReadChunkBytes,
+			maxCarryBytes: result.maxCarryBytes,
+		});
+		return result;
 	}
 
 	private parseClaimJournalRecord(name: string, line: Buffer, lineNumber: number, offset: number): ClaimJournalRecord {
@@ -1067,9 +1193,14 @@ export class SecurePathScope {
 		const content = Buffer.from(`${JSON.stringify(record)}\n`);
 		appendAndSync(descriptor, content);
 		applyClaimRecord(cache, record);
+		cache.prefixHash.update(content);
 		cache.offset += content.byteLength;
 		cache.nextLine += 1;
-		cache.mtimeNs = fstatSync(descriptor, { bigint: true }).mtimeNs;
+		const status = fstatSync(descriptor, { bigint: true });
+		cache.device = status.dev;
+		cache.inode = status.ino;
+		cache.mtimeNs = status.mtimeNs;
+		cache.ctimeNs = status.ctimeNs;
 		testHook?.({ stage: "claim_journal_appended" });
 		emitClaimCacheStats(cache);
 	}
@@ -1089,6 +1220,7 @@ export class SecurePathScope {
 		let state: ClaimState | undefined;
 		const size = Number(fstatSync(descriptor, { bigint: true }).size);
 		this.streamClaimJournal(cache.name, descriptor, 0, size, 1, (record) => {
+			if (record === undefined) return;
 			if (record.eventId === eventId && (record.state === "pending" || record.state === "done")) {
 				state = record.state;
 			}
@@ -1120,18 +1252,24 @@ export class SecurePathScope {
 		const migrated = new Map<string, ClaimState>();
 		const legacyEventIds = new Map<string, string>();
 		const eventsInLog = new Set<string>();
-		for (const line of readAll(logDescriptor).toString("utf8").split("\n")) {
-			if (!line) continue;
-			try {
-				const event = JSON.parse(line) as { eventId?: unknown };
-				if (typeof event.eventId === "string") {
-					eventsInLog.add(event.eventId);
-					legacyEventIds.set(createHash("sha256").update(event.eventId).digest("hex"), event.eventId);
-				}
-			} catch {
-				// A malformed event tail is handled by the normal recovery path.
-			}
+		const logSize = Number(fstatSync(logDescriptor, { bigint: true }).size);
+		if (!Number.isSafeInteger(logSize)) {
+			throw new SecureFsError("read_file", undefined, new Error("Event log is too large"));
 		}
+		scanEvidenceLog(
+			logDescriptor,
+			0,
+			logSize,
+			1,
+			createHash("sha256"),
+			createRecoveryTruncatedTailHasher(),
+			undefined,
+			(event) => {
+				if (typeof event.eventId !== "string") return;
+				eventsInLog.add(event.eventId);
+				legacyEventIds.set(createHash("sha256").update(event.eventId).digest("hex"), event.eventId);
+			},
+		);
 
 		try {
 			for (const entry of entries) {

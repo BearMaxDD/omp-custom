@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { type Hash, createHash } from "node:crypto";
 
 export interface RecoveryTruncatedTailEvent {
 	eventId: string;
@@ -21,15 +21,21 @@ function evidenceUuidFromDigest(digest: Buffer): string {
 	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
+export function createRecoveryTruncatedTailHasher(): Hash {
+	return createHash("sha256").update("recovery_truncated_tail\0");
+}
+
+export function recoveryTruncatedTailDigest(originalContent: Buffer): Buffer {
+	return createRecoveryTruncatedTailHasher().update(originalContent).digest();
+}
+
 export function createRecoveryTruncatedTailEvent(
 	originalContent: Buffer,
 	truncatedTail: Buffer,
 	timestamp = new Date().toISOString(),
 ): RecoveryTruncatedTailEvent {
 	return {
-		eventId: evidenceUuidFromDigest(
-			createHash("sha256").update("recovery_truncated_tail\0").update(originalContent).digest(),
-		),
+		eventId: evidenceUuidFromDigest(recoveryTruncatedTailDigest(originalContent)),
 		type: "recovery_truncated_tail",
 		timestamp,
 		truncatedBytes: truncatedTail.byteLength,
@@ -41,6 +47,18 @@ export function isRecoveryTruncatedTailFor(
 	originalContent: Buffer,
 	truncatedTail: Buffer,
 ): value is RecoveryTruncatedTailEvent {
+	return isRecoveryTruncatedTailForDigest(
+		value,
+		recoveryTruncatedTailDigest(originalContent),
+		truncatedTail.byteLength,
+	);
+}
+
+export function isRecoveryTruncatedTailForDigest(
+	value: unknown,
+	originalDigest: Buffer,
+	truncatedBytes: number,
+): value is RecoveryTruncatedTailEvent {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const record = value as Record<string, unknown>;
 	const fields = Object.keys(record).sort();
@@ -51,6 +69,5 @@ export function isRecoveryTruncatedTailFor(
 	if (typeof record.timestamp !== "string") return false;
 	const timestamp = Date.parse(record.timestamp);
 	if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== record.timestamp) return false;
-	const expected = createRecoveryTruncatedTailEvent(originalContent, truncatedTail, record.timestamp);
-	return record.eventId === expected.eventId && record.truncatedBytes === expected.truncatedBytes;
+	return record.eventId === evidenceUuidFromDigest(originalDigest) && record.truncatedBytes === truncatedBytes;
 }

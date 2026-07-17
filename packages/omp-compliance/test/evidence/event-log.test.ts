@@ -44,6 +44,21 @@ function indexedEventId(index: number): string {
 	return `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`;
 }
 
+function overwriteLineStart(path: string, position: "first" | "middle" | "last"): { line: number; offset: number } {
+	const lines = readFileSync(path).toString("utf8").trimEnd().split("\n");
+	const line = position === "first" ? 0 : position === "middle" ? Math.floor(lines.length / 2) : lines.length - 1;
+	const offset = lines.slice(0, line).reduce((total, content) => total + Buffer.byteLength(content) + 1, 0);
+	const before = statSync(path);
+	const descriptor = openSync(path, "r+");
+	try {
+		writeSync(descriptor, Buffer.from("!"), 0, 1, offset);
+	} finally {
+		closeSync(descriptor);
+	}
+	utimesSync(path, before.atime, before.mtime);
+	return { line: line + 1, offset };
+}
+
 async function runConcurrentChildren(script: string, args: string[], count = 12): Promise<void> {
 	const barrier = join(temporaryRoot(), "start");
 	const children = Array.from({ length: count }, () =>
@@ -136,6 +151,128 @@ describe("EventLog", () => {
 		expect(readFileSync(path, "utf8").trim().split("\n")).toHaveLength(1);
 	});
 
+	it.each(["first", "middle"] as const)(
+		"event_appended 后篡改旧前缀 %s 行时提交失败且缓存不接受损坏世代",
+		(position) => {
+			const path = join(temporaryRoot(), "events.jsonl");
+			const log = new EventLog<TestEvent>(path);
+			for (let index = 0; index < 4; index += 1) {
+				log.append({ eventId: eventId(`commit-window-existing-${index}`), type: `existing-${index}` });
+			}
+			let corruption: { line: number; offset: number } | undefined;
+			setSecureFsTestHook((event) => {
+				if (event.stage !== "event_appended" || corruption !== undefined) return;
+				corruption = overwriteLineStart(path, position);
+			});
+			const appended = { eventId: eventId(`commit-window-${position}`), type: "must-fail" };
+
+			expect(() => log.append(appended)).toThrow(EvidencePersistenceError);
+			setSecureFsTestHook(undefined);
+			expect(() => log.append(appended)).toThrow(EvidencePersistenceError);
+			expect(corruption).toBeDefined();
+		},
+	);
+
+	it("event_appended 后旧前缀被等长改成另一条合法 JSON 时仍拒绝提交", () => {
+		const path = join(temporaryRoot(), "events.jsonl");
+		const log = new EventLog<TestEvent>(path);
+		log.append({ eventId: eventId("valid-prefix-change"), type: "alpha" });
+		let changed = false;
+		setSecureFsTestHook((event) => {
+			if (event.stage !== "event_appended" || changed) return;
+			const content = readFileSync(path);
+			const offset = content.indexOf(Buffer.from("alpha"));
+			const descriptor = openSync(path, "r+");
+			try {
+				writeSync(descriptor, Buffer.from("omega"), 0, 5, offset);
+			} finally {
+				closeSync(descriptor);
+			}
+			changed = true;
+		});
+
+		try {
+			log.append({ eventId: eventId("after-valid-prefix-change"), type: "must-fail" });
+			expect.unreachable("合法 JSON 的旧前缀改写也必须 fail-closed");
+		} catch (error) {
+			expect(error).toBeInstanceOf(EvidencePersistenceError);
+			const secureCause = (error as Error & { cause?: unknown }).cause as Error & { cause?: unknown };
+			expect(secureCause.cause).toMatchObject({ line: 1, offset: 0, reason: "event_prefix_changed" });
+		}
+	});
+
+	it.each(["first", "middle", "last"] as const)("claim journal 暖缓存发现同 inode 等长破坏的 %s 行", (position) => {
+		const root = temporaryRoot();
+		const path = join(root, "events.jsonl");
+		const journalPath = join(root, ".events.jsonl.claims.jsonl");
+		const log = new EventLog<TestEvent>(path);
+		for (let index = 0; index < 4; index += 1) {
+			log.append({ eventId: eventId(`journal-prefix-${index}`), type: "journal-prefix" });
+		}
+		const fixedTime = new Date(Math.floor(Date.now() / 1_000) * 1_000);
+		utimesSync(journalPath, fixedTime, fixedTime);
+		log.append({ eventId: eventId("journal-prefix-0"), type: "journal-prefix" });
+		const corruption = overwriteLineStart(journalPath, position);
+
+		try {
+			log.append({ eventId: eventId(`journal-after-${position}`), type: "must-fail" });
+			expect.unreachable("已验证 claim journal 前缀被改写后必须 fail-closed");
+		} catch (error) {
+			expect(error).toBeInstanceOf(EvidencePersistenceError);
+			const secureCause = (error as Error & { cause?: unknown }).cause as Error & { cause?: unknown };
+			expect(secureCause.cause).toMatchObject({
+				path: journalPath,
+				line: corruption.line,
+				offset: corruption.offset,
+			});
+		}
+	});
+
+	it("10 万事件日志冷启动和首尾 eventId 查询均使用有界流式扫描", () => {
+		const root = temporaryRoot();
+		const path = join(root, "events.jsonl");
+		const journalPath = join(root, ".events.jsonl.claims.jsonl");
+		const count = 100_000;
+		const eventIds = Array.from({ length: count }, (_, index) => indexedEventId(index));
+		writeFileSync(
+			path,
+			eventIds.map((currentEventId) => `${JSON.stringify({ eventId: currentEventId, type: "stream" })}\n`).join(""),
+		);
+		writeFileSync(
+			journalPath,
+			eventIds.map((currentEventId) => `${JSON.stringify({ eventId: currentEventId, state: "done" })}\n`).join(""),
+		);
+		let maxReadChunkBytes = 0;
+		let maxCarryBytes = 0;
+		setSecureFsTestHook((event) => {
+			if (event.stage !== "event_log_stream_stats") return;
+			maxReadChunkBytes = Math.max(maxReadChunkBytes, event.maxReadChunkBytes ?? 0);
+			maxCarryBytes = Math.max(maxCarryBytes, event.maxCarryBytes ?? 0);
+		});
+
+		new EventLog<TestEvent>(path).append({ eventId: eventIds[0] as string, type: "stream" });
+		new EventLog<TestEvent>(path).append({ eventId: eventIds.at(-1) as string, type: "stream" });
+
+		expect(maxReadChunkBytes).toBeGreaterThan(0);
+		expect(maxReadChunkBytes).toBeLessThanOrEqual(64 * 1024);
+		expect(maxCarryBytes).toBeLessThanOrEqual(64 * 1024);
+		expect(readFileSync(path, "utf8").trim().split("\n")).toHaveLength(count);
+	}, 30_000);
+
+	it("事件日志超过 64 KiB 单行上限时返回稳定位置且不追加", () => {
+		const path = join(temporaryRoot(), "events.jsonl");
+		writeFileSync(path, Buffer.concat([Buffer.alloc(64 * 1024 + 1, 0x78), Buffer.from("\n")]));
+
+		try {
+			new EventLog<TestEvent>(path).append({ eventId: eventId("after-long-event-line"), type: "must-fail" });
+			expect.unreachable("超长事件行必须 fail-closed");
+		} catch (error) {
+			expect(error).toBeInstanceOf(EvidencePersistenceError);
+			const secureCause = (error as Error & { cause?: unknown }).cause as Error & { cause?: unknown };
+			expect(secureCause.cause).toMatchObject({ line: 1, offset: 0, reason: "event_line_too_long" });
+		}
+	});
+
 	it("恢复事件已由竞争者持久化时返回值逐字段采用规范磁盘记录", () => {
 		const path = join(temporaryRoot(), "events.jsonl");
 		const original = `${JSON.stringify({ eventId: eventId("before-nested-recovery"), type: "valid" })}\n{"broken"`;
@@ -164,10 +301,12 @@ describe("EventLog", () => {
 		let fullReads = 0;
 		let deltaReads = 0;
 		let journalAppends = 0;
+		let eventScannedBytes = 0;
 		setSecureFsTestHook((event) => {
 			if (event.stage === "claim_journal_full_read") fullReads += 1;
 			if (event.stage === "claim_journal_delta_read") deltaReads += 1;
 			if (event.stage === "claim_journal_appended") journalAppends += 1;
+			if (event.stage === "event_log_stream_stats") eventScannedBytes += event.scannedBytes ?? 0;
 		});
 
 		const eventIds = Array.from({ length: 1_000 }, (_, index) => eventId(`journal-${index}`));
@@ -182,6 +321,7 @@ describe("EventLog", () => {
 		expect(journalLines.filter((line) => JSON.parse(line).state === "done")).toHaveLength(1_000);
 		expect(readdirSync(root).filter((name) => name.includes("claims"))).toEqual([".events.jsonl.claims.jsonl"]);
 		expect({ fullReads, deltaReads, journalAppends }).toEqual({ fullReads: 1, deltaReads: 0, journalAppends: 2_000 });
+		expect(eventScannedBytes).toBeLessThanOrEqual(statSync(path).size * 2);
 	});
 
 	it.each([10_000, 100_000])(
