@@ -20,14 +20,21 @@ const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f
 const PROJECT_CONTEXT_INVALID_ERROR = "OMP project context is invalid";
 
 export function createProjectContext(
-	identity: ProjectIdentityResult,
-	sessionId: string,
-	cwd: string,
+	...args: [
+		identity: ProjectIdentityResult,
+		sessionId: string,
+		cwd: string,
+		currentCodebaseProjectId: string | undefined,
+	]
 ): Readonly<ProjectContext> {
+	const hasCurrentCodebaseObservation = args.length >= 4;
+	const [identity, sessionId, cwd, currentCodebaseProjectId] = args;
 	let canonicalCwd: string;
 	let validatedBinding: ReturnType<typeof validateProjectBinding>;
 	try {
-		if (!isBoundProjectIdentityResult(identity)) throw new Error(PROJECT_CONTEXT_INVALID_ERROR);
+		if (!hasCurrentCodebaseObservation || !isBoundProjectIdentityResult(identity)) {
+			throw new Error(PROJECT_CONTEXT_INVALID_ERROR);
+		}
 		canonicalCwd = canonicalPath(cwd);
 		validatedBinding = validateProjectBinding(identity.binding);
 		if (
@@ -37,16 +44,13 @@ export function createProjectContext(
 		) {
 			throw new Error(PROJECT_CONTEXT_INVALID_ERROR);
 		}
-		const freshIdentity = ProjectIdentityStore.open(canonicalCwd, {
-			...(validatedBinding.codebaseProjectId === undefined
-				? {}
-				: { codebaseProjectId: validatedBinding.codebaseProjectId }),
-		});
+		const freshIdentity = ProjectIdentityStore.open(canonicalCwd, { codebaseProjectId: currentCodebaseProjectId });
 		if (
 			freshIdentity.status !== "bound" ||
 			freshIdentity.binding.projectId !== validatedBinding.projectId ||
 			freshIdentity.observedRoot !== validatedBinding.canonicalRoot ||
-			freshIdentity.observedRemote !== validatedBinding.gitRemoteIdentity
+			freshIdentity.observedRemote !== validatedBinding.gitRemoteIdentity ||
+			freshIdentity.binding.codebaseProjectId !== validatedBinding.codebaseProjectId
 		) {
 			throw new Error(PROJECT_CONTEXT_INVALID_ERROR);
 		}
