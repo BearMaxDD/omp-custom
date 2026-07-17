@@ -1,25 +1,5 @@
-/**
- * JSONL Evidence Store for TDD Compliance Task Events.
- *
- * Persists compliance task activity as append-only JSONL records.
- * Supports atomic writes, crash recovery (tolerates truncated last line),
- * and in-memory pending buffer for graceful failure handling.
- *
- * Atomicity:
- *   Writes go to a .tmp file first, then rename to the final path.
- *   On crash during write, the .tmp is orphaned and the final file is intact.
- *
- * Crash recovery:
- *   readAll tolerates a truncated (incomplete JSON) last line so that
- *   a crash mid-write never loses the preceding records.
- *
- * Pending buffer:
- *   When disk write fails, records are held in memory for later retry.
- *   flushPending() retries the failed writes.
- */
-
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { createHash } from "node:crypto";
+import { EvidenceRepository } from "./evidence-repository";
 
 export interface EvidenceRecord {
 	schemaVersion: number;
@@ -30,155 +10,63 @@ export interface EvidenceRecord {
 	attempt: number;
 	event: string;
 	signalDigest: string;
+	eventId?: string;
 	verdictSummary?: string;
 	worktreeFingerprint?: string;
 	outputTruncated?: string;
 	commandTruncated?: string;
 }
 
+function eventIdFor(record: EvidenceRecord): string {
+	if (record.eventId) {
+		return record.eventId;
+	}
+	const identity = JSON.stringify([
+		record.schemaVersion,
+		record.timestamp,
+		record.taskId,
+		record.contractPath,
+		record.contractHash,
+		record.attempt,
+		record.event,
+		record.signalDigest,
+		record.verdictSummary ?? null,
+		record.worktreeFingerprint ?? null,
+		record.outputTruncated ?? null,
+		record.commandTruncated ?? null,
+	]);
+	return `evidence:${createHash("sha256").update(identity).digest("hex")}`;
+}
+
+/**
+ * Compatibility adapter for callers that still use the original EvidenceStore API.
+ * New persistence is delegated to EvidenceRepository and never falls back to memory.
+ */
 export class EvidenceStore {
-	private pending: Map<string, EvidenceRecord[]> = new Map();
-	private basePath: string;
+	private readonly repository: EvidenceRepository;
 
 	constructor(basePath: string) {
-		this.basePath = basePath;
-		try {
-			mkdirSync(basePath, { recursive: true });
-		} catch {
-			// Path may be read-only or otherwise unwritable.
-			// append() will catch the error and buffer in memory.
-		}
+		this.repository = new EvidenceRepository(basePath);
 	}
 
-	/**
-	 * Number of pending (unwritten) records for a task, or total.
-	 */
-	pendingCount(taskId?: string): number {
-		if (taskId) {
-			return this.pending.get(taskId)?.length ?? 0;
-		}
-		let total = 0;
-		for (const records of this.pending.values()) {
-			total += records.length;
-		}
-		return total;
+	pendingCount(_taskId?: string): number {
+		return 0;
 	}
 
-	/**
-	 * Get all pending records (for inspection in tests).
-	 */
 	getPending(): EvidenceRecord[] {
-		const result: EvidenceRecord[] = [];
-		for (const records of this.pending.values()) {
-			result.push(...records);
-		}
-		return result;
+		return [];
 	}
 
-	/**
-	 * Adopt pending records from another store (for crash recovery testing).
-	 */
-	adoptPending(other: EvidenceStore): void {
-		for (const [taskId, records] of other.pending) {
-			const existing = this.pending.get(taskId) ?? [];
-			this.pending.set(taskId, [...existing, ...records]);
-		}
-		other.pending.clear();
-	}
+	adoptPending(_other: EvidenceStore): void {}
 
-	/**
-	 * Append an evidence record to the JSONL file for a task.
-	 * Uses atomic write (temp file + rename) for crash safety.
-	 * Falls back to pending buffer on disk failure.
-	 *
-	 * PERFORMANCE NOTE: This method reads the entire file on every append
-	 * (readFileSync + writeFileSync), giving it O(n²) insertion cost.
-	 * This is acceptable for compliance logs which typically contain only
-	 * a few hundred records per task. For high-throughput scenarios,
-	 * a streaming log writer would be more appropriate.
-	 */
 	async append(record: EvidenceRecord): Promise<void> {
-		const line = `${JSON.stringify(record)}\n`;
-		const filePath = join(this.basePath, `${record.taskId}.jsonl`);
-
-		try {
-			mkdirSync(dirname(filePath), { recursive: true });
-			const existing = this.readFileSafe(filePath);
-			const tmpPath = `${filePath}.tmp`;
-			writeFileSync(tmpPath, existing + line, "utf-8");
-			renameSync(tmpPath, filePath);
-		} catch {
-			const taskPending = this.pending.get(record.taskId) ?? [];
-			taskPending.push(record);
-			this.pending.set(record.taskId, taskPending);
-		}
+		const eventId = eventIdFor(record);
+		this.repository.task(record.taskId).events.append({ ...record, eventId });
 	}
 
-	/**
-	 * Retry writing all pending records.
-	 */
-	async flushPending(): Promise<void> {
-		for (const [taskId, records] of this.pending) {
-			const filePath = join(this.basePath, `${taskId}.jsonl`);
-			try {
-				mkdirSync(dirname(filePath), { recursive: true });
-				let content = this.readFileSafe(filePath);
-				for (const record of records) {
-					content += `${JSON.stringify(record)}\n`;
-				}
-				const tmpPath = `${filePath}.tmp`;
-				writeFileSync(tmpPath, content, "utf-8");
-				renameSync(tmpPath, filePath);
-				this.pending.delete(taskId);
-			} catch {
-				// Leave pending for next retry
-			}
-		}
-	}
+	async flushPending(): Promise<void> {}
 
-	/**
-	 * Read all evidence records for a task.
-	 * Tolerates a truncated (incomplete) last line.
-	 * Returns empty array if file doesn't exist.
-	 */
 	async readAll(taskId: string): Promise<EvidenceRecord[]> {
-		const filePath = join(this.basePath, `${taskId}.jsonl`);
-		const content = this.readFileSafe(filePath);
-		if (!content) return [];
-
-		const lines = content.split("\n");
-		const records: EvidenceRecord[] = [];
-
-		for (const line of lines) {
-			const trimmed = line.trim();
-			if (!trimmed) continue;
-
-			try {
-				const parsed = JSON.parse(trimmed) as EvidenceRecord;
-				records.push(parsed);
-			} catch {
-				break;
-			}
-		}
-
-		return records;
-	}
-
-	/**
-	 * Read file content, returning empty string on any error.
-	 *
-	 * Silently handles all file-system errors (ENOENT, EACCES, EISDIR, etc.):
-	 * - If the file does not exist, returns "" so callers treat it as empty.
-	 * - If the file is unreadable (permissions, locked), returns "" and the
-	 *   write operation will later attempt creation of a fresh file.
-	 * This is intentional: evidence storage must never throw, as that would
-	 * interrupt the compliance reporting pipeline.
-	 */
-	private readFileSafe(filePath: string): string {
-		try {
-			return readFileSync(filePath, "utf-8");
-		} catch {
-			return "";
-		}
+		return this.repository.task(taskId).events.readAll() as unknown as EvidenceRecord[];
 	}
 }
