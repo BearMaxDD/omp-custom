@@ -97,6 +97,7 @@ const DETAILS_MAX_KEYS = 64;
 const DETAILS_MAX_ARRAY = 32;
 const DETAILS_MAX_STRING = 2 * 1024;
 const IDENTIFIER_MAX_BYTES = 256;
+const FAILURE_SCAN_MAX_DEPTH = 32;
 const DETAILS_PRIORITY_KEYS = [
 	"results",
 	"async",
@@ -130,10 +131,28 @@ function boundedIdentifier(value: string): string {
 	return `id:sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
 }
 
-function boundedJsonString(value: string, maxBytes: number): string | null {
+interface SanitizeState {
+	truncated: boolean;
+}
+
+interface DetailSummary {
+	details?: Record<string, unknown>;
+	truncated: boolean;
+	failure: boolean;
+}
+
+function boundedStorageKey(value: string, state: SanitizeState): string {
+	if (utf8Length(value) <= IDENTIFIER_MAX_BYTES) return value;
+	state.truncated = true;
+	return `key:sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
+}
+
+function boundedJsonString(value: string, maxBytes: number, state: SanitizeState): string | null {
 	const capped = value.slice(0, DETAILS_MAX_STRING);
+	if (capped !== value) state.truncated = true;
 	let serialized = JSON.stringify(capped);
 	if (utf8Length(serialized) <= maxBytes) return serialized;
+	state.truncated = true;
 	let low = 0;
 	let high = capped.length;
 	while (low < high) {
@@ -146,42 +165,72 @@ function boundedJsonString(value: string, maxBytes: number): string | null {
 	return utf8Length(serialized) <= maxBytes ? serialized : null;
 }
 
-function orderedDetailKeys(value: object): string[] {
-	const keys = Object.keys(value);
+function orderedDetailKeys(value: object, state: SanitizeState): string[] {
 	const priority = new Map(DETAILS_PRIORITY_KEYS.map((key, index) => [key, index]));
-	return keys
-		.sort(
-			(left, right) =>
-				(priority.get(left) ?? Number.MAX_SAFE_INTEGER) - (priority.get(right) ?? Number.MAX_SAFE_INTEGER),
-		)
-		.slice(0, DETAILS_MAX_KEYS);
+	const keys: string[] = [];
+	for (const key of DETAILS_PRIORITY_KEYS) {
+		if (Object.hasOwn(value, key)) keys.push(key);
+	}
+	for (const key in value) {
+		if (!Object.hasOwn(value, key) || priority.has(key)) continue;
+		if (keys.length >= DETAILS_MAX_KEYS) {
+			state.truncated = true;
+			break;
+		}
+		keys.push(key);
+	}
+	if (keys.length > DETAILS_MAX_KEYS) {
+		state.truncated = true;
+		return keys.slice(0, DETAILS_MAX_KEYS);
+	}
+	return keys;
 }
 
-function sanitizeDetailJson(value: unknown, depth: number, ancestors: Set<object>, maxBytes: number): string | null {
+function sanitizeDetailJson(
+	value: unknown,
+	depth: number,
+	ancestors: Set<object>,
+	maxBytes: number,
+	state: SanitizeState,
+): string | null {
 	if (value === null) return maxBytes >= 4 ? "null" : null;
-	if (typeof value === "string") return boundedJsonString(value, maxBytes);
+	if (typeof value === "string") return boundedJsonString(value, maxBytes, state);
 	if (typeof value === "boolean") {
 		const serialized = String(value);
 		return utf8Length(serialized) <= maxBytes ? serialized : null;
 	}
 	if (typeof value === "number") {
+		if (!Number.isFinite(value)) state.truncated = true;
 		const serialized = Number.isFinite(value) ? String(value) : JSON.stringify("[Unsupported:number]");
 		return utf8Length(serialized) <= maxBytes ? serialized : null;
 	}
-	if (typeof value !== "object") return boundedJsonString(`[Unsupported:${typeof value}]`, maxBytes);
-	if (ancestors.has(value)) return boundedJsonString("[Circular]", maxBytes);
-	if (depth >= DETAILS_MAX_DEPTH) return boundedJsonString("[MaxDepth]", maxBytes);
+	if (typeof value !== "object") {
+		state.truncated = true;
+		return boundedJsonString(`[Unsupported:${typeof value}]`, maxBytes, state);
+	}
+	if (ancestors.has(value)) {
+		state.truncated = true;
+		return boundedJsonString("[Circular]", maxBytes, state);
+	}
+	if (depth >= DETAILS_MAX_DEPTH) {
+		state.truncated = true;
+		return boundedJsonString("[MaxDepth]", maxBytes, state);
+	}
 
 	ancestors.add(value);
 	try {
 		if (Array.isArray(value)) {
 			if (maxBytes < 2) return null;
+			if (value.length > DETAILS_MAX_ARRAY) state.truncated = true;
 			const parts: string[] = [];
 			let used = 2;
 			for (const item of value.slice(0, DETAILS_MAX_ARRAY)) {
 				const separatorBytes = parts.length === 0 ? 0 : 1;
-				const child = sanitizeDetailJson(item, depth + 1, ancestors, maxBytes - used - separatorBytes);
-				if (child === null) break;
+				const child = sanitizeDetailJson(item, depth + 1, ancestors, maxBytes - used - separatorBytes, state);
+				if (child === null) {
+					state.truncated = true;
+					break;
+				}
 				parts.push(child);
 				used += separatorBytes + utf8Length(child);
 			}
@@ -191,11 +240,15 @@ function sanitizeDetailJson(value: unknown, depth: number, ancestors: Set<object
 		if (maxBytes < 2) return null;
 		const parts: string[] = [];
 		let used = 2;
-		for (const key of orderedDetailKeys(value)) {
-			const keyJson = JSON.stringify(key);
+		for (const key of orderedDetailKeys(value, state)) {
+			const storedKey = boundedStorageKey(key, state);
+			const keyJson = JSON.stringify(storedKey);
 			const separatorBytes = parts.length === 0 ? 0 : 1;
 			const overhead = separatorBytes + utf8Length(keyJson) + 1;
-			if (used + overhead >= maxBytes) break;
+			if (used + overhead >= maxBytes) {
+				state.truncated = true;
+				break;
+			}
 			let child: string | null;
 			try {
 				child = sanitizeDetailJson(
@@ -203,11 +256,16 @@ function sanitizeDetailJson(value: unknown, depth: number, ancestors: Set<object
 					depth + 1,
 					ancestors,
 					maxBytes - used - overhead,
+					state,
 				);
 			} catch {
-				child = boundedJsonString("[Unreadable]", maxBytes - used - overhead);
+				state.truncated = true;
+				child = boundedJsonString("[Unreadable]", maxBytes - used - overhead, state);
 			}
-			if (child === null) continue;
+			if (child === null) {
+				state.truncated = true;
+				continue;
+			}
 			parts.push(`${keyJson}:${child}`);
 			used += overhead + utf8Length(child);
 		}
@@ -215,6 +273,46 @@ function sanitizeDetailJson(value: unknown, depth: number, ancestors: Set<object
 	} finally {
 		ancestors.delete(value);
 	}
+}
+
+function summarizeFailures(
+	value: unknown,
+	depth = 0,
+	ancestors: Set<object> = new Set(),
+): { failure: boolean; incomplete: boolean } {
+	if (typeof value !== "object" || value === null) return { failure: false, incomplete: false };
+	if (ancestors.has(value) || depth >= FAILURE_SCAN_MAX_DEPTH) return { failure: false, incomplete: true };
+	ancestors.add(value);
+	let failure = false;
+	let incomplete = false;
+	try {
+		for (const key in value) {
+			if (!Object.hasOwn(value, key)) continue;
+			let child: unknown;
+			try {
+				child = (value as Record<string, unknown>)[key];
+			} catch {
+				incomplete = true;
+				continue;
+			}
+			if (["exitCode", "exit", "code"].includes(key)) {
+				const exitCode = typeof child === "number" ? child : Number(child);
+				if (Number.isFinite(exitCode) && exitCode !== 0) failure = true;
+			}
+			if (["status", "state"].includes(key) && typeof child === "string") {
+				if (["failed", "failure", "error", "aborted", "cancelled"].includes(child.toLowerCase())) failure = true;
+			}
+			if (key === "error" && (child === true || (typeof child === "string" && child.length > 0))) failure = true;
+			const nested = summarizeFailures(child, depth + 1, ancestors);
+			failure ||= nested.failure;
+			incomplete ||= nested.incomplete;
+		}
+	} catch {
+		incomplete = true;
+	} finally {
+		ancestors.delete(value);
+	}
+	return { failure, incomplete };
 }
 
 export class ToolEventCollector {
@@ -355,10 +453,17 @@ export class ToolEventCollector {
 				}
 			} else {
 				// Official non-canonical tools may only correlate by their exact bounded id.
-				storageId = this.calls.has(toolCallId) ? toolCallId : undefined;
+				const exactCall = this.calls.get(toolCallId);
+				storageId = exactCall && !exactCall.qualifiedName ? toolCallId : undefined;
 			}
 		} else {
 			// Alias fallback is reserved for legacy synthetic fixtures without identity metadata.
+			if (
+				this.retired.has(this.retiredIdKey(toolCallId)) ||
+				this.retired.has(this.retiredAliasKey(this.rawAliasKey(toolCallId)))
+			) {
+				return;
+			}
 			storageId = this.findLegacyStorageId(toolCallId);
 		}
 		if (!storageId) return;
@@ -370,13 +475,15 @@ export class ToolEventCollector {
 		}
 		toolCallId = storageId;
 		const ref = this.extractResultRef(event);
-		const details = this.extractStructuredDetails(event);
+		const detailSummary = this.extractStructuredDetails(event);
 
 		this.results.set(toolCallId, {
 			toolCallId,
 			success: !isError,
 			resultRef: ref,
-			details,
+			details: detailSummary.details,
+			detailsTruncated: detailSummary.truncated,
+			detailsFailure: detailSummary.failure,
 			timestamp: new Date().toISOString(),
 		});
 		this.enforceResultLimit();
@@ -486,7 +593,8 @@ export class ToolEventCollector {
 		if (!rawCall?.qualifiedName || !rawCall.argsFingerprint) return;
 		const reason: InvalidXdevReason =
 			rawCall.qualifiedName === identity.qualifiedName ? "args_mismatch" : "tool_mismatch";
-		this.recordInvalidXdev(toolCallId, reason, undefined, rawCall.toolCallId);
+		// Exact canonical misses never mutate the raw-id call. Keep diagnostics separate.
+		this.recordInvalidXdev(toolCallId, reason);
 	}
 
 	private setCanonicalMapping(key: string, storageId: string): void {
@@ -602,10 +710,33 @@ export class ToolEventCollector {
 	 */
 	private truncateParams(params: object): Record<string, unknown> {
 		const result: Record<string, unknown> = {};
-		for (const [key, value] of Object.entries(params)) {
-			result[key] = this.truncateValue(value);
+		const state: SanitizeState = { truncated: false };
+		let count = 0;
+		for (const key in params) {
+			if (!Object.hasOwn(params, key)) continue;
+			if (count >= DETAILS_MAX_KEYS) {
+				state.truncated = true;
+				break;
+			}
+			const storedKey = boundedStorageKey(key, state);
+			try {
+				result[storedKey] = this.truncateValue((params as Record<string, unknown>)[key]);
+			} catch {
+				result[storedKey] = "[Unreadable]";
+				state.truncated = true;
+			}
+			count++;
 		}
-		return result;
+		const serialized = sanitizeDetailJson(result, 0, new Set(), DETAILS_MAX_BYTES, state);
+		if (!serialized) return {};
+		try {
+			const parsed: unknown = JSON.parse(serialized);
+			return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+				? (parsed as Record<string, unknown>)
+				: {};
+		} catch {
+			return {};
+		}
 	}
 
 	private truncateValue(value: unknown): unknown {
@@ -617,7 +748,11 @@ export class ToolEventCollector {
 			return `[array:${value.length}]`;
 		}
 		if (typeof value === "object" && value !== null) {
-			return `{object:${Object.keys(value).length}}`;
+			let count = 0;
+			for (const key in value) {
+				if (Object.hasOwn(value, key)) count++;
+			}
+			return `{object:${count}}`;
 		}
 		return value;
 	}
@@ -657,20 +792,27 @@ export class ToolEventCollector {
 		}
 	}
 
-	private extractStructuredDetails(
-		event: ToolResultEvent | LegacySyntheticToolResultEvent,
-	): Record<string, unknown> | undefined {
+	private extractStructuredDetails(event: ToolResultEvent | LegacySyntheticToolResultEvent): DetailSummary {
 		const value = isOfficialToolResultEvent(event) ? event.details : event.result;
-		if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+		if (typeof value !== "object" || value === null || Array.isArray(value)) {
+			return { truncated: false, failure: false };
+		}
+		const state: SanitizeState = { truncated: false };
+		const failureSummary = summarizeFailures(value);
 		try {
-			const serialized = sanitizeDetailJson(value, 0, new Set(), DETAILS_MAX_BYTES);
-			if (!serialized) return undefined;
+			const serialized = sanitizeDetailJson(value, 0, new Set(), DETAILS_MAX_BYTES, state);
+			if (!serialized) return { truncated: true, failure: failureSummary.failure };
 			const parsed: unknown = JSON.parse(serialized);
-			return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
-				? (parsed as Record<string, unknown>)
-				: undefined;
+			return {
+				details:
+					typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+						? (parsed as Record<string, unknown>)
+						: undefined,
+				truncated: state.truncated || failureSummary.incomplete,
+				failure: failureSummary.failure,
+			};
 		} catch {
-			return undefined;
+			return { truncated: true, failure: failureSummary.failure };
 		}
 	}
 }

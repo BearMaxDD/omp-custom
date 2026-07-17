@@ -46,6 +46,10 @@ export interface ToolResultRecord {
 	resultRef: string;
 	/** Bounded JSON-safe structured result details retained for downstream normalizers. */
 	details?: Record<string, unknown>;
+	/** True when structured details were clipped, summarized, or could not be traversed completely. */
+	detailsTruncated?: boolean;
+	/** Fixed-size aggregate indicating a failure anywhere in the original structured details. */
+	detailsFailure?: boolean;
 	/** ISO timestamp of the result. */
 	timestamp: string;
 }

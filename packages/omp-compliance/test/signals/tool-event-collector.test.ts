@@ -58,7 +58,7 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 	});
 
 	it("记录 tool_result 并关联到同名 tool_call", () => {
-		collector.recordCall(makeCall("search_graph", { query: "foo" }, "c1"));
+		collector.recordCall(makeCall("bash", { command: "pwd" }, "c1"));
 		collector.recordResult(makeResult("c1", { references: ["src/a.ts"] }, false));
 		const snap = collector.snapshot();
 		expect(snap.results).toHaveLength(1);
@@ -155,7 +155,9 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 	it("外层 xd 与同 id 内层事件按 canonical identity 去重且结果保持关联", () => {
 		collector.recordCall(makeCall("write", { path: "xd://search_graph", content: '{"query":"same"}' }, "shared"));
 		collector.recordCall(makeCall("mcp__codebase_memory_mcp__search_graph", { query: "same" }, "shared"));
-		collector.recordResult(makeResult("shared", "packages/omp-compliance/src/signals/types.ts"));
+		collector.recordResult(
+			makeMcpResult("shared", "search_graph", { query: "same" }, "packages/omp-compliance/src/signals/types.ts"),
+		);
 
 		const snap = collector.snapshot();
 		expect(snap.calls).toHaveLength(1);
@@ -190,12 +192,17 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 		} as ToolResultEvent);
 
 		const snap = collector.snapshot();
-		expect(snap.calls).toHaveLength(1);
-		expect(snap.calls[0]).toMatchObject({
-			toolName: "invalid_xdev_event",
-			params: { reason },
-		});
-		expect(snap.results[0]).toMatchObject({ success: false, toolCallId: `tampered-${reason}` });
+		expect(snap.calls).toHaveLength(2);
+		expect(snap.calls).toContainEqual(
+			expect.objectContaining({ toolName: "search_graph", params: { query: "original" } }),
+		);
+		expect(snap.calls).toContainEqual(
+			expect.objectContaining({
+				toolName: "invalid_xdev_event",
+				params: { reason },
+			}),
+		);
+		expect(snap.results).toContainEqual(expect.objectContaining({ success: false, resultRef: reason }));
 		expect(snap.codebaseMemory).toEqual({ indexReady: false, queries: [], references: [] });
 	});
 
@@ -214,11 +221,16 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 		);
 
 		const snap = collector.snapshot();
-		expect(snap.calls[0]).toMatchObject({
-			toolName: "invalid_xdev_event",
-			params: { reason: "args_mismatch" },
-		});
-		expect(snap.results[0]).toMatchObject({ success: false });
+		expect(snap.calls).toContainEqual(
+			expect.objectContaining({
+				toolName: "invalid_xdev_event",
+				params: { reason: "args_mismatch" },
+			}),
+		);
+		expect(snap.calls).toContainEqual(
+			expect.objectContaining({ toolName: "search_graph", params: { query: "original" } }),
+		);
+		expect(snap.results).toContainEqual(expect.objectContaining({ success: false }));
 		expect(snap.codebaseMemory).toEqual({ indexReady: false, queries: [], references: [] });
 	});
 
@@ -241,10 +253,93 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 		} as ToolResultEvent & { serverName: string });
 
 		const snap = collector.snapshot();
-		expect(snap.calls[0]).toMatchObject({ toolName: "invalid_xdev_event", params: { reason: "args_mismatch" } });
-		expect(snap.results[0]).toMatchObject({ success: false });
+		expect(snap.calls).toContainEqual(
+			expect.objectContaining({ toolName: "invalid_xdev_event", params: { reason: "args_mismatch" } }),
+		);
+		expect(snap.calls).toContainEqual(
+			expect.objectContaining({ toolName: "search_graph", params: { query: "original" } }),
+		);
+		expect(snap.results).toContainEqual(expect.objectContaining({ success: false }));
 		expect(snap.codebaseMemory.references).toEqual([]);
 	});
+
+	it("正式 v17 短名 Codebase 事件无需 serverName 即规范为可信 direct 调用", () => {
+		collector.recordCall(makeCall("search_graph", { query: "official-direct" }, "official-direct"));
+		collector.recordResult({
+			type: "tool_result",
+			toolName: "search_graph",
+			toolCallId: "official-direct",
+			input: { query: "official-direct" },
+			isError: false,
+			content: [{ type: "text", text: "packages/direct-official.ts" }],
+			details: undefined,
+		});
+
+		const snap = collector.snapshot();
+		expect(snap.calls[0]).toMatchObject({
+			toolName: "search_graph",
+			serverName: "codebase-memory",
+			qualifiedName: "codebase-memory-mcp.search_graph",
+		});
+		expect(snap.codebaseMemory.references).toEqual(["packages/direct-official.ts"]);
+	});
+
+	it("legacy synthetic 显式 evil server 不能伪装 direct Codebase 调用", () => {
+		collector.recordCall({
+			toolName: "search_graph",
+			toolCallId: "evil-direct",
+			serverName: "evil-codebase-memory-mcp",
+			params: { query: "spoof" },
+		});
+		const snap = collector.snapshot();
+		expect(snap.calls).toHaveLength(1);
+		expect(snap.calls[0].qualifiedName).toBeUndefined();
+		expect(snap.codebaseMemory.queries).toEqual([]);
+	});
+
+	it.each(["direct", "mcp", "xdev"] as const)(
+		"%s 的 early beta result 不得改写同 raw ID 的 alpha call",
+		(transport) => {
+			const id = `early-${transport}`;
+			if (transport === "direct") {
+				collector.recordCall(makeCall("search_graph", { query: "alpha" }, id));
+				collector.recordResult({
+					type: "tool_result",
+					toolName: "search_graph",
+					toolCallId: id,
+					input: { query: "beta" },
+					isError: false,
+					content: [{ type: "text", text: "packages/spoofed-early-direct.ts" }],
+					details: undefined,
+				});
+				collector.recordCall(makeCall("search_graph", { query: "beta" }, id));
+			} else if (transport === "mcp") {
+				collector.recordCall(makeCall("mcp__codebase_memory_mcp__search_graph", { query: "alpha" }, id));
+				collector.recordResult(makeMcpResult(id, "search_graph", { query: "beta" }, "packages/spoofed-early-mcp.ts"));
+				collector.recordCall(makeCall("mcp__codebase_memory_mcp__search_graph", { query: "beta" }, id));
+			} else {
+				collector.recordCall(makeCall("write", { path: "xd://search_graph", content: '{"query":"alpha"}' }, id));
+				collector.recordResult({
+					type: "tool_result",
+					toolName: "write",
+					toolCallId: id,
+					input: { path: "xd://search_graph", content: '{"query":"beta"}' },
+					isError: false,
+					content: [{ type: "text", text: "packages/spoofed-early-xdev.ts" }],
+					details: { xdev: { tool: "search_graph", mode: "execute", args: { query: "beta" } } },
+				} as ToolResultEvent);
+				collector.recordCall(makeCall("write", { path: "xd://search_graph", content: '{"query":"beta"}' }, id));
+			}
+
+			const snap = collector.snapshot();
+			const canonicalCalls = snap.calls.filter((call) => call.toolName === "search_graph");
+			expect(canonicalCalls.map((call) => call.params.query)).toEqual(["alpha", "beta"]);
+			expect(
+				canonicalCalls.every((call) => snap.results.every((result) => result.toolCallId !== call.toolCallId)),
+			).toBe(true);
+			expect(snap.codebaseMemory.references).toEqual([]);
+		},
+	);
 
 	it("canonical result-before-call 丢弃，后续匹配 result 才建立 Evidence", () => {
 		const result = makeMcpResult("result-before-call", "search_graph", { query: "ordered" }, "packages/ordered.ts");
@@ -523,6 +618,50 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 		}
 	});
 
+	it("参数快照限制键数、键长和总字节，canonical args 超过 64KiB 时记录 invalid", () => {
+		const hugeKey = "巨型参数键".repeat(512 * 1024);
+		const manyKeys = Object.fromEntries(Array.from({ length: 100_000 }, (_, index) => [`key-${index}`, index]));
+		collector.recordCall(makeCall("task", { [hugeKey]: "value", ...manyKeys }, "bounded-params"));
+		collector.recordCall(makeCall("search_graph", { payload: "x".repeat(65 * 1024) }, "oversized-canonical"));
+
+		const snap = collector.snapshot();
+		const stored = snap.calls.find((call) => call.toolCallId === "bounded-params");
+		expect(stored).toBeDefined();
+		expect(Object.keys(stored?.params ?? {})).toHaveLength(64);
+		for (const key of Object.keys(stored?.params ?? {})) {
+			expect(new TextEncoder().encode(key).byteLength).toBeLessThanOrEqual(256);
+		}
+		expect(new TextEncoder().encode(JSON.stringify(stored?.params)).byteLength).toBeLessThanOrEqual(16 * 1024);
+		expect(snap.calls).toContainEqual(
+			expect.objectContaining({ toolName: "invalid_xdev_event", params: { reason: "unserializable_args" } }),
+		);
+		expect(new TextEncoder().encode(JSON.stringify(snap)).byteLength).toBeLessThan(32 * 1024);
+	});
+
+	it("retired raw ID 禁止 identity-less legacy result 污染 fresh canonical call", () => {
+		collector.recordCall(makeCall("mcp__codebase_memory_mcp__search_graph", { query: "old" }, "retired-legacy"));
+		for (let index = 0; index < 2048; index++) {
+			collector.recordCall(
+				makeCall("mcp__codebase_memory_mcp__search_graph", { query: `retire-${index}` }, `retire-${index}`),
+			);
+		}
+		collector.recordCall(makeCall("mcp__codebase_memory_mcp__search_graph", { query: "fresh" }, "retired-legacy"));
+		collector.recordResult({ toolCallId: "retired-legacy", success: true, resultRef: "packages/legacy-spoof.ts" });
+
+		let snap = collector.snapshot();
+		const fresh = snap.calls.find((call) => call.params.query === "fresh");
+		expect(fresh).toBeDefined();
+		expect(snap.results.some((result) => result.toolCallId === fresh?.toolCallId)).toBe(false);
+		expect(snap.codebaseMemory.references).not.toContain("packages/legacy-spoof.ts");
+
+		collector.recordResult(
+			makeMcpResult("retired-legacy", "search_graph", { query: "fresh" }, "packages/fresh-official.ts"),
+		);
+		snap = collector.snapshot();
+		expect(snap.results.some((result) => result.toolCallId === fresh?.toolCallId)).toBe(true);
+		expect(snap.codebaseMemory.references).toContain("packages/fresh-official.ts");
+	});
+
 	it("details 有界清洗且保留 task normalizer 所需字段", () => {
 		const cyclic: Record<string, unknown> = {};
 		cyclic.self = cyclic;
@@ -566,14 +705,13 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 		expect(stored?.wide as unknown[]).toHaveLength(32);
 		expect(Object.keys(stored?.manyKeys as object)).toHaveLength(64);
 		expect(JSON.stringify(stored?.deep)).not.toContain("too deep");
-		expect(snap.subagentDelegations[0]).toMatchObject({
-			agentId: "bounded-agent",
+		expect(snap.results[0]).toMatchObject({ detailsTruncated: true, detailsFailure: false });
+		expect((stored?.results as Array<Record<string, unknown>>)[0]).toMatchObject({
+			id: "bounded-agent",
 			agent: "implementer",
-			status: "completed",
 			exitCode: 0,
-			durationMs: 12,
-			codebaseRefs: ["packages/omp-compliance/src/signals/tool-event-collector.ts"],
 		});
+		expect(snap.subagentDelegations[0]).toMatchObject({ status: "insufficient", codebaseRefs: [] });
 	});
 
 	it("reset 清空去重关联，后续相同 id 可重新记录", () => {

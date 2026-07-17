@@ -59,6 +59,11 @@ export function normalizeTaskDelegation(
 			continue;
 		}
 
+		if (result.detailsTruncated) {
+			results.push(emptyEvidence(call, result.detailsFailure ? "aborted" : "insufficient"));
+			continue;
+		}
+
 		// Structured v17 details are authoritative; resultRef is only a text fallback.
 		const details = { ...parseResultDetails(result.resultRef), ...result.details };
 		if (isTaskToolDetails(details)) {

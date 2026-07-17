@@ -1,3 +1,4 @@
+import { codebaseToolAccess, isTrustedCodebaseServerId } from "./codebase-tool-policy";
 import { type CanonicalToolIdentity, canonicalArgsFingerprint, canonicalizeToolIdentity } from "./tool-identity";
 
 interface ToolCallLike {
@@ -55,6 +56,17 @@ function isXdevCandidate(event: ToolCallLike): boolean {
 	return isRecord(args) && typeof args.path === "string" && args.path.trim().toLowerCase().startsWith("xd://");
 }
 
+function isOfficialCodebaseCandidate(event: ToolCallLike, toolName: string): boolean {
+	if (event.type !== "tool_call") return false;
+	const serverName = stringField(event.serverName);
+	if (serverName !== undefined && !isTrustedCodebaseServerId(serverName)) return false;
+	if (codebaseToolAccess(toolName)) return true;
+	for (const prefix of ["mcp__codebase_memory_mcp__", "mcp__codebase_memory__"] as const) {
+		if (toolName.startsWith(prefix) && codebaseToolAccess(toolName.slice(prefix.length))) return true;
+	}
+	return false;
+}
+
 function diagnoseXdevCall(event: ToolCallLike): InvalidXdevReason | "help" {
 	if (event.type !== "tool_call") return "invalid_outer_event";
 	if (!isRecord(event.input)) return "invalid_content";
@@ -87,8 +99,16 @@ export function classifyToolCallEvent(event: ToolCallLike): ToolEventClassificat
 		toolName,
 		serverName: stringField(event.serverName),
 		args: eventArgs(event),
+		official: event.type === "tool_call",
 	});
 	if (!identity) {
+		if (
+			isOfficialCodebaseCandidate(event, toolName) &&
+			isRecord(eventArgs(event)) &&
+			canonicalArgsFingerprint(eventArgs(event)) === null
+		) {
+			return { kind: "invalid_xdev", toolCallId, reason: "unserializable_args" };
+		}
 		if (!isXdevCandidate(event)) return { kind: "ignored" };
 		const reason = diagnoseXdevCall(event);
 		return reason === "help" ? { kind: "ignored" } : { kind: "invalid_xdev", toolCallId, reason };

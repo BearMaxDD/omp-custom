@@ -6,20 +6,7 @@
  */
 
 import type { EvidenceSnapshot } from "../signals/types";
-
-// ─── Read-Only Tool Suffixes ───────────────────────────────────────
-
-/**
- * Suffixes of read-only codebase-memory tools that the advisor MAY use.
- * `index_repository` is deliberately excluded — it is a write operation.
- */
-const READ_ONLY_CODEBASE_SUFFIXES = [
-	"index_status",
-	"search_graph",
-	"search_code",
-	"get_code_snippet",
-	"trace_path",
-] as const;
+import { READONLY_CODEBASE_TOOLS } from "../xdev/codebase-tool-policy";
 
 // ─── Types ─────────────────────────────────────────────────────────
 
@@ -95,10 +82,10 @@ function deriveSource(queries: string[]): "graph" | "snippet" | "trace" | "text"
 
 /** True when at least one query is a recognised read-only codebase tool. */
 function hasRelevantQuery(queries: string[]): boolean {
-	return queries.some((q) => (READ_ONLY_CODEBASE_SUFFIXES as readonly string[]).includes(q));
+	return queries.some((query) => READONLY_CODEBASE_TOOLS.has(query));
 }
 
 /** Keep only recognised read-only codebase tool names. */
 function filterReadOnlyTools(queries: string[]): string[] {
-	return queries.filter((q) => (READ_ONLY_CODEBASE_SUFFIXES as readonly string[]).includes(q));
+	return queries.filter((query) => READONLY_CODEBASE_TOOLS.has(query));
 }

@@ -100,6 +100,28 @@ describe("buildTopicCodebaseEvidence", () => {
 		expect(evidence.requestedToolNames.every((name) => !name.endsWith("index_repository"))).toBe(true);
 	});
 
+	it.each(["get_architecture", "query_graph"])("accepts shared read-only policy tool %s", (toolName) => {
+		const snapshot: EvidenceSnapshot = {
+			...emptyEvidenceSnapshot(),
+			codebaseMemory: { indexReady: true, queries: [toolName], references: ["ArchitectureRef"] },
+		};
+		const evidence = buildTopicCodebaseEvidence("required", snapshot);
+		expect(evidence.mode).toBe("available");
+		expect(evidence.requestedToolNames).toEqual([toolName]);
+	});
+
+	it("rejects index_repository from required Brainstorm evidence", () => {
+		const snapshot: EvidenceSnapshot = {
+			...emptyEvidenceSnapshot(),
+			codebaseMemory: { indexReady: true, queries: ["index_repository"], references: ["WriteRef"] },
+		};
+		expect(buildTopicCodebaseEvidence("required", snapshot)).toEqual({
+			mode: "unavailable",
+			references: [],
+			requestedToolNames: [],
+		});
+	});
+
 	// ── relevance: "required" — unavailable ─────────────────────────
 
 	it("returns unavailable when index is not ready", () => {

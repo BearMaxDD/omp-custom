@@ -234,6 +234,40 @@ describe("task-delegation v17 details 领域归一化", () => {
 		]);
 	});
 
+	it("批量 details 第 33 项失败时聚合为 aborted，不能被数组截断隐藏", () => {
+		const collector = new ToolEventCollector();
+		const results = Array.from({ length: 33 }, (_, index) =>
+			singleResult({
+				index,
+				id: `batch-failure-${index}`,
+				exitCode: index === 32 ? 9 : 0,
+			}),
+		);
+		collector.recordCall(taskCall({ task: "检查完整批次" }, "truncated-failure"));
+		collector.recordResult(taskResult("truncated-failure", taskDetails({ results })));
+
+		const snapshot = collector.snapshot();
+		expect(snapshot.results[0]).toMatchObject({ detailsTruncated: true, detailsFailure: true });
+		expect(snapshot.subagentDelegations).toEqual([
+			expect.objectContaining({ taskSummary: "检查完整批次", status: "aborted" }),
+		]);
+	});
+
+	it("批量 details 纯成功但被截断时只能产生 insufficient", () => {
+		const collector = new ToolEventCollector();
+		const results = Array.from({ length: 33 }, (_, index) =>
+			singleResult({ index, id: `batch-success-${index}`, exitCode: 0 }),
+		);
+		collector.recordCall(taskCall({ task: "不完整成功批次" }, "truncated-success"));
+		collector.recordResult(taskResult("truncated-success", taskDetails({ results })));
+
+		const snapshot = collector.snapshot();
+		expect(snapshot.results[0]).toMatchObject({ detailsTruncated: true, detailsFailure: false });
+		expect(snapshot.subagentDelegations).toEqual([
+			expect.objectContaining({ taskSummary: "不完整成功批次", status: "insufficient" }),
+		]);
+	});
+
 	it("非 task 工具不产生委派证据", () => {
 		const collector = new ToolEventCollector();
 		collector.recordCall({ type: "tool_call", toolName: "bash", toolCallId: "bash-1", input: { command: "ls" } });
