@@ -18,12 +18,13 @@ function mcpResult(
 	details: unknown,
 	content = "ok",
 	isError = false,
+	input: Record<string, unknown> = {},
 ): ToolResultEvent {
 	return {
 		type: "tool_result",
 		toolName: `mcp__codebase_memory_mcp__${shortName}`,
 		toolCallId,
-		input: {},
+		input,
 		content: [{ type: "text", text: content }],
 		isError,
 		details,
@@ -86,7 +87,9 @@ describe("codebase-memory Task 8 可信 server 边界", () => {
 		const collector = new ToolEventCollector();
 		collector.recordCall(mcpCall("search_graph", { query: "failed" }, "failed-query"));
 		collector.recordResult(
-			mcpResult("failed-query", "search_graph", undefined, "packages/omp-compliance/src/should-not-count.ts", true),
+			mcpResult("failed-query", "search_graph", undefined, "packages/omp-compliance/src/should-not-count.ts", true, {
+				query: "failed",
+			}),
 		);
 		expect(collector.snapshot().codebaseMemory).toEqual({ indexReady: false, queries: [], references: [] });
 	});
@@ -119,6 +122,8 @@ describe("codebase-memory Task 8 可信 server 边界", () => {
 					],
 				},
 				"ordinary content; packages/omp-compliance/src/extension.ts",
+				false,
+				{ query: "TaskTool" },
 			),
 		);
 		collector.recordCall(mcpCall("get_code_snippet", { qualified_name: "TaskTool.execute" }, "snippet-1"));
@@ -128,6 +133,8 @@ describe("codebase-memory Task 8 可信 server 边界", () => {
 				"get_code_snippet",
 				{ file_path: "packages/omp-compliance/src/signals/codebase-memory.ts" },
 				"no structured path here",
+				false,
+				{ qualified_name: "TaskTool.execute" },
 			),
 		);
 
@@ -159,7 +166,7 @@ describe("codebase-memory Task 8 可信 server 边界", () => {
 		const collector = new ToolEventCollector();
 		for (const id of ["a", "b"]) {
 			collector.recordCall(mcpCall("search_code", { query: id }, id));
-			collector.recordResult(mcpResult(id, "search_code", { matches: [] }));
+			collector.recordResult(mcpResult(id, "search_code", { matches: [] }, "ok", false, { query: id }));
 		}
 		expect(collector.snapshot().codebaseMemory.queries).toEqual(["search_code"]);
 	});

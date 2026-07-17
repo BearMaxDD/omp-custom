@@ -25,6 +25,23 @@ function makeResult(toolCallId: string, result: unknown, isError = false): ToolR
 	};
 }
 
+function makeMcpResult(
+	toolCallId: string,
+	toolName: string,
+	input: Record<string, unknown>,
+	content: string,
+): ToolResultEvent {
+	return {
+		type: "tool_result",
+		toolName: `mcp__codebase_memory_mcp__${toolName}`,
+		toolCallId,
+		input,
+		isError: false,
+		content: [{ type: "text", text: content }],
+		details: undefined,
+	};
+}
+
 describe("ToolEventCollector — recordCall / recordResult 记录与关联", () => {
 	let collector: ToolEventCollector;
 
@@ -188,6 +205,76 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 		const snap = collector.snapshot();
 		expect(snap.calls).toHaveLength(2);
 		expect(snap.calls.map((call) => call.params.query)).toEqual(["outer", "inner"]);
+	});
+
+	it("MCP result 参数与原 call 不一致时失败且伪 reference 不进入 Evidence", () => {
+		collector.recordCall(makeCall("mcp__codebase_memory_mcp__search_graph", { query: "original" }, "mcp-tampered"));
+		collector.recordResult(
+			makeMcpResult("mcp-tampered", "search_graph", { query: "tampered" }, "packages/spoofed-reference.ts"),
+		);
+
+		const snap = collector.snapshot();
+		expect(snap.calls[0]).toMatchObject({
+			toolName: "invalid_xdev_event",
+			params: { reason: "args_mismatch" },
+		});
+		expect(snap.results[0]).toMatchObject({ success: false });
+		expect(snap.codebaseMemory).toEqual({ indexReady: false, queries: [], references: [] });
+	});
+
+	it("direct result 也必须与原 call canonical args 一致", () => {
+		collector.recordCall({
+			toolName: "search_graph",
+			toolCallId: "direct-tampered",
+			serverName: "codebase-memory-mcp",
+			params: { query: "original" },
+		});
+		collector.recordResult({
+			type: "tool_result",
+			toolName: "search_graph",
+			toolCallId: "direct-tampered",
+			serverName: "codebase-memory-mcp",
+			input: { query: "tampered" },
+			isError: false,
+			content: [{ type: "text", text: "packages/direct-spoofed.ts" }],
+			details: undefined,
+		} as ToolResultEvent & { serverName: string });
+
+		const snap = collector.snapshot();
+		expect(snap.calls[0]).toMatchObject({ toolName: "invalid_xdev_event", params: { reason: "args_mismatch" } });
+		expect(snap.results[0]).toMatchObject({ success: false });
+		expect(snap.codebaseMemory.references).toEqual([]);
+	});
+
+	it("canonical result-before-call 丢弃，后续匹配 result 才建立 Evidence", () => {
+		const result = makeMcpResult("result-before-call", "search_graph", { query: "ordered" }, "packages/ordered.ts");
+		collector.recordResult(result);
+		expect(collector.snapshot()).toMatchObject({ calls: [], results: [] });
+
+		collector.recordCall(
+			makeCall("mcp__codebase_memory_mcp__search_graph", { query: "ordered" }, "result-before-call"),
+		);
+		let snap = collector.snapshot();
+		expect(snap.results).toEqual([]);
+		expect(snap.codebaseMemory.references).toEqual([]);
+
+		collector.recordResult(result);
+		snap = collector.snapshot();
+		expect(snap.results).toHaveLength(1);
+		expect(snap.codebaseMemory.references).toEqual(["packages/ordered.ts"]);
+	});
+
+	it("同一 ID 的不同 canonical args 分别精确关联各自 result", () => {
+		collector.recordCall(makeCall("mcp__codebase_memory_mcp__search_graph", { query: "alpha" }, "shared-mcp-id"));
+		collector.recordCall(makeCall("mcp__codebase_memory_mcp__search_graph", { query: "beta" }, "shared-mcp-id"));
+		collector.recordResult(makeMcpResult("shared-mcp-id", "search_graph", { query: "alpha" }, "packages/alpha.ts"));
+		collector.recordResult(makeMcpResult("shared-mcp-id", "search_graph", { query: "beta" }, "packages/beta.ts"));
+
+		const snap = collector.snapshot();
+		expect(snap.calls).toHaveLength(2);
+		expect(snap.results).toHaveLength(2);
+		expect(new Set(snap.results.map((result) => result.toolCallId)).size).toBe(2);
+		expect(snap.codebaseMemory.references).toEqual(["packages/alpha.ts", "packages/beta.ts"]);
 	});
 
 	it("外层与内层 id 不同时按 parent 关联去重并重关联结果", () => {
@@ -378,6 +465,62 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 		snap = collector.snapshot();
 		expect(snap.calls.some((call) => call.toolCallId === "long-session-0")).toBe(true);
 		expect(snap.codebaseMemory.references).toContain("packages/new-session.ts");
+	});
+
+	it("retired raw ID 可用于新的非 retired identity，并分配固定长度 storage ID", () => {
+		collector.recordCall(makeCall("mcp__codebase_memory_mcp__search_graph", { query: "retired" }, "reused-raw-id"));
+		for (let index = 0; index < 2048; index++) {
+			collector.recordCall(
+				makeCall("mcp__codebase_memory_mcp__search_graph", { query: `filler-${index}` }, `filler-${index}`),
+			);
+		}
+		collector.recordCall(makeCall("mcp__codebase_memory_mcp__search_graph", { query: "fresh" }, "reused-raw-id"));
+		collector.recordResult(makeMcpResult("reused-raw-id", "search_graph", { query: "fresh" }, "packages/fresh.ts"));
+
+		const snap = collector.snapshot();
+		const freshCall = snap.calls.find((call) => call.params.query === "fresh");
+		expect(freshCall).toBeDefined();
+		expect(freshCall?.toolCallId).not.toBe("reused-raw-id");
+		expect(new TextEncoder().encode(freshCall?.toolCallId ?? "").byteLength).toBeLessThanOrEqual(256);
+		expect(snap.results.some((result) => result.toolCallId === freshCall?.toolCallId)).toBe(true);
+		expect(snap.codebaseMemory.references).toContain("packages/fresh.ts");
+	});
+
+	it("超长中文 ID 在任何 record 或 Map key 前压缩到 256 UTF-8 字节", () => {
+		const hugeOuterId = "外层调用标识".repeat(128 * 1024);
+		const hugeInnerId = "内层调用标识".repeat(128 * 1024);
+		collector.recordCall(makeCall("mcp__codebase_memory_mcp__search_graph", { query: "huge-id" }, hugeOuterId));
+		collector.recordCall({
+			type: "tool_call",
+			toolName: "mcp__codebase_memory_mcp__search_graph",
+			toolCallId: hugeInnerId,
+			parentToolCallId: hugeOuterId,
+			input: { query: "huge-id" },
+		} as ToolCallEvent & { parentToolCallId: string });
+		collector.recordResult(makeMcpResult(hugeInnerId, "search_graph", { query: "huge-id" }, "packages/huge-id.ts"));
+
+		const snap = collector.snapshot();
+		expect(snap.calls).toHaveLength(1);
+		expect(snap.results).toHaveLength(1);
+		expect(snap.results[0].toolCallId).toBe(snap.calls[0].toolCallId);
+		expect(new TextEncoder().encode(snap.calls[0].toolCallId).byteLength).toBeLessThanOrEqual(256);
+		expect(new TextEncoder().encode(JSON.stringify(snap)).byteLength).toBeLessThan(64 * 1024);
+		expect(snap.codebaseMemory.references).toEqual(["packages/huge-id.ts"]);
+
+		const internals = collector as unknown as {
+			calls: Map<string, unknown>;
+			results: Map<string, unknown>;
+			canonicalCallIds: Map<string, string>;
+			callAliases: Map<string, string>;
+		};
+		for (const map of [internals.calls, internals.results, internals.canonicalCallIds, internals.callAliases]) {
+			for (const [key, value] of map) {
+				expect(new TextEncoder().encode(key).byteLength).toBeLessThanOrEqual(256);
+				if (typeof value === "string") {
+					expect(new TextEncoder().encode(value).byteLength).toBeLessThanOrEqual(256);
+				}
+			}
+		}
 	});
 
 	it("details 有界清洗且保留 task normalizer 所需字段", () => {

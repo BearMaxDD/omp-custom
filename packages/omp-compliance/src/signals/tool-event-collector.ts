@@ -11,9 +11,11 @@
  * Correlation:
  *   tool_call events are recorded with a toolCallId.
  *   tool_result events carry the same toolCallId and are matched when
- *   producing the snapshot. Orphan results are stored but flagged.
+ *   producing the snapshot. Canonical results without a matching call are dropped.
  */
 
+import { Buffer } from "node:buffer";
+import { createHash } from "node:crypto";
 import type {
 	ExtensionContext,
 	ToolCallEvent,
@@ -94,6 +96,7 @@ const DETAILS_MAX_DEPTH = 4;
 const DETAILS_MAX_KEYS = 64;
 const DETAILS_MAX_ARRAY = 32;
 const DETAILS_MAX_STRING = 2 * 1024;
+const IDENTIFIER_MAX_BYTES = 256;
 const DETAILS_PRIORITY_KEYS = [
 	"results",
 	"async",
@@ -119,7 +122,12 @@ const DETAILS_PRIORITY_KEYS = [
 ];
 
 function utf8Length(value: string): number {
-	return new TextEncoder().encode(value).byteLength;
+	return Buffer.byteLength(value, "utf8");
+}
+
+function boundedIdentifier(value: string): string {
+	if (utf8Length(value) <= IDENTIFIER_MAX_BYTES) return value;
+	return `id:sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
 }
 
 function boundedJsonString(value: string, maxBytes: number): string | null {
@@ -234,42 +242,51 @@ export class ToolEventCollector {
 		let canonicalIdentity: CanonicalToolIdentity | undefined;
 		if (isOfficialToolCallEvent(event)) {
 			toolName = event.toolName;
-			toolCallId = event.toolCallId;
+			toolCallId = boundedIdentifier(event.toolCallId);
 			input = event.input;
 		} else {
 			// Legacy synthetic events are isolated to internal fixtures and verification recording.
 			toolName = String(event.toolName ?? "");
-			toolCallId = String(event.toolCallId ?? `${toolName}-${Date.now()}`);
+			toolCallId = boundedIdentifier(String(event.toolCallId ?? `${toolName}-${Date.now()}`));
 			serverName = event.serverName ? String(event.serverName) : undefined;
 			input = event.params ?? {};
 		}
 
 		const classified = classifyToolCallEvent(event);
 		if (classified.kind === "invalid_xdev") {
-			this.recordInvalidXdev(classified.toolCallId, classified.reason, context);
+			this.recordInvalidXdev(boundedIdentifier(classified.toolCallId), classified.reason, context);
 			return;
 		}
 		if (classified.kind === "valid") {
 			const unwrapped = classified.event;
-			const dedupeKey = this.dedupeKey(unwrapped.correlationId, unwrapped.identity);
-			const aliasKey = this.aliasKey(unwrapped.toolCallId, unwrapped.identity);
-			if (this.retired.has(this.retiredDedupeKey(dedupeKey)) || this.retired.has(this.retiredAliasKey(aliasKey))) {
+			const observedId = boundedIdentifier(unwrapped.toolCallId);
+			const correlationId = boundedIdentifier(unwrapped.correlationId);
+			const dedupeKey = this.dedupeKey(correlationId, unwrapped.identity);
+			const observedDedupeKey = this.dedupeKey(observedId, unwrapped.identity);
+			const aliasKey = this.aliasKey(observedId, unwrapped.identity);
+			if (
+				this.retired.has(this.retiredDedupeKey(dedupeKey)) ||
+				this.retired.has(this.retiredDedupeKey(observedDedupeKey)) ||
+				this.retired.has(this.retiredAliasKey(aliasKey))
+			) {
 				return;
 			}
 			const existingId = this.canonicalCallIds.get(dedupeKey);
 			if (existingId) {
+				this.setCanonicalMapping(observedDedupeKey, existingId);
 				this.setAlias(aliasKey, existingId);
-				if (unwrapped.toolCallId !== existingId) this.setRawAlias(unwrapped.toolCallId, existingId);
+				if (observedId !== existingId) this.setRawAlias(observedId, existingId);
 				return;
 			}
-			toolCallId = this.availableStorageId(unwrapped.correlationId, unwrapped.identity.argsFingerprint);
+			toolCallId = this.availableStorageId(correlationId, unwrapped.identity.argsFingerprint);
 			toolName = unwrapped.identity.toolName;
 			serverName = "codebase-memory";
 			input = unwrapped.identity.args;
 			canonicalIdentity = unwrapped.identity;
-			this.canonicalCallIds.set(dedupeKey, toolCallId);
+			this.setCanonicalMapping(dedupeKey, toolCallId);
+			this.setCanonicalMapping(observedDedupeKey, toolCallId);
 			this.setAlias(aliasKey, toolCallId);
-			if (unwrapped.toolCallId !== toolCallId) this.setRawAlias(unwrapped.toolCallId, toolCallId);
+			if (observedId !== toolCallId) this.setRawAlias(observedId, toolCallId);
 		} else if (this.isXdevCandidate(toolName, input)) {
 			return;
 		}
@@ -299,56 +316,59 @@ export class ToolEventCollector {
 		let toolCallId: string;
 		let isError: boolean;
 		if (isOfficialToolResultEvent(event)) {
-			toolCallId = event.toolCallId;
+			toolCallId = boundedIdentifier(event.toolCallId);
 			isError = event.isError;
 		} else {
-			toolCallId = String(event.toolCallId ?? "");
+			toolCallId = boundedIdentifier(String(event.toolCallId ?? ""));
 			isError = event.isError === true || event.success === false;
 		}
-		const existingStorageId = this.findExistingStorageId(toolCallId);
-		if (
-			!existingStorageId &&
-			(this.retired.has(this.retiredIdKey(toolCallId)) ||
-				this.retired.has(this.retiredAliasKey(this.rawAliasKey(toolCallId))))
-		) {
-			return;
-		}
-		const expectedCall = existingStorageId ? this.calls.get(existingStorageId) : undefined;
-
 		let identity: CanonicalToolIdentity | undefined;
-		if (isOfficialToolResultEvent(event) && this.isXdevCandidate(event.toolName, event.input)) {
-			const classified = classifyToolResultEvent(event, expectedCall?.qualifiedName);
-			if (classified.kind === "invalid_xdev") {
-				this.recordInvalidXdev(toolCallId, classified.reason, undefined, existingStorageId);
-				return;
+		let storageId: string | undefined;
+		if (isOfficialToolResultEvent(event)) {
+			const callClassification = classifyToolCallEvent({ ...event, type: "tool_call" });
+			if (callClassification.kind === "valid") {
+				identity = callClassification.event.identity;
+				const resultDedupeKey = this.dedupeKey(toolCallId, identity);
+				if (this.retired.has(this.retiredDedupeKey(resultDedupeKey))) return;
+				storageId = this.canonicalCallIds.get(resultDedupeKey);
+				if (!storageId) {
+					this.recordCanonicalMismatch(toolCallId, identity);
+					return;
+				}
+				const expectedCall = this.calls.get(storageId);
+				if (!expectedCall) return;
+				if (identity.qualifiedName !== expectedCall.qualifiedName) {
+					this.recordInvalidXdev(toolCallId, "tool_mismatch", undefined, storageId);
+					return;
+				}
+				if (identity.argsFingerprint !== expectedCall.argsFingerprint) {
+					this.recordInvalidXdev(toolCallId, "args_mismatch", undefined, storageId);
+					return;
+				}
+				if (identity.transport === "xdev") {
+					const resultClassification = classifyToolResultEvent(event, expectedCall.qualifiedName);
+					if (resultClassification.kind === "invalid_xdev") {
+						this.recordInvalidXdev(toolCallId, resultClassification.reason, undefined, storageId);
+						return;
+					}
+					if (resultClassification.kind !== "valid") return;
+				}
+			} else {
+				// Official non-canonical tools may only correlate by their exact bounded id.
+				storageId = this.calls.has(toolCallId) ? toolCallId : undefined;
 			}
-			if (classified.kind === "ignored") return;
-			identity = classified.event.identity;
-			if (expectedCall?.qualifiedName && identity.qualifiedName !== expectedCall.qualifiedName) {
-				this.recordInvalidXdev(toolCallId, "tool_mismatch", undefined, existingStorageId);
-				return;
-			}
-			if (expectedCall?.argsFingerprint && identity.argsFingerprint !== expectedCall.argsFingerprint) {
-				this.recordInvalidXdev(toolCallId, "args_mismatch", undefined, existingStorageId);
-				return;
-			}
-		} else if (isOfficialToolResultEvent(event)) {
-			const classified = classifyToolCallEvent({ ...event, type: "tool_call" });
-			if (classified.kind === "valid") identity = classified.event.identity;
+		} else {
+			// Alias fallback is reserved for legacy synthetic fixtures without identity metadata.
+			storageId = this.findLegacyStorageId(toolCallId);
 		}
-
-		const resolvedId =
-			existingStorageId ??
-			(identity
-				? this.resolveStorageId(toolCallId, identity)
-				: (this.callAliases.get(this.rawAliasKey(toolCallId)) ?? toolCallId));
+		if (!storageId) return;
 		if (
-			this.retired.has(this.retiredIdKey(resolvedId)) ||
+			this.retired.has(this.retiredIdKey(storageId)) ||
 			this.retired.has(this.retiredAliasKey(this.rawAliasKey(toolCallId)))
 		) {
 			return;
 		}
-		toolCallId = resolvedId;
+		toolCallId = storageId;
 		const ref = this.extractResultRef(event);
 		const details = this.extractStructuredDetails(event);
 
@@ -410,52 +430,79 @@ export class ToolEventCollector {
 	}
 
 	private dedupeKey(correlationId: string, identity: CanonicalToolIdentity): string {
-		return `${correlationId}\u0000${identity.qualifiedName}\u0000${identity.argsFingerprint}`;
-	}
-
-	private aliasKey(toolCallId: string, identity: CanonicalToolIdentity): string {
-		return `${toolCallId}\u0000${identity.qualifiedName}\u0000${identity.argsFingerprint}`;
-	}
-
-	private rawAliasKey(toolCallId: string): string {
-		return `raw:${toolCallId}`;
-	}
-
-	private retiredDedupeKey(key: string): string {
-		return `dedupe:${key}`;
-	}
-
-	private retiredAliasKey(key: string): string {
-		return `alias:${key}`;
-	}
-
-	private retiredIdKey(key: string): string {
-		return `id:${key}`;
-	}
-
-	private availableStorageId(correlationId: string, fingerprint: string): string {
-		if (!this.calls.has(correlationId)) return correlationId;
-		const base = `${correlationId}#${fingerprint.slice("sha256:".length, "sha256:".length + 12)}`;
-		let candidate = base;
-		let suffix = 1;
-		while (this.calls.has(candidate)) candidate = `${base}-${suffix++}`;
-		return candidate;
-	}
-
-	private resolveStorageId(toolCallId: string, identity: CanonicalToolIdentity): string {
-		const aliasKey = this.aliasKey(toolCallId, identity);
-		return (
-			this.callAliases.get(aliasKey) ??
-			this.canonicalCallIds.get(this.dedupeKey(toolCallId, identity)) ??
-			this.callAliases.get(this.rawAliasKey(toolCallId)) ??
-			toolCallId
+		return boundedIdentifier(
+			`${boundedIdentifier(correlationId)}\u0000${identity.qualifiedName}\u0000${identity.argsFingerprint}`,
 		);
 	}
 
-	private findExistingStorageId(toolCallId: string): string | undefined {
+	private aliasKey(toolCallId: string, identity: CanonicalToolIdentity): string {
+		return boundedIdentifier(
+			`${boundedIdentifier(toolCallId)}\u0000${identity.qualifiedName}\u0000${identity.argsFingerprint}`,
+		);
+	}
+
+	private rawAliasKey(toolCallId: string): string {
+		return boundedIdentifier(`raw:${boundedIdentifier(toolCallId)}`);
+	}
+
+	private retiredDedupeKey(key: string): string {
+		return boundedIdentifier(`dedupe:${boundedIdentifier(key)}`);
+	}
+
+	private retiredAliasKey(key: string): string {
+		return boundedIdentifier(`alias:${boundedIdentifier(key)}`);
+	}
+
+	private retiredIdKey(key: string): string {
+		return boundedIdentifier(`id:${boundedIdentifier(key)}`);
+	}
+
+	private availableStorageId(correlationId: string, fingerprint: string): string {
+		const boundedCorrelationId = boundedIdentifier(correlationId);
+		if (!this.calls.has(boundedCorrelationId) && !this.retired.has(this.retiredIdKey(boundedCorrelationId))) {
+			return boundedCorrelationId;
+		}
+		for (let counter = 0; ; counter++) {
+			const digest = createHash("sha256")
+				.update(boundedCorrelationId, "utf8")
+				.update("\u0000")
+				.update(fingerprint, "utf8")
+				.update("\u0000")
+				.update(String(counter), "utf8")
+				.digest("hex");
+			const candidate = `call:sha256:${digest}`;
+			if (!this.calls.has(candidate) && !this.retired.has(this.retiredIdKey(candidate))) return candidate;
+		}
+	}
+
+	private findLegacyStorageId(toolCallId: string): string | undefined {
 		const aliased = this.callAliases.get(this.rawAliasKey(toolCallId));
 		if (aliased && this.calls.has(aliased)) return aliased;
 		return this.calls.has(toolCallId) ? toolCallId : undefined;
+	}
+
+	private recordCanonicalMismatch(toolCallId: string, identity: CanonicalToolIdentity): void {
+		const rawCall = this.calls.get(boundedIdentifier(toolCallId));
+		if (!rawCall?.qualifiedName || !rawCall.argsFingerprint) return;
+		const reason: InvalidXdevReason =
+			rawCall.qualifiedName === identity.qualifiedName ? "args_mismatch" : "tool_mismatch";
+		this.recordInvalidXdev(toolCallId, reason, undefined, rawCall.toolCallId);
+	}
+
+	private setCanonicalMapping(key: string, storageId: string): void {
+		const boundedKey = boundedIdentifier(key);
+		const boundedStorageId = boundedIdentifier(storageId);
+		this.canonicalCallIds.set(boundedKey, boundedStorageId);
+		while (this.canonicalCallIds.size > ToolEventCollector.MAX_RECORDS) {
+			const oldest = this.canonicalCallIds.keys().next().value;
+			if (oldest === undefined) break;
+			const oldestStorageId = this.canonicalCallIds.get(oldest);
+			if (oldestStorageId && this.calls.has(oldestStorageId)) this.evictCall(oldestStorageId);
+			else {
+				this.canonicalCallIds.delete(oldest);
+				this.retired.add(this.retiredDedupeKey(oldest));
+			}
+		}
 	}
 
 	private setAlias(key: string, storageId: string): void {
