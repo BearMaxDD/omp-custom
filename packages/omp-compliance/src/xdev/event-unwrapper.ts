@@ -56,11 +56,10 @@ function isXdevCandidate(event: ToolCallLike): boolean {
 	return isRecord(args) && typeof args.path === "string" && args.path.trim().toLowerCase().startsWith("xd://");
 }
 
-function isOfficialCodebaseCandidate(event: ToolCallLike, toolName: string): boolean {
-	if (event.type !== "tool_call") return false;
+function isTrustedCodebaseCandidate(event: ToolCallLike, toolName: string): boolean {
 	const serverName = stringField(event.serverName);
 	if (serverName !== undefined && !isTrustedCodebaseServerId(serverName)) return false;
-	if (codebaseToolAccess(toolName)) return true;
+	if (codebaseToolAccess(toolName)) return serverName !== undefined;
 	for (const prefix of ["mcp__codebase_memory_mcp__", "mcp__codebase_memory__"] as const) {
 		if (toolName.startsWith(prefix) && codebaseToolAccess(toolName.slice(prefix.length))) return true;
 	}
@@ -99,11 +98,10 @@ export function classifyToolCallEvent(event: ToolCallLike): ToolEventClassificat
 		toolName,
 		serverName: stringField(event.serverName),
 		args: eventArgs(event),
-		official: event.type === "tool_call",
 	});
 	if (!identity) {
 		if (
-			isOfficialCodebaseCandidate(event, toolName) &&
+			isTrustedCodebaseCandidate(event, toolName) &&
 			isRecord(eventArgs(event)) &&
 			canonicalArgsFingerprint(eventArgs(event)) === null
 		) {

@@ -44,6 +44,8 @@ export interface ToolResultRecord {
 	success: boolean;
 	/** A reference or truncated representation of the result payload. */
 	resultRef: string;
+	/** Whether the result came from the official v17 event API or a controlled legacy fixture. */
+	source?: "official" | "legacy";
 	/** Bounded JSON-safe structured result details retained for downstream normalizers. */
 	details?: Record<string, unknown>;
 	/** True when structured details were clipped, summarized, or could not be traversed completely. */

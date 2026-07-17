@@ -21,7 +21,6 @@ export interface ToolIdentityInput {
 	toolName: string;
 	serverName?: string;
 	args: unknown;
-	official?: boolean;
 }
 
 const HELP_CONTENT_RE = /^(?:|\?|help|describe)$/i;
@@ -158,12 +157,6 @@ export function canonicalizeToolIdentity(input: ToolIdentityInput): CanonicalToo
 		return identity("mcp", mcp.toolName, input.args);
 	}
 
-	if (input.serverName !== undefined) {
-		if (!isTrustedCodebaseServerId(input.serverName)) return null;
-	} else if (!input.official) {
-		return null;
-	}
-	// The v17 official event shape is the trust boundary for unqualified direct names.
-	// Synthetic events must still provide an exact trusted server id.
+	if (!input.serverName || !isTrustedCodebaseServerId(input.serverName)) return null;
 	return identity("direct", input.toolName, input.args);
 }

@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it } from "bun:test";
-import type { ToolCallEvent, ToolResultEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type {
+	ExtensionContext,
+	ToolCallEvent,
+	ToolResultEvent,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { ToolEventCollector } from "../../src/signals/tool-event-collector";
 
 /** Build a minimal tool_call event shape. */
@@ -16,7 +20,7 @@ function makeCall(toolName: string, params: Record<string, unknown> = {}, toolCa
 function makeResult(toolCallId: string, result: unknown, isError = false): ToolResultEvent {
 	return {
 		type: "tool_result",
-		toolName: "test-tool",
+		toolName: "bash",
 		toolCallId,
 		input: {},
 		isError,
@@ -263,7 +267,7 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 		expect(snap.codebaseMemory.references).toEqual([]);
 	});
 
-	it("正式 v17 短名 Codebase 事件无需 serverName 即规范为可信 direct 调用", () => {
+	it("正式 v17 短名 Codebase spoof 不形成 canonical Evidence", () => {
 		collector.recordCall(makeCall("search_graph", { query: "official-direct" }, "official-direct"));
 		collector.recordResult({
 			type: "tool_result",
@@ -278,10 +282,10 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 		const snap = collector.snapshot();
 		expect(snap.calls[0]).toMatchObject({
 			toolName: "search_graph",
-			serverName: "codebase-memory",
-			qualifiedName: "codebase-memory-mcp.search_graph",
 		});
-		expect(snap.codebaseMemory.references).toEqual(["packages/direct-official.ts"]);
+		expect(snap.calls[0].serverName).toBeUndefined();
+		expect(snap.calls[0].qualifiedName).toBeUndefined();
+		expect(snap.codebaseMemory).toEqual({ indexReady: false, queries: [], references: [] });
 	});
 
 	it("legacy synthetic 显式 evil server 不能伪装 direct Codebase 调用", () => {
@@ -297,22 +301,61 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 		expect(snap.codebaseMemory.queries).toEqual([]);
 	});
 
+	it.each(["official", "legacy"] as const)("%s 普通 result 工具名不匹配时不得按同 ID 关联", (source) => {
+		collector.recordCall(makeCall("task", { task: "do work" }, `tool-mismatch-${source}`));
+		if (source === "official") {
+			collector.recordResult({
+				type: "tool_result",
+				toolName: "bash",
+				toolCallId: `tool-mismatch-${source}`,
+				input: { command: "true" },
+				isError: false,
+				content: [{ type: "text", text: "ok" }],
+				details: { exitCode: 0 },
+			});
+		} else {
+			collector.recordResult({
+				toolName: "bash",
+				toolCallId: `tool-mismatch-${source}`,
+				success: true,
+				resultRef: '{"exitCode":0}',
+			});
+		}
+
+		const snap = collector.snapshot();
+		expect(snap.results).toEqual([]);
+		expect(snap.subagentDelegations).toEqual([
+			expect.objectContaining({ taskSummary: "do work", status: "insufficient" }),
+		]);
+	});
+
 	it.each(["direct", "mcp", "xdev"] as const)(
 		"%s 的 early beta result 不得改写同 raw ID 的 alpha call",
 		(transport) => {
 			const id = `early-${transport}`;
 			if (transport === "direct") {
-				collector.recordCall(makeCall("search_graph", { query: "alpha" }, id));
+				collector.recordCall({
+					toolName: "search_graph",
+					toolCallId: id,
+					serverName: "codebase-memory-mcp",
+					params: { query: "alpha" },
+				});
 				collector.recordResult({
 					type: "tool_result",
 					toolName: "search_graph",
 					toolCallId: id,
+					serverName: "codebase-memory-mcp",
 					input: { query: "beta" },
 					isError: false,
 					content: [{ type: "text", text: "packages/spoofed-early-direct.ts" }],
 					details: undefined,
+				} as ToolResultEvent & { serverName: string });
+				collector.recordCall({
+					toolName: "search_graph",
+					toolCallId: id,
+					serverName: "codebase-memory-mcp",
+					params: { query: "beta" },
 				});
-				collector.recordCall(makeCall("search_graph", { query: "beta" }, id));
 			} else if (transport === "mcp") {
 				collector.recordCall(makeCall("mcp__codebase_memory_mcp__search_graph", { query: "alpha" }, id));
 				collector.recordResult(makeMcpResult(id, "search_graph", { query: "beta" }, "packages/spoofed-early-mcp.ts"));
@@ -622,7 +665,9 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 		const hugeKey = "巨型参数键".repeat(512 * 1024);
 		const manyKeys = Object.fromEntries(Array.from({ length: 100_000 }, (_, index) => [`key-${index}`, index]));
 		collector.recordCall(makeCall("task", { [hugeKey]: "value", ...manyKeys }, "bounded-params"));
-		collector.recordCall(makeCall("search_graph", { payload: "x".repeat(65 * 1024) }, "oversized-canonical"));
+		collector.recordCall(
+			makeCall("mcp__codebase_memory_mcp__search_graph", { payload: "x".repeat(65 * 1024) }, "oversized-canonical"),
+		);
 
 		const snap = collector.snapshot();
 		const stored = snap.calls.find((call) => call.toolCallId === "bounded-params");
@@ -712,6 +757,51 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 			exitCode: 0,
 		});
 		expect(snap.subagentDelegations[0]).toMatchObject({ status: "insufficient", codebaseRefs: [] });
+	});
+
+	it("2MiB 长期字符串字段与 Map key 均保持固定字节预算", () => {
+		const huge = "超长字段".repeat(256 * 1024);
+		const context = {
+			cwd: huge,
+			sessionManager: { getSessionId: () => huge },
+		} as unknown as ExtensionContext;
+		collector.recordCall(
+			{
+				toolName: huge,
+				toolCallId: "bounded-metadata",
+				serverName: huge,
+				params: { value: huge },
+			},
+			context,
+		);
+		collector.recordResult({
+			toolName: huge,
+			toolCallId: "bounded-metadata",
+			success: true,
+			resultRef: huge,
+		});
+
+		const snap = collector.snapshot();
+		const call = snap.calls[0];
+		const result = snap.results[0];
+		expect(new TextEncoder().encode(call.toolName).byteLength).toBeLessThanOrEqual(256);
+		expect(new TextEncoder().encode(call.serverName ?? "").byteLength).toBeLessThanOrEqual(128);
+		expect(new TextEncoder().encode(call.cwd ?? "").byteLength).toBeLessThanOrEqual(1024);
+		expect(new TextEncoder().encode(call.sessionId ?? "").byteLength).toBeLessThanOrEqual(256);
+		expect(new TextEncoder().encode(result.resultRef).byteLength).toBeLessThanOrEqual(2048);
+		expect(new TextEncoder().encode(JSON.stringify(snap)).byteLength).toBeLessThan(32 * 1024);
+
+		const internals = collector as unknown as {
+			calls: Map<string, unknown>;
+			results: Map<string, unknown>;
+			canonicalCallIds: Map<string, string>;
+			callAliases: Map<string, string>;
+		};
+		for (const map of [internals.calls, internals.results, internals.canonicalCallIds, internals.callAliases]) {
+			for (const key of map.keys()) {
+				expect(new TextEncoder().encode(key).byteLength).toBeLessThanOrEqual(256);
+			}
+		}
 	});
 
 	it("reset 清空去重关联，后续相同 id 可重新记录", () => {

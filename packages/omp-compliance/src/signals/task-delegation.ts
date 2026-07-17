@@ -59,13 +59,16 @@ export function normalizeTaskDelegation(
 			continue;
 		}
 
-		if (result.detailsTruncated) {
+		if (result.detailsTruncated || (result.source === "official" && !isTaskToolDetails(result.details ?? {}))) {
 			results.push(emptyEvidence(call, result.detailsFailure ? "aborted" : "insufficient"));
 			continue;
 		}
 
-		// Structured v17 details are authoritative; resultRef is only a text fallback.
-		const details = { ...parseResultDetails(result.resultRef), ...result.details };
+		// Official v17 Task evidence is structured-only. Text fallback is legacy-fixture compatibility.
+		const details =
+			result.source === "official"
+				? (result.details ?? {})
+				: { ...parseResultDetails(result.resultRef), ...result.details };
 		if (isTaskToolDetails(details)) {
 			const asyncDetails = readRecord(details.async);
 			if (details.results.length === 0) {

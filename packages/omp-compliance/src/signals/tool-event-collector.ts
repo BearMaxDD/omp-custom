@@ -39,6 +39,7 @@ interface LegacySyntheticToolCallEvent {
 }
 
 interface LegacySyntheticToolResultEvent {
+	toolName?: unknown;
 	toolCallId?: unknown;
 	isError?: unknown;
 	error?: unknown;
@@ -97,6 +98,11 @@ const DETAILS_MAX_KEYS = 64;
 const DETAILS_MAX_ARRAY = 32;
 const DETAILS_MAX_STRING = 2 * 1024;
 const IDENTIFIER_MAX_BYTES = 256;
+const TOOL_NAME_MAX_BYTES = 256;
+const SERVER_NAME_MAX_BYTES = 128;
+const CWD_MAX_BYTES = 1024;
+const SESSION_ID_MAX_BYTES = 256;
+const RESULT_REF_MAX_BYTES = 2 * 1024;
 const FAILURE_SCAN_MAX_DEPTH = 32;
 const DETAILS_PRIORITY_KEYS = [
 	"results",
@@ -126,9 +132,37 @@ function utf8Length(value: string): number {
 	return Buffer.byteLength(value, "utf8");
 }
 
+function boundedHashedString(value: string, maxBytes: number, label: string): string {
+	if (utf8Length(value) <= maxBytes) return value;
+	return `${label}:sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
+}
+
+function boundedUtf8(value: string, maxBytes: number, label: string): string {
+	if (utf8Length(value) <= maxBytes) return value;
+	const digest = createHash("sha256").update(value, "utf8").digest("hex");
+	const marker = `...[${label}:sha256:${digest}]`;
+	const prefixBudget = maxBytes - utf8Length(marker);
+	let prefix = "";
+	let used = 0;
+	for (const character of value) {
+		const bytes = utf8Length(character);
+		if (used + bytes > prefixBudget) break;
+		prefix += character;
+		used += bytes;
+	}
+	return `${prefix}${marker}`;
+}
+
 function boundedIdentifier(value: string): string {
-	if (utf8Length(value) <= IDENTIFIER_MAX_BYTES) return value;
-	return `id:sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
+	return boundedHashedString(value, IDENTIFIER_MAX_BYTES, "id");
+}
+
+function boundedToolName(value: string): string {
+	return boundedHashedString(value, TOOL_NAME_MAX_BYTES, "tool");
+}
+
+function boundedServerName(value: string): string {
+	return boundedHashedString(value, SERVER_NAME_MAX_BYTES, "server");
 }
 
 interface SanitizeState {
@@ -352,7 +386,13 @@ export class ToolEventCollector {
 
 		const classified = classifyToolCallEvent(event);
 		if (classified.kind === "invalid_xdev") {
-			this.recordInvalidXdev(boundedIdentifier(classified.toolCallId), classified.reason, context);
+			this.recordInvalidXdev(
+				boundedIdentifier(classified.toolCallId),
+				classified.reason,
+				context,
+				undefined,
+				isOfficialToolCallEvent(event) ? "official" : "legacy",
+			);
 			return;
 		}
 		if (classified.kind === "valid") {
@@ -388,6 +428,12 @@ export class ToolEventCollector {
 		} else if (this.isXdevCandidate(toolName, input)) {
 			return;
 		}
+		toolName = boundedToolName(toolName);
+		serverName = serverName === undefined ? undefined : boundedServerName(serverName);
+		const cwd = context?.cwd === undefined ? undefined : boundedUtf8(context.cwd, CWD_MAX_BYTES, "cwd");
+		const rawSessionId = context?.sessionManager.getSessionId();
+		const sessionId =
+			rawSessionId === undefined ? undefined : boundedHashedString(rawSessionId, SESSION_ID_MAX_BYTES, "session");
 
 		this.calls.set(toolCallId, {
 			toolName,
@@ -396,8 +442,8 @@ export class ToolEventCollector {
 			qualifiedName: canonicalIdentity?.qualifiedName,
 			argsFingerprint: canonicalIdentity?.argsFingerprint,
 			params: this.truncateParams(input),
-			cwd: context?.cwd,
-			sessionId: context?.sessionManager.getSessionId(),
+			cwd,
+			sessionId,
 			timestamp: new Date().toISOString(),
 		});
 		this.enforceCallLimit();
@@ -413,12 +459,17 @@ export class ToolEventCollector {
 	recordResult(event: ToolResultEvent | LegacySyntheticToolResultEvent, _context?: ExtensionContext): void {
 		let toolCallId: string;
 		let isError: boolean;
+		let resultToolName: string | undefined;
+		const source = isOfficialToolResultEvent(event) ? "official" : "legacy";
 		if (isOfficialToolResultEvent(event)) {
 			toolCallId = boundedIdentifier(event.toolCallId);
 			isError = event.isError;
+			resultToolName = boundedToolName(event.toolName);
 		} else {
 			toolCallId = boundedIdentifier(String(event.toolCallId ?? ""));
 			isError = event.isError === true || event.success === false;
+			resultToolName =
+				typeof event.toolName === "string" && event.toolName.length > 0 ? boundedToolName(event.toolName) : undefined;
 		}
 		let identity: CanonicalToolIdentity | undefined;
 		let storageId: string | undefined;
@@ -436,17 +487,17 @@ export class ToolEventCollector {
 				const expectedCall = this.calls.get(storageId);
 				if (!expectedCall) return;
 				if (identity.qualifiedName !== expectedCall.qualifiedName) {
-					this.recordInvalidXdev(toolCallId, "tool_mismatch", undefined, storageId);
+					this.recordInvalidXdev(toolCallId, "tool_mismatch", undefined, storageId, "official");
 					return;
 				}
 				if (identity.argsFingerprint !== expectedCall.argsFingerprint) {
-					this.recordInvalidXdev(toolCallId, "args_mismatch", undefined, storageId);
+					this.recordInvalidXdev(toolCallId, "args_mismatch", undefined, storageId, "official");
 					return;
 				}
 				if (identity.transport === "xdev") {
 					const resultClassification = classifyToolResultEvent(event, expectedCall.qualifiedName);
 					if (resultClassification.kind === "invalid_xdev") {
-						this.recordInvalidXdev(toolCallId, resultClassification.reason, undefined, storageId);
+						this.recordInvalidXdev(toolCallId, resultClassification.reason, undefined, storageId, "official");
 						return;
 					}
 					if (resultClassification.kind !== "valid") return;
@@ -454,7 +505,8 @@ export class ToolEventCollector {
 			} else {
 				// Official non-canonical tools may only correlate by their exact bounded id.
 				const exactCall = this.calls.get(toolCallId);
-				storageId = exactCall && !exactCall.qualifiedName ? toolCallId : undefined;
+				storageId =
+					exactCall && !exactCall.qualifiedName && resultToolName === exactCall.toolName ? toolCallId : undefined;
 			}
 		} else {
 			// Alias fallback is reserved for legacy synthetic fixtures without identity metadata.
@@ -467,6 +519,9 @@ export class ToolEventCollector {
 			storageId = this.findLegacyStorageId(toolCallId);
 		}
 		if (!storageId) return;
+		const expectedCall = this.calls.get(storageId);
+		if (!expectedCall) return;
+		if (!identity && resultToolName !== undefined && resultToolName !== expectedCall.toolName) return;
 		if (
 			this.retired.has(this.retiredIdKey(storageId)) ||
 			this.retired.has(this.retiredAliasKey(this.rawAliasKey(toolCallId)))
@@ -481,6 +536,7 @@ export class ToolEventCollector {
 			toolCallId,
 			success: !isError,
 			resultRef: ref,
+			source,
 			details: detailSummary.details,
 			detailsTruncated: detailSummary.truncated,
 			detailsFailure: detailSummary.failure,
@@ -594,7 +650,7 @@ export class ToolEventCollector {
 		const reason: InvalidXdevReason =
 			rawCall.qualifiedName === identity.qualifiedName ? "args_mismatch" : "tool_mismatch";
 		// Exact canonical misses never mutate the raw-id call. Keep diagnostics separate.
-		this.recordInvalidXdev(toolCallId, reason);
+		this.recordInvalidXdev(toolCallId, reason, undefined, undefined, "official");
 	}
 
 	private setCanonicalMapping(key: string, storageId: string): void {
@@ -679,21 +735,27 @@ export class ToolEventCollector {
 		reason: InvalidXdevReason,
 		context?: ExtensionContext,
 		existingStorageId?: string,
+		source: "official" | "legacy" = "legacy",
 	): void {
 		const storageId = existingStorageId ?? this.availableStorageId(toolCallId, reason);
 		if (existingStorageId) this.removeIndexesForStorage(existingStorageId, true);
+		const cwd = context?.cwd === undefined ? undefined : boundedUtf8(context.cwd, CWD_MAX_BYTES, "cwd");
+		const rawSessionId = context?.sessionManager.getSessionId();
+		const sessionId =
+			rawSessionId === undefined ? undefined : boundedHashedString(rawSessionId, SESSION_ID_MAX_BYTES, "session");
 		this.calls.set(storageId, {
 			toolName: "invalid_xdev_event",
 			toolCallId: storageId,
 			params: { reason },
-			cwd: context?.cwd,
-			sessionId: context?.sessionManager.getSessionId(),
+			cwd,
+			sessionId,
 			timestamp: new Date().toISOString(),
 		});
 		this.results.set(storageId, {
 			toolCallId: storageId,
 			success: false,
 			resultRef: reason,
+			source,
 			details: { reason },
 			timestamp: new Date().toISOString(),
 		});
@@ -769,24 +831,24 @@ export class ToolEventCollector {
 				.filter((item) => item.type === "text")
 				.map((item) => item.text)
 				.join("\n");
-			if (text) return text.length > 200 ? `${text.slice(0, 200)}…` : text;
+			if (text) return boundedUtf8(text, RESULT_REF_MAX_BYTES, "result");
 			try {
 				const json = JSON.stringify(event.details ?? event) ?? "[undefined]";
-				return json.length > 200 ? `${json.slice(0, 200)}…` : json;
+				return boundedUtf8(json, RESULT_REF_MAX_BYTES, "result");
 			} catch {
 				return "[unserializable]";
 			}
 		}
-		if (typeof event.resultRef === "string") return event.resultRef;
+		if (typeof event.resultRef === "string") return boundedUtf8(event.resultRef, RESULT_REF_MAX_BYTES, "result");
 		if (typeof event.content === "string") {
-			return event.content.length > 200 ? `${event.content.slice(0, 200)}…` : event.content;
+			return boundedUtf8(event.content, RESULT_REF_MAX_BYTES, "result");
 		}
 		if (typeof event.output === "string") {
-			return event.output.length > 200 ? `${event.output.slice(0, 200)}…` : event.output;
+			return boundedUtf8(event.output, RESULT_REF_MAX_BYTES, "result");
 		}
 		try {
 			const json = JSON.stringify(event.result ?? event) ?? "[undefined]";
-			return json.length > 200 ? `${json.slice(0, 200)}…` : json;
+			return boundedUtf8(json, RESULT_REF_MAX_BYTES, "result");
 		} catch {
 			return "[unserializable]";
 		}
