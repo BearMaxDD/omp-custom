@@ -16,7 +16,7 @@ export interface ProjectContext {
 	readonly cwd: string;
 }
 
-const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const PROJECT_CONTEXT_INVALID_ERROR = "OMP project context is invalid";
 
 export function createProjectContext(
@@ -71,7 +71,7 @@ export function createProjectContext(
 }
 
 function isUuid(value: unknown): value is string {
-	return typeof value === "string" && UUID_V4.test(value);
+	return typeof value === "string" && SESSION_UUID.test(value);
 }
 
 function canonicalPath(value: unknown): string {

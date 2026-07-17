@@ -12,7 +12,9 @@ import {
 	mkdirSync,
 	openSync,
 	readFileSync,
+	readdirSync,
 	realpathSync,
+	renameSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
@@ -44,15 +46,14 @@ export interface ProjectIdentityOpenOptions {
 }
 
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const LOCK_WAIT_MS = 5_000;
-const LOCK_RECOVERY_GRACE_MS = 1_000;
-const LOCK_OWNER_LEASE_MS = 30_000;
-const LOCK_TIMESTAMP_TOLERANCE_MS = 5_000;
+const PUBLISH_WAIT_MS = 5_000;
+const PUBLISH_RECOVERY_GRACE_MS = 1_000;
+const PUBLISH_OWNER_LEASE_MS = 30_000;
+const PUBLISH_TIMESTAMP_TOLERANCE_MS = 5_000;
 const MAX_PROBEABLE_PID = 2_147_483_647;
 const REMOTE_IDENTITY_PREFIX = "git-remote:v1://";
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
 const SLEEP_BUFFER = new Int32Array(new SharedArrayBuffer(4));
-let LOCK_WAIT_OBSERVER_FOR_TESTS: (() => void) | undefined;
 const PROJECT_IDENTITY_RESULTS = new WeakSet<object>();
 const BINDING_KEYS = new Set([
 	"schemaVersion",
@@ -82,14 +83,14 @@ const REDIRECTING_GIT_ENVIRONMENT_KEYS = new Set([
 	"GIT_CONFIG_COUNT",
 ]);
 
-interface LockOwner {
+interface PublishOwner {
 	readonly token: string;
 	readonly pid: number;
 	readonly createdAt: string;
 }
 
-interface LockSnapshot extends FileIdentity {
-	readonly owner?: LockOwner;
+interface PublishMarkerSnapshot extends FileIdentity {
+	readonly owner?: PublishOwner;
 }
 
 interface FileNodeIdentity {
@@ -122,7 +123,7 @@ interface GitCommandResult {
 }
 
 type ProcessState = "alive" | "dead" | "unknown";
-type LockOwnerState = "current" | "stale" | "unknown";
+type PublishOwnerState = "current" | "stale" | "unknown";
 
 // biome-ignore lint/complexity/noStaticOnlyClass: The plan specifies a named ProjectIdentityStore.open boundary.
 export class ProjectIdentityStore {
@@ -154,8 +155,11 @@ export class ProjectIdentityStore {
 }
 
 function readPublishedBindingIfPresent(filePath: string): Readonly<ProjectBinding> | undefined {
-	const lockPath = join(dirname(filePath), ".project.lock");
-	return isPublicationComplete(lockPath, filePath) ? readProjectBindingIfPresent(filePath) : undefined;
+	const directory = dirname(filePath);
+	if (!pathExists(directory)) return undefined;
+	const storageIdentity = captureStorageIdentityForFile(filePath);
+	waitForActivePublishers(directory, storageIdentity);
+	return readProjectBindingIfPresent(filePath);
 }
 
 function isProjectIdentityError(error: unknown): error is Error {
@@ -164,10 +168,6 @@ function isProjectIdentityError(error: unknown): error is Error {
 
 export function isBoundProjectIdentityResult(value: unknown): value is ProjectIdentityResult {
 	return isRecord(value) && PROJECT_IDENTITY_RESULTS.has(value) && value.status === "bound";
-}
-
-export function setProjectIdentityLockWaitObserverForTests(observer: (() => void) | undefined): void {
-	LOCK_WAIT_OBSERVER_FOR_TESTS = observer;
 }
 
 function canonicalPath(path: string): string {
@@ -403,151 +403,129 @@ function createBindingAtomically(
 	codebaseProjectId: string | undefined,
 ): Readonly<ProjectBinding> {
 	const directory = join(canonicalRoot, ".omp", "compliance");
-	const lockPath = join(directory, ".project.lock");
 	prepareStorageDirectory(canonicalRoot);
 	const storageIdentity = captureStorageIdentity(canonicalRoot);
 	assertStoragePathSafe(canonicalRoot);
-	const lockOwner = acquireLock(lockPath, filePath, canonicalRoot, storageIdentity);
-	if (!lockOwner) {
-		const concurrentBinding = readProjectBindingIfPresent(filePath);
-		if (concurrentBinding) return concurrentBinding;
-		throw new Error("OMP project identity lock released without a durable binding");
-	}
-
+	const publication = createPublishMarker(directory, storageIdentity);
+	const temporaryPath = join(directory, `.project.${publication.owner.token}.tmp`);
+	const readyPath = join(directory, `.project.${publication.owner.token}.ready`);
+	let temporaryNode: FileNodeIdentity | undefined;
+	let published = false;
+	const binding = freezeBinding({
+		schemaVersion: 1,
+		projectId: randomUUID(),
+		canonicalRoot,
+		...(gitRemoteIdentity === undefined ? {} : { gitRemoteIdentity }),
+		...(codebaseProjectId === undefined ? {} : { codebaseProjectId }),
+		createdAt: new Date().toISOString(),
+	});
 	try {
-		const concurrentBinding = readProjectBindingIfPresent(filePath);
-		if (concurrentBinding) return concurrentBinding;
-
-		const binding = freezeBinding({
-			schemaVersion: 1,
-			projectId: randomUUID(),
-			canonicalRoot,
-			...(gitRemoteIdentity === undefined ? {} : { gitRemoteIdentity }),
-			...(codebaseProjectId === undefined ? {} : { codebaseProjectId }),
-			createdAt: new Date().toISOString(),
-		});
-		const temporaryPath = join(directory, `.project.${randomUUID()}.tmp`);
-		let publishedBinding = binding;
-		let temporaryNode: FileNodeIdentity | undefined;
-
+		assertStorageIdentity(storageIdentity);
+		const fd = openSync(temporaryPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | NO_FOLLOW, 0o600);
 		try {
+			const opened = fstatSync(fd, { bigint: true });
+			temporaryNode = Object.freeze({ dev: opened.dev, ino: opened.ino });
 			assertStorageIdentity(storageIdentity);
-			const fd = openSync(temporaryPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | NO_FOLLOW, 0o600);
-			try {
-				const opened = fstatSync(fd, { bigint: true });
-				temporaryNode = Object.freeze({ dev: opened.dev, ino: opened.ino });
-				assertStorageIdentity(storageIdentity);
-				writeFileSync(fd, `${JSON.stringify(binding, null, 2)}\n`, "utf8");
-				fsyncSync(fd);
-				assertStorageIdentity(storageIdentity);
-			} finally {
-				closeSync(fd);
-			}
-			const temporaryIdentity = captureRegularFileIdentity(temporaryPath, temporaryNode);
-			assertStorageIdentity(storageIdentity);
-			assertStoragePathSafe(canonicalRoot);
-			assertRegularFileIdentity(temporaryPath, temporaryIdentity);
-			let linked = false;
-			try {
-				linkSync(temporaryPath, filePath);
-				linked = true;
-			} catch (error) {
-				if (!isAlreadyExists(error)) throw error;
-				const competingBinding = readProjectBindingIfPresent(filePath);
-				if (!competingBinding) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
-				publishedBinding = competingBinding;
-			}
-			if (linked) {
-				const publishedIdentity = captureRegularFileIdentity(filePath, temporaryNode);
-				assertRegularFileIdentity(temporaryPath, publishedIdentity);
-			}
-			assertStorageIdentity(storageIdentity);
-			fsyncDirectory(directory, storageIdentity.compliance);
+			writeFileSync(fd, `${JSON.stringify(binding, null, 2)}\n`, "utf8");
+			fsyncSync(fd);
 			assertStorageIdentity(storageIdentity);
 		} finally {
-			if (temporaryNode) removeFileNodeIfUnchanged(temporaryPath, temporaryNode);
+			closeSync(fd);
 		}
-
-		return publishedBinding;
-	} finally {
-		removeLockIfOwned(lockPath, lockOwner.token);
-	}
-}
-
-function acquireLock(
-	lockPath: string,
-	filePath: string,
-	canonicalRoot: string,
-	storageIdentity: StorageIdentity,
-): LockOwner | undefined {
-	const deadline = Date.now() + LOCK_WAIT_MS;
-	while (true) {
+		const temporaryIdentity = captureRegularFileIdentity(temporaryPath, temporaryNode);
 		assertStorageIdentity(storageIdentity);
 		assertStoragePathSafe(canonicalRoot);
-		if (isPublicationComplete(lockPath, filePath)) return undefined;
-		const owner = Object.freeze({ token: randomUUID(), pid: process.pid, createdAt: new Date().toISOString() });
-		let createdLock = false;
+		assertRegularFileIdentity(temporaryPath, temporaryIdentity);
+		renameSync(temporaryPath, readyPath);
+		captureRegularFileIdentity(readyPath, temporaryNode);
+		fsyncDirectory(directory, storageIdentity.compliance);
 		try {
-			const fd = openSync(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | NO_FOLLOW, 0o600);
-			createdLock = true;
+			linkSync(readyPath, filePath);
+			published = true;
+		} catch (error) {
+			if (!isAlreadyExists(error)) throw error;
+		}
+		if (published) {
+			const publishedIdentity = captureRegularFileIdentity(filePath, temporaryNode);
+			assertRegularFileIdentity(readyPath, publishedIdentity);
+		}
+		assertStorageIdentity(storageIdentity);
+		fsyncDirectory(directory, storageIdentity.compliance);
+		assertStorageIdentity(storageIdentity);
+	} finally {
+		if (temporaryNode) {
+			removeFileNodeIfUnchanged(temporaryPath, temporaryNode);
+			removeFileNodeIfUnchanged(readyPath, temporaryNode);
+		}
+		assertStorageIdentity(storageIdentity);
+		fsyncDirectory(directory, storageIdentity.compliance);
+		removeFileNodeIfUnchanged(publication.markerPath, publication.markerNode);
+		fsyncDirectory(directory, storageIdentity.compliance);
+	}
+
+	if (published) return binding;
+	waitForActivePublishers(directory, storageIdentity);
+	const competingBinding = readProjectBindingIfPresent(filePath);
+	if (competingBinding) return competingBinding;
+	throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
+}
+
+interface PublishAttempt {
+	readonly owner: PublishOwner;
+	readonly markerPath: string;
+	readonly markerNode: FileNodeIdentity;
+}
+
+function createPublishMarker(directory: string, storageIdentity: StorageIdentity): PublishAttempt {
+	while (true) {
+		const owner = Object.freeze({ token: randomUUID(), pid: process.pid, createdAt: new Date().toISOString() });
+		const markerPath = join(directory, `.project.publish.${owner.token}.json`);
+		let markerNode: FileNodeIdentity | undefined;
+		try {
+			const fd = openSync(markerPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | NO_FOLLOW, 0o600);
 			try {
+				const opened = fstatSync(fd, { bigint: true });
+				markerNode = Object.freeze({ dev: opened.dev, ino: opened.ino });
 				writeFileSync(fd, `${JSON.stringify(owner)}\n`, "utf8");
 				fsyncSync(fd);
 			} finally {
 				closeSync(fd);
 			}
 			assertStorageIdentity(storageIdentity);
-			if (bindingFileExists(filePath)) {
-				removeLockIfOwned(lockPath, owner.token);
-				return undefined;
-			}
-			return owner;
+			captureRegularFileIdentity(markerPath, markerNode);
+			fsyncDirectory(directory, storageIdentity.compliance);
+			return Object.freeze({ owner, markerPath, markerNode });
 		} catch (error) {
-			if (createdLock) {
-				removeLockIfOwned(lockPath, owner.token);
-				throw error;
-			}
-			if (!isAlreadyExists(error)) throw error;
-			const snapshot = readLockSnapshot(lockPath);
-			if (snapshot) {
-				const ageMs = Date.now() - nanosecondsToMilliseconds(snapshot.mtimeNs);
-				const ownerState = snapshot.owner ? probeLockOwner(snapshot.owner, snapshot) : undefined;
-				const recoverable =
-					(ownerState === undefined && ageMs >= LOCK_RECOVERY_GRACE_MS) ||
-					(ownerState === "stale" && ageMs >= LOCK_RECOVERY_GRACE_MS) ||
-					(ownerState === "unknown" && ageMs >= LOCK_OWNER_LEASE_MS);
-				if (recoverable && removeLockIfUnchanged(lockPath, snapshot)) {
-					continue;
-				}
-			}
-			if (Date.now() >= deadline) throw new Error("Timed out acquiring OMP project identity lock");
-			LOCK_WAIT_OBSERVER_FOR_TESTS?.();
-			Atomics.wait(SLEEP_BUFFER, 0, 0, 10);
+			if (isAlreadyExists(error)) continue;
+			if (markerNode) cleanupOwnedPublishMarker(markerPath, markerNode, directory, storageIdentity);
+			throw error;
 		}
 	}
 }
 
-function isPublicationComplete(lockPath: string, filePath: string): boolean {
-	if (pathExists(lockPath)) return false;
-	let identity: FileIdentity;
+function cleanupOwnedPublishMarker(
+	markerPath: string,
+	markerNode: FileNodeIdentity,
+	directory: string,
+	storageIdentity: StorageIdentity,
+): void {
 	try {
-		identity = captureExistingRegularFileIdentity(filePath);
-	} catch (error) {
-		if (isNotFound(error)) return false;
-		throw error;
+		removeFileNodeIfUnchanged(markerPath, markerNode);
+		fsyncDirectory(directory, storageIdentity.compliance);
+	} catch {
+		// Cleanup is best-effort and the inode check prevents removing a replacement marker.
 	}
-	if (pathExists(lockPath)) return false;
-	assertRegularFileIdentity(filePath, identity);
-	return true;
 }
 
-function bindingFileExists(filePath: string): boolean {
-	try {
-		captureExistingRegularFileIdentity(filePath);
-		return true;
-	} catch (error) {
-		if (isNotFound(error)) return false;
-		throw error;
+function waitForActivePublishers(directory: string, storageIdentity: StorageIdentity): void {
+	const deadline = Date.now() + PUBLISH_WAIT_MS;
+	while (true) {
+		assertStorageIdentity(storageIdentity);
+		const markerPaths = listPublishMarkerPaths(directory);
+		const active = markerPaths.some((markerPath) => isPublishMarkerActive(markerPath));
+		if (!active) return;
+		if (Date.now() >= deadline) throw new Error("Timed out waiting for OMP project identity publishers");
+		Atomics.wait(SLEEP_BUFFER, 0, 0, 10);
 	}
 }
 
@@ -705,7 +683,30 @@ function assertStoragePathSafe(canonicalRoot: string): void {
 	assertDirectoryNotLink(ompDirectory, true);
 	assertDirectoryNotLink(complianceDirectory, true);
 	assertRegularFileOrMissing(join(complianceDirectory, "project.json"));
-	assertRegularFileOrMissing(join(complianceDirectory, ".project.lock"));
+	if (pathExists(complianceDirectory)) listPublishMarkerPaths(complianceDirectory);
+}
+
+interface PublishMarkerPath {
+	readonly path: string;
+	readonly token: string;
+}
+
+function listPublishMarkerPaths(directory: string): PublishMarkerPath[] {
+	const markers: PublishMarkerPath[] = [];
+	for (const name of readdirSync(directory)) {
+		if (!name.startsWith(".project.")) continue;
+		const marker = name.match(
+			/^\.project\.publish\.([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/i,
+		);
+		const prepared = name.match(
+			/^\.project\.([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.(?:tmp|ready)$/i,
+		);
+		if (!marker && !prepared) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
+		const path = join(directory, name);
+		assertRegularFileOrMissing(path);
+		if (marker?.[1]) markers.push(Object.freeze({ path, token: marker[1] }));
+	}
+	return markers;
 }
 
 function assertDirectoryNotLink(path: string, allowMissing = false): void {
@@ -784,15 +785,13 @@ function removeFileNodeIfUnchanged(path: string, identity: FileNodeIdentity): vo
 	}
 }
 
-function readLockOwner(lockPath: string): LockOwner | undefined {
-	let fd: number | undefined;
+function parsePublishOwner(content: string, expectedToken: string): PublishOwner | undefined {
 	try {
-		fd = openSync(lockPath, constants.O_RDONLY | NO_FOLLOW);
-		const value = JSON.parse(readFileSync(fd, "utf8")) as unknown;
+		const value = JSON.parse(content) as unknown;
 		if (
 			!isRecord(value) ||
 			Object.keys(value).length !== 3 ||
-			!UUID_V4.test(typeof value.token === "string" ? value.token : "") ||
+			value.token !== expectedToken ||
 			!Number.isSafeInteger(value.pid) ||
 			(value.pid as number) <= 0 ||
 			(value.pid as number) > MAX_PROBEABLE_PID ||
@@ -803,17 +802,15 @@ function readLockOwner(lockPath: string): LockOwner | undefined {
 		return Object.freeze({ token: value.token as string, pid: value.pid as number, createdAt: value.createdAt });
 	} catch {
 		return undefined;
-	} finally {
-		if (fd !== undefined) closeSync(fd);
 	}
 }
 
-function readLockSnapshot(lockPath: string): LockSnapshot | undefined {
+function readPublishMarkerSnapshot(marker: PublishMarkerPath): PublishMarkerSnapshot | undefined {
 	try {
-		const before = lstatSync(lockPath, { bigint: true });
+		const before = lstatSync(marker.path, { bigint: true });
 		if (before.isSymbolicLink() || !before.isFile()) return undefined;
-		const owner = readLockOwner(lockPath);
-		const after = lstatSync(lockPath, { bigint: true });
+		const owner = parsePublishOwner(readFileNoFollow(marker.path, before, openSync), marker.token);
+		const after = lstatSync(marker.path, { bigint: true });
 		if (!sameFileIdentity(before, after)) return undefined;
 		return Object.freeze({
 			dev: after.dev,
@@ -828,15 +825,15 @@ function readLockSnapshot(lockPath: string): LockSnapshot | undefined {
 	}
 }
 
-function removeLockIfUnchanged(lockPath: string, snapshot: LockSnapshot): boolean {
-	try {
-		const current = lstatSync(lockPath, { bigint: true });
-		if (!sameFileIdentity(snapshot, current)) return false;
-		unlinkSync(lockPath);
-		return true;
-	} catch {
-		return false;
-	}
+function isPublishMarkerActive(marker: PublishMarkerPath): boolean {
+	const snapshot = readPublishMarkerSnapshot(marker);
+	if (!snapshot) return false;
+	const ageMs = Date.now() - nanosecondsToMilliseconds(snapshot.mtimeNs);
+	if (!snapshot.owner) return ageMs < PUBLISH_RECOVERY_GRACE_MS;
+	const ownerState = probePublishOwner(snapshot.owner, snapshot);
+	if (ownerState === "current") return true;
+	if (ownerState === "unknown") return ageMs < PUBLISH_OWNER_LEASE_MS;
+	return false;
 }
 
 function sameFileIdentity(
@@ -856,15 +853,16 @@ function nanosecondsToMilliseconds(value: bigint): number {
 	return Number(value / 1_000_000n);
 }
 
-function probeLockOwner(owner: LockOwner, snapshot: LockSnapshot): LockOwnerState {
+function probePublishOwner(owner: PublishOwner, snapshot: PublishMarkerSnapshot): PublishOwnerState {
 	const createdAt = Date.parse(owner.createdAt);
-	if (Math.abs(createdAt - nanosecondsToMilliseconds(snapshot.mtimeNs)) > LOCK_TIMESTAMP_TOLERANCE_MS) return "stale";
+	if (Math.abs(createdAt - nanosecondsToMilliseconds(snapshot.mtimeNs)) > PUBLISH_TIMESTAMP_TOLERANCE_MS)
+		return "stale";
 	const processState = probeProcess(owner.pid);
 	if (processState === "dead") return "stale";
 	if (processState === "unknown") return "unknown";
 	const processStartedAt = readProcessStartedAt(owner.pid);
 	if (processStartedAt === undefined) return "unknown";
-	return processStartedAt <= createdAt + LOCK_TIMESTAMP_TOLERANCE_MS ? "current" : "stale";
+	return processStartedAt <= createdAt + PUBLISH_TIMESTAMP_TOLERANCE_MS ? "current" : "stale";
 }
 
 function readProcessStartedAt(pid: number): number | undefined {
@@ -879,15 +877,6 @@ function readProcessStartedAt(pid: number): number | undefined {
 		return Number.isNaN(timestamp) ? undefined : timestamp;
 	} catch {
 		return undefined;
-	}
-}
-
-function removeLockIfOwned(lockPath: string, token: string): void {
-	try {
-		const snapshot = readLockSnapshot(lockPath);
-		if (snapshot?.owner?.token === token) removeLockIfUnchanged(lockPath, snapshot);
-	} catch {
-		// Lock cleanup is best-effort and must never remove another owner's lock.
 	}
 }
 
