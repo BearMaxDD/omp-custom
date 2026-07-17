@@ -45,8 +45,8 @@ function eventIdFor(record: EvidenceRecord): string {
 export class EvidenceStore {
 	private readonly repository: EvidenceRepository;
 
-	constructor(basePath: string) {
-		this.repository = new EvidenceRepository(basePath);
+	constructor(basePath: string, trustedRoot?: string) {
+		this.repository = new EvidenceRepository(basePath, trustedRoot);
 	}
 
 	pendingCount(_taskId?: string): number {

@@ -110,40 +110,29 @@ function assertComponent(component: string): void {
 	}
 }
 
-interface CanonicalRoot {
+interface CanonicalTrustedRoot {
 	path: string;
 	anchorDepth: number;
 	anchorDevice: bigint;
 	anchorInode: bigint;
 }
 
-function canonicalRoot(path: string): CanonicalRoot {
-	let existing = resolve(path);
-	const missing: string[] = [];
-	for (;;) {
-		try {
-			lstatSync(existing);
-			break;
-		} catch (error) {
-			if (
-				typeof error !== "object" ||
-				error === null ||
-				!("code" in error) ||
-				(error as { code?: unknown }).code !== "ENOENT"
-			) {
-				throw new SecureFsError("open_directory", undefined, error);
-			}
-			const parent = dirname(existing);
-			if (parent === existing) throw new SecureFsError("open_directory");
-			missing.unshift(basename(existing));
-			existing = parent;
-		}
+function canonicalTrustedRoot(path: string): CanonicalTrustedRoot {
+	const trustedRoot = resolve(path);
+	let canonicalExisting: string;
+	try {
+		lstatSync(trustedRoot);
+		canonicalExisting = realpathSync.native(trustedRoot);
+	} catch (error) {
+		throw new SecureFsError("open_directory", undefined, error);
 	}
-	const canonicalExisting = realpathSync.native(existing);
 	const identity = lstatSync(canonicalExisting, { bigint: true });
+	if (!identity.isDirectory()) {
+		throw new SecureFsError("open_directory", undefined, new Error("Trusted root is not a directory"));
+	}
 	const anchorDepth = canonicalExisting.slice(sep.length).split(sep).filter(Boolean).length;
 	return {
-		path: resolve(canonicalExisting, ...missing),
+		path: canonicalExisting,
 		anchorDepth,
 		anchorDevice: identity.dev,
 		anchorInode: identity.ino,
@@ -224,7 +213,7 @@ export class SecurePathScope {
 	private readonly anchorInode: bigint;
 
 	constructor(root: string, childDirectories: readonly string[] = []) {
-		const canonical = canonicalRoot(root);
+		const canonical = canonicalTrustedRoot(root);
 		const absoluteRoot = canonical.path;
 		if (!isAbsolute(absoluteRoot) || parse(absoluteRoot).root !== sep) {
 			throw new SecureFsError("open_directory", undefined, new Error("Secure root must be absolute"));
@@ -238,7 +227,9 @@ export class SecurePathScope {
 	}
 
 	static forFile(path: string): SecurePathScope {
-		return new SecurePathScope(dirname(resolve(path)));
+		const parent = dirname(resolve(path));
+		const trustedRoot = dirname(parent);
+		return parent === trustedRoot ? new SecurePathScope(parent) : new SecurePathScope(trustedRoot, [basename(parent)]);
 	}
 
 	withLockedFile<T>(

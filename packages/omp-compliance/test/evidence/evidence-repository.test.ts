@@ -25,6 +25,33 @@ afterEach(() => {
 });
 
 describe("EvidenceRepository", () => {
+	it.each([".omp", "compliance", "repository"] as const)("构造前预置 %s symlink 时失败关闭且不写入外部", (target) => {
+		const sandbox = temporaryRoot();
+		const projectRoot = join(sandbox, "project");
+		const outside = join(sandbox, "outside");
+		mkdirSync(projectRoot);
+		mkdirSync(outside);
+
+		let repositoryRoot: string;
+		if (target === ".omp") {
+			symlinkSync(outside, join(projectRoot, ".omp"), "dir");
+			repositoryRoot = join(projectRoot, ".omp", "compliance");
+		} else if (target === "compliance") {
+			mkdirSync(join(projectRoot, ".omp"));
+			symlinkSync(outside, join(projectRoot, ".omp", "compliance"), "dir");
+			repositoryRoot = join(projectRoot, ".omp", "compliance");
+		} else {
+			symlinkSync(outside, join(projectRoot, "repository"), "dir");
+			repositoryRoot = join(projectRoot, "repository");
+		}
+
+		const repository = new EvidenceRepository(repositoryRoot);
+		expect(() => repository.task("task-1").state.write({ status: "active", attempt: 1 })).toThrow(
+			EvidencePersistenceError,
+		);
+		expect(readdirSync(outside)).toEqual([]);
+	});
+
 	it("使用固定任务布局并在实际写入前不创建目录", () => {
 		const root = join(temporaryRoot(), "repository");
 		const repository = new EvidenceRepository(root);
@@ -47,6 +74,15 @@ describe("EvidenceRepository", () => {
 		expect(existsSync(task.paths.state)).toBe(true);
 		expect(existsSync(task.paths.contract)).toBe(false);
 		expect(existsSync(task.paths.reviews)).toBe(false);
+	});
+
+	it("兼容任意 basePath 时从最近已存在普通父目录锚定", () => {
+		const root = join(temporaryRoot(), "missing-parent", "repository");
+		const task = new EvidenceRepository(root).task("task-1");
+
+		expect(existsSync(root)).toBe(false);
+		task.state.write({ status: "active", attempt: 1 });
+		expect(existsSync(task.paths.state)).toBe(true);
 	});
 
 	it.each(["../escape", "task/child", "/absolute", "", ".", "..", "task\\child"])("拒绝不安全 taskId：%s", (taskId) => {

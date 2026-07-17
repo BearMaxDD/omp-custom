@@ -1,4 +1,5 @@
-import { join, resolve } from "node:path";
+import { lstatSync } from "node:fs";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { EventLog, type EvidenceEvent, EvidencePersistenceError } from "./event-log";
 import { SecurePathScope } from "./secure-fs";
 import { SnapshotStore } from "./snapshot-store";
@@ -29,6 +30,54 @@ function assertSafeTaskId(taskId: string): void {
 	}
 }
 
+interface RepositoryBoundary {
+	trustedRoot: string;
+	components: string[];
+}
+
+function nearestPlainDirectory(path: string): string {
+	let candidate = resolve(path);
+	for (;;) {
+		try {
+			const status = lstatSync(candidate);
+			if (status.isDirectory() && !status.isSymbolicLink()) return candidate;
+		} catch (error) {
+			if (
+				typeof error !== "object" ||
+				error === null ||
+				!("code" in error) ||
+				(error as { code?: unknown }).code !== "ENOENT"
+			) {
+				throw error;
+			}
+		}
+		const parent = dirname(candidate);
+		if (parent === candidate) throw new Error("No trusted Evidence parent directory exists");
+		candidate = parent;
+	}
+}
+
+function repositoryBoundary(root: string, trustedRoot?: string): RepositoryBoundary {
+	const repositoryRoot = resolve(root);
+	const standardProjectRoot =
+		dirname(repositoryRoot) !== repositoryRoot &&
+		basename(dirname(repositoryRoot)) === ".omp" &&
+		repositoryRoot === join(dirname(repositoryRoot), "compliance")
+			? dirname(dirname(repositoryRoot))
+			: undefined;
+	const anchor = resolve(trustedRoot ?? standardProjectRoot ?? nearestPlainDirectory(dirname(repositoryRoot)));
+	const pathFromAnchor = relative(anchor, repositoryRoot);
+	if (
+		!pathFromAnchor ||
+		pathFromAnchor === ".." ||
+		pathFromAnchor.startsWith(`..${sep}`) ||
+		pathFromAnchor.startsWith(sep)
+	) {
+		throw new Error("Evidence repository must be below its trusted root");
+	}
+	return { trustedRoot: anchor, components: pathFromAnchor.split(sep).filter(Boolean) };
+}
+
 export class EvidenceTaskRepository {
 	readonly paths: EvidenceTaskPaths;
 	readonly state: SnapshotStore;
@@ -40,11 +89,13 @@ export class EvidenceTaskRepository {
 	constructor(
 		root: string,
 		readonly taskId: string,
+		trustedRoot?: string,
 	) {
 		assertSafeTaskId(taskId);
 		const repositoryRoot = resolve(root);
 		const taskRoot = join(repositoryRoot, "tasks", taskId);
-		this.scope = new SecurePathScope(repositoryRoot, ["tasks", taskId]);
+		const boundary = repositoryBoundary(repositoryRoot, trustedRoot);
+		this.scope = new SecurePathScope(boundary.trustedRoot, [...boundary.components, "tasks", taskId]);
 		this.paths = {
 			root: taskRoot,
 			state: join(taskRoot, "state.json"),
@@ -76,13 +127,15 @@ export class EvidenceTaskRepository {
 
 export class EvidenceRepository {
 	readonly root: string;
+	private readonly trustedRoot?: string;
 
-	constructor(root: string) {
+	constructor(root: string, trustedRoot?: string) {
 		this.root = resolve(root);
+		this.trustedRoot = trustedRoot === undefined ? undefined : resolve(trustedRoot);
 	}
 
 	task(taskId: string): EvidenceTaskRepository {
 		assertSafeTaskId(taskId);
-		return new EvidenceTaskRepository(this.root, taskId);
+		return new EvidenceTaskRepository(this.root, taskId, this.trustedRoot);
 	}
 }
