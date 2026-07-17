@@ -58,12 +58,16 @@ export interface CodebaseMemoryEvidence {
 	params: Record<string, unknown>;
 	/** A reference to the original result artifact. */
 	resultRef: string;
+	/** Serializable structured result details from the v17 host event. */
+	details?: Record<string, unknown>;
 }
 
 /** Normalized evidence for one task (subagent) delegation. */
 export interface TaskDelegationEvidence {
 	/** The agent id assigned to the subtask, if available. */
 	agentId?: string;
+	/** The agent definition used by the host, kept separate from the run id. */
+	agent?: string;
 	/** A short summary or assignment string. */
 	taskSummary?: string;
 	/** The exit status: "completed", "aborted", or "insufficient". */

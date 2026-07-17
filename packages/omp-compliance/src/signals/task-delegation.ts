@@ -60,6 +60,41 @@ export function normalizeTaskDelegation(
 
 		// Structured v17 details are authoritative; resultRef is only a text fallback.
 		const details = { ...parseResultDetails(result.resultRef), ...result.details };
+		if (isTaskToolDetails(details)) {
+			const asyncState = readRecord(details.async)?.state;
+			if (asyncState === "running" || asyncState === "failed") {
+				results.push(emptyEvidence(call, asyncState === "failed" ? "aborted" : "insufficient"));
+				continue;
+			}
+
+			if (details.results.length === 0) {
+				results.push(emptyEvidence(call, "insufficient"));
+				continue;
+			}
+
+			const evidenceCount = results.length;
+			for (const value of details.results) {
+				const single = readRecord(value);
+				if (!single) continue;
+				const exitCode = toFiniteNumber(single.exitCode);
+				const aborted = single.aborted === true || hasNonEmptyString(single.error);
+				const outputArtifacts = collectOutputArtifacts(single, details.outputPaths);
+				const codebaseRefs = extractCodebaseRefs(`${outputArtifacts.join(" ")} ${safeStringify(single)}`);
+
+				results.push({
+					agentId: toOptionalString(single.id),
+					agent: toOptionalString(single.agent),
+					taskSummary: extractSingleResultSummary(single) ?? extractTaskSummary(call.params),
+					status: !aborted && exitCode === 0 ? "completed" : "aborted",
+					durationMs: toFiniteNumber(single.durationMs),
+					exitCode,
+					outputArtifacts,
+					codebaseRefs,
+				});
+			}
+			if (results.length === evidenceCount) results.push(emptyEvidence(call, "insufficient"));
+			continue;
+		}
 
 		const agentId = details.agentId ?? details.agent ?? call.params.agent ?? call.params.name;
 		const exitCode = details.exitCode ?? details.exit ?? details.code;
@@ -108,9 +143,17 @@ function parseResultDetails(ref: string): Record<string, unknown> {
 	}
 }
 
-function collectOutputArtifacts(details: Record<string, unknown>): string[] {
+function collectOutputArtifacts(details: Record<string, unknown>, sharedOutputs?: unknown): string[] {
 	const artifacts: string[] = [];
-	for (const value of [details.artifacts, details.outputs, details.output]) {
+	for (const value of [
+		details.artifacts,
+		details.outputs,
+		details.output,
+		details.outputPath,
+		details.patchPath,
+		details.branchName,
+		sharedOutputs,
+	]) {
 		if (Array.isArray(value)) {
 			artifacts.push(...value.map(String));
 		} else if (typeof value === "string") {
@@ -118,6 +161,55 @@ function collectOutputArtifacts(details: Record<string, unknown>): string[] {
 		}
 	}
 	return [...new Set(artifacts)];
+}
+
+function isTaskToolDetails(
+	details: Record<string, unknown>,
+): details is Record<string, unknown> & { results: unknown[] } {
+	return Array.isArray(details.results);
+}
+
+function readRecord(value: unknown): Record<string, unknown> | undefined {
+	return typeof value === "object" && value !== null && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+function toOptionalString(value: unknown): string | undefined {
+	return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function toFiniteNumber(value: unknown): number | undefined {
+	const number = typeof value === "number" ? value : Number(value);
+	return Number.isFinite(number) ? number : undefined;
+}
+
+function hasNonEmptyString(value: unknown): boolean {
+	return typeof value === "string" && value.length > 0;
+}
+
+function extractSingleResultSummary(result: Record<string, unknown>): string | undefined {
+	for (const value of [result.assignment, result.task, result.description]) {
+		if (typeof value === "string" && value.length > 0) return value;
+	}
+	return undefined;
+}
+
+function emptyEvidence(call: ToolCallRecord, status: TaskDelegationEvidence["status"]): TaskDelegationEvidence {
+	return {
+		status,
+		taskSummary: extractTaskSummary(call.params),
+		outputArtifacts: [],
+		codebaseRefs: [],
+	};
+}
+
+function safeStringify(value: unknown): string {
+	try {
+		return JSON.stringify(value) ?? "";
+	} catch {
+		return "";
+	}
 }
 
 /**

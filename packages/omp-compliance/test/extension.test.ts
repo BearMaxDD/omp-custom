@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "@oh-my-pi/pi-coding-agent/advisor/index";
+import type { TaskToolDetails } from "@oh-my-pi/pi-coding-agent/task/types";
 import { ComplianceReviewRegistry } from "../src/advisor/review-envelope";
 import { EvidenceStore } from "../src/evidence/evidence-store";
 import { bindCollectorEvents } from "../src/extension";
@@ -38,10 +39,32 @@ describe("extension v17 tool event wiring", () => {
 		expect(snapshot.results[0]?.resultRef).toContain("packages/task-tool.ts");
 	});
 
-	it("preserves structured task details when content is ordinary text", async () => {
+	it("normalizes real v17 TaskToolDetails batch results when content is ordinary text", async () => {
 		const api = new FakeExtensionAPI();
 		const collector = new CollectorRuntime();
 		const taskOutput = `${"x".repeat(240)} Updated packages/omp-compliance/src/signals/task-delegation.ts`;
+		const details: TaskToolDetails = {
+			projectAgentsDir: "/workspace/.omp/agents",
+			totalDurationMs: 4_321,
+			results: [
+				{
+					index: 0,
+					id: "agent-v17",
+					agent: "implementer",
+					agentSource: "project",
+					task: "Implement the v17 adapter",
+					assignment: "Implement the v17 adapter",
+					exitCode: 0,
+					output: taskOutput,
+					stderr: "",
+					truncated: false,
+					durationMs: 4_321,
+					tokens: 200,
+					requests: 3,
+					outputPath: "/tmp/task-report.txt",
+				},
+			],
+		};
 
 		bindCollectorEvents(api.toAPI(), collector);
 		await api.fireToolCall("task", { assignment: "Implement the v17 adapter" }, "v17-task-1");
@@ -51,27 +74,66 @@ describe("extension v17 tool event wiring", () => {
 			input: { assignment: "Implement the v17 adapter" },
 			content: [{ type: "text", text: "Task completed successfully." }],
 			isError: false,
-			details: {
-				agentId: "agent-v17",
-				exitCode: 0,
-				durationMs: 4_321,
-				artifacts: ["artifact://task-report"],
-				output: taskOutput,
-			},
+			details,
 		});
 
 		const snapshot = collector.collector.snapshot();
 		const delegation = snapshot.subagentDelegations[0];
-		expect(snapshot.results[0]?.details?.output).toBe(taskOutput);
+		expect(snapshot.results[0]?.details?.results).toEqual(details.results);
 		expect(delegation).toEqual({
 			agentId: "agent-v17",
+			agent: "implementer",
 			taskSummary: "Implement the v17 adapter",
 			status: "completed",
 			durationMs: 4_321,
 			exitCode: 0,
-			outputArtifacts: ["artifact://task-report", taskOutput],
+			outputArtifacts: [taskOutput, "/tmp/task-report.txt"],
 			codebaseRefs: ["packages/omp-compliance/src/signals/task-delegation.ts"],
 		});
+	});
+
+	it("keeps async running incomplete and reads codebase references from structured details", async () => {
+		const api = new FakeExtensionAPI();
+		const collector = new CollectorRuntime();
+
+		bindCollectorEvents(api.toAPI(), collector);
+		await api.fireToolCall("task", { task: "background review" }, "v17-task-running");
+		await api.fireToolResult({
+			toolName: "task",
+			toolCallId: "v17-task-running",
+			input: { task: "background review" },
+			content: [{ type: "text", text: "Task started." }],
+			isError: false,
+			details: {
+				projectAgentsDir: null,
+				results: [],
+				totalDurationMs: 0,
+				async: { state: "running", jobId: "job-e2e", type: "task" },
+			} satisfies TaskToolDetails,
+		});
+		await api.fireToolCall("mcp__codebase_memory_mcp__index_status", {}, "v17-index");
+		await api.fireToolResult({
+			toolName: "mcp__codebase_memory_mcp__index_status",
+			toolCallId: "v17-index",
+			input: {},
+			content: [{ type: "text", text: "ordinary content" }],
+			isError: false,
+			details: { status: "ready" },
+		});
+		await api.fireToolCall("mcp__codebase_memory_mcp__get_code_snippet", {}, "v17-snippet");
+		await api.fireToolResult({
+			toolName: "mcp__codebase_memory_mcp__get_code_snippet",
+			toolCallId: "v17-snippet",
+			input: {},
+			content: [{ type: "text", text: "ordinary content" }],
+			isError: false,
+			details: { file_path: "packages/omp-compliance/src/signals/codebase-memory.ts" },
+		});
+
+		const snapshot = collector.collector.snapshot();
+		expect(snapshot.subagentDelegations[0]?.status).toBe("insufficient");
+		expect(snapshot.codebaseMemory.indexReady).toBe(true);
+		expect(snapshot.codebaseMemory.references).toContain("packages/omp-compliance/src/signals/codebase-memory.ts");
 	});
 
 	it("records cwd and sessionId from the extension context on calls", async () => {

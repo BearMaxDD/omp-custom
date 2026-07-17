@@ -1,136 +1,115 @@
 import { describe, expect, it, test } from "bun:test";
+import type { ToolCallEvent, ToolResultEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { codebaseIndexReady, normalizeCodebaseMemory } from "../../src/signals/codebase-memory";
 import { ToolEventCollector } from "../../src/signals/tool-event-collector";
-import type { ToolCallRecord, ToolResultRecord } from "../../src/signals/types";
 
-/** Build a tool_call event for the codebase-memory MCP server. */
-function mcpCall(toolName: string, params: Record<string, unknown> = {}, toolCallId?: string): Record<string, unknown> {
+function mcpCall(shortName: string, input: Record<string, unknown>, toolCallId: string): ToolCallEvent {
 	return {
-		toolName,
-		toolCallId: toolCallId ?? `cb-${Date.now()}`,
-		serverName: "codebase-memory",
-		params,
-	};
-}
-
-/** Build a tool_result event. */
-function mcpResult(toolCallId: string, resultOrContent: unknown, isError?: boolean): Record<string, unknown> {
-	const content = typeof resultOrContent === "string" ? resultOrContent : JSON.stringify(resultOrContent);
-	return {
+		type: "tool_call",
+		toolName: `mcp__codebase_memory_mcp__${shortName}`,
 		toolCallId,
-		content,
-		result: resultOrContent,
-		isError,
+		input,
 	};
 }
 
-describe("codebase-memory 证据采集 — 仅工具名匹配，不基于自然语言", () => {
-	it("识别 index_repository 工具调用", () => {
+function mcpResult(
+	toolCallId: string,
+	shortName: string,
+	details: unknown,
+	content = "ok",
+	isError = false,
+): ToolResultEvent {
+	return {
+		type: "tool_result",
+		toolName: `mcp__codebase_memory_mcp__${shortName}`,
+		toolCallId,
+		input: {},
+		content: [{ type: "text", text: content }],
+		isError,
+		details,
+	};
+}
+
+describe("codebase-memory v17 structured details 归一化", () => {
+	it.each(["index_repository", "index_status"])("%s 的 details.status=ready 可令 indexReady=true", (toolName) => {
 		const collector = new ToolEventCollector();
-		collector.recordCall(mcpCall("index_repository", { path: "/repo" }, "i1"));
-		collector.recordResult(mcpResult("i1", { status: "ok" }));
-		const snap = collector.snapshot();
-		expect(snap.codebaseMemory.queries).not.toContain("index_repository");
-		// status "ok" does not count as indexed or ready
-		expect(snap.codebaseMemory.indexReady).toBe(false);
+		collector.recordCall(mcpCall(toolName, {}, `ready-${toolName}`));
+		collector.recordResult(mcpResult(`ready-${toolName}`, toolName, { status: "ready" }, "ordinary content"));
+		expect(collector.snapshot().codebaseMemory.indexReady).toBe(true);
 	});
 
-	it("index_status 成功时设置 indexReady", () => {
+	it("失败的 index_status 即使 details ready 也不设 ready", () => {
 		const collector = new ToolEventCollector();
-		collector.recordCall(mcpCall("index_status", {}, "idx-ok"));
-		collector.recordResult(mcpResult("idx-ok", { status: "ready" }));
-		const snap = collector.snapshot();
-		expect(snap.codebaseMemory.indexReady).toBe(true);
+		collector.recordCall(mcpCall("index_status", {}, "failed-ready"));
+		collector.recordResult(mcpResult("failed-ready", "index_status", { status: "ready" }, "ordinary", true));
+		expect(collector.snapshot().codebaseMemory.indexReady).toBe(false);
 	});
 
-	it("index_status 失败时不设 indexReady", () => {
+	it("search/snippet 的 structured references 与 content 合并并稳定去重", () => {
 		const collector = new ToolEventCollector();
-		collector.recordCall(mcpCall("index_status", {}, "idx-fail"));
-		collector.recordResult(mcpResult("idx-fail", undefined, true));
-		const snap = collector.snapshot();
-		expect(snap.codebaseMemory.indexReady).toBe(false);
-	});
+		collector.recordCall(mcpCall("search_graph", { query: "TaskTool" }, "search-1"));
+		collector.recordResult(
+			mcpResult(
+				"search-1",
+				"search_graph",
+				{
+					results: [
+						{ file_path: "packages/omp-compliance/src/signals/task-delegation.ts" },
+						{ file_path: "packages/omp-compliance/src/signals/task-delegation.ts" },
+					],
+				},
+				"ordinary content; packages/omp-compliance/src/extension.ts",
+			),
+		);
+		collector.recordCall(mcpCall("get_code_snippet", { qualified_name: "TaskTool.execute" }, "snippet-1"));
+		collector.recordResult(
+			mcpResult(
+				"snippet-1",
+				"get_code_snippet",
+				{ file_path: "packages/omp-compliance/src/signals/codebase-memory.ts" },
+				"no structured path here",
+			),
+		);
 
-	it("仅在 index、搜索、源码或调用链证据连续存在时标记 codebase evidence complete", () => {
-		const collector = new ToolEventCollector();
-		collector.recordCall(mcpCall("index_status", {}, "idx-1"));
-		collector.recordResult(mcpResult("idx-1", { status: "ready" }));
-		collector.recordCall(mcpCall("search_graph", { query: "TaskTool" }, "sg-1"));
-		collector.recordResult(mcpResult("sg-1", "Referenced src/task/index.ts:TaskTool"));
-		collector.recordCall(mcpCall("get_code_snippet", { qualified_name: "TaskTool.execute" }, "gcs-1"));
-		collector.recordResult(mcpResult("gcs-1", { code: "function execute()" }));
-		const snap = collector.snapshot();
-		expect(snap.codebaseMemory).toMatchObject({
-			indexReady: true,
+		expect(collector.snapshot().codebaseMemory).toEqual({
+			indexReady: false,
 			queries: ["search_graph", "get_code_snippet"],
-			references: ["src/task/index.ts"],
+			references: [
+				"packages/omp-compliance/src/extension.ts",
+				"packages/omp-compliance/src/signals/task-delegation.ts",
+				"packages/omp-compliance/src/signals/codebase-memory.ts",
+			],
 		});
 	});
 
-	it("search_code 也被识别为查询证据", () => {
+	it("未知工具、其他 FQN 与自然语言提及都不建立证据", () => {
 		const collector = new ToolEventCollector();
-		collector.recordCall(mcpCall("search_code", { query: "find" }, "sc-1"));
-		collector.recordResult(mcpResult("sc-1", { matches: [] }));
-		const snap = collector.snapshot();
-		expect(snap.codebaseMemory.queries).toContain("search_code");
-	});
-
-	it("trace_path 也被识别为调用链证据", () => {
-		const collector = new ToolEventCollector();
-		collector.recordCall(mcpCall("trace_path", { symbol: "main" }, "tp-1"));
-		collector.recordResult(mcpResult("tp-1", { trace: ["src/main.ts:main -> src/util.ts:helper"] }));
-		const snap = collector.snapshot();
-		expect(snap.codebaseMemory.queries).toContain("trace_path");
-		expect(snap.codebaseMemory.references.length).toBeGreaterThanOrEqual(1);
-	});
-
-	it("不识别未知工具名", () => {
-		const collector = new ToolEventCollector();
-		collector.recordCall(mcpCall("unknown_tool", {}, "ut-1"));
-		collector.recordResult(mcpResult("ut-1", { ok: true }));
-		const snap = collector.snapshot();
-		expect(snap.codebaseMemory.queries).toHaveLength(0);
-		expect(snap.codebaseMemory.references).toHaveLength(0);
-	});
-
-	it("不识别其他服务器的同名工具（如非 codebase-memory 的 search_graph）", () => {
-		const collector = new ToolEventCollector();
-		collector.recordCall({
-			toolName: "search_graph",
-			toolCallId: "non-cb",
-			serverName: "other-server",
-			params: {},
+		collector.recordCall(mcpCall("unknown_tool", {}, "unknown"));
+		collector.recordResult(mcpResult("unknown", "unknown_tool", { file_path: "src/no.ts" }));
+		collector.recordCall({ type: "tool_call", toolName: "other__search_graph", toolCallId: "other", input: {} });
+		collector.recordResult({
+			type: "tool_result",
+			toolName: "other__search_graph",
+			toolCallId: "other",
+			input: {},
+			content: [{ type: "text", text: "search_graph src/no.ts" }],
+			isError: false,
+			details: { file_path: "src/no.ts" },
 		});
-		collector.recordResult(mcpResult("non-cb", { ok: true }));
-		const snap = collector.snapshot();
-		expect(snap.codebaseMemory.queries).toHaveLength(0);
-	});
-
-	it("自然语言输出中出现 search_graph 不建立证据", () => {
-		const collector = new ToolEventCollector();
-		// A completion/chat tool mentioning search_graph in text — not a tool call
-		collector.recordCall({
-			toolName: "completion",
-			toolCallId: "nlp",
-			params: { prompt: "I searched the graph using search_graph and found results" },
-		});
-		collector.recordResult(mcpResult("nlp", { text: "I used search_graph to find" }));
-		const snap = collector.snapshot();
-		expect(snap.codebaseMemory.queries).toHaveLength(0);
+		expect(collector.snapshot().codebaseMemory).toEqual({ indexReady: false, queries: [], references: [] });
 	});
 
 	it("相同查询名去重", () => {
 		const collector = new ToolEventCollector();
-		collector.recordCall(mcpCall("search_graph", { query: "a" }, "sg-a"));
-		collector.recordResult(mcpResult("sg-a", { references: [] }));
-		collector.recordCall(mcpCall("search_graph", { query: "b" }, "sg-b"));
-		collector.recordResult(mcpResult("sg-b", { references: [] }));
-		const snap = collector.snapshot();
-		expect(snap.codebaseMemory.queries).toEqual(["search_graph"]);
+		for (const id of ["a", "b"]) {
+			collector.recordCall(mcpCall("search_code", { query: id }, id));
+			collector.recordResult(mcpResult(id, "search_code", { matches: [] }));
+		}
+		expect(collector.snapshot().codebaseMemory.queries).toEqual(["search_code"]);
 	});
 });
 
-describe("codebaseIndexReady — 矩阵测试", () => {
+describe("codebaseIndexReady matrix", () => {
 	const cases: Array<[string, { success: boolean; status?: string }, boolean]> = [
 		["index_repository", { success: true, status: "indexed" }, true],
 		["index_repository", { success: true, status: "ready" }, true],
@@ -139,26 +118,16 @@ describe("codebaseIndexReady — 矩阵测试", () => {
 		["search_graph", { success: true }, false],
 	];
 
-	test.each(cases)("%s %j → indexReady=%s", (toolName, result, ready) => {
+	test.each(cases)("%s %j -> indexReady=%s", (toolName, result, ready) => {
 		expect(codebaseIndexReady(toolName, result)).toBe(ready);
 	});
 
-	it("识别真实 MCP fully-qualified index_repository 名称", () => {
-		const result = normalizeCodebaseMemory([
-			{
-				call: {
-					toolCallId: "call-fqn",
-					toolName: "mcp__codebase_memory_mcp__index_repository",
-					serverName: "",
-					params: {},
-				},
-				result: {
-					toolCallId: "call-fqn",
-					success: true,
-					resultRef: JSON.stringify({ status: "indexed" }),
-				},
-			},
-		]);
-		expect(result.indexReady).toBe(true);
+	it("保留直接 normalizer 契约", () => {
+		expect(
+			normalizeCodebaseMemory({
+				toolName: "mcp__codebase_memory_mcp__index_repository",
+				result: { success: true, status: "indexed" },
+			}),
+		).toEqual({ indexReady: true, queries: [], references: [] });
 	});
 });
