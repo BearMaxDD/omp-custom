@@ -420,10 +420,13 @@ describe("ProjectIdentityStore", () => {
 			})),
 		);
 
-		expect(results.every((result) => result.exitCode === 0 && result.stderr === "")).toBe(true);
+		expect(results.map(({ exitCode, stderr }) => ({ exitCode, stderr }))).toEqual(
+			Array.from({ length: 8 }, () => ({ exitCode: 0, stderr: "" })),
+		);
 		expect(new Set(results.map((result) => result.stdout)).size).toBe(1);
-		expect(staleMarkers.every((path) => existsSync(path))).toBe(true);
+		expect(staleMarkers.every((path) => !existsSync(path))).toBe(true);
 		expect(existsSync(join(directory, ".project.lock"))).toBe(false);
+		expect(readdirSync(directory)).toEqual(["project.json"]);
 	});
 
 	it("fails closed for corrupted identity JSON", () => {
@@ -488,7 +491,7 @@ describe("ProjectIdentityStore", () => {
 		expect(readdirSync(outside)).toEqual([]);
 	});
 
-	it("ignores a unique publish marker owned by a dead process without deleting it", async () => {
+	it("reclaims a unique publish marker and prepared files owned by a dead process", async () => {
 		const root = initGit();
 		const directory = join(root, ".omp", "compliance");
 		mkdirSync(directory, { recursive: true });
@@ -497,30 +500,41 @@ describe("ProjectIdentityStore", () => {
 		await exitedOwner.exited;
 		const token = randomUUID();
 		const markerPath = join(directory, `.project.publish.${token}.json`);
+		const temporaryPath = join(directory, `.project.${token}.tmp`);
+		const readyPath = join(directory, `.project.${token}.ready`);
 		writeFileSync(markerPath, JSON.stringify({ token, pid: deadPid, createdAt: new Date().toISOString() }));
+		writeFileSync(temporaryPath, "temporary");
+		writeFileSync(readyPath, "ready");
 
 		const result = ProjectIdentityStore.open(root);
 
 		expect(result.status).toBe("bound");
-		expect(existsSync(markerPath)).toBe(true);
+		expect(existsSync(markerPath)).toBe(false);
+		expect(existsSync(temporaryPath)).toBe(false);
+		expect(existsSync(readyPath)).toBe(false);
+		expect(readdirSync(directory)).toEqual(["project.json"]);
 	});
 
-	it.each(["", '{"token":'])("ignores a stale malformed unique publish marker: %j", (content) => {
+	it.each(["", '{"token":'])("reclaims a stale malformed unique publish marker: %j", (content) => {
 		const root = initGit();
 		const directory = join(root, ".omp", "compliance");
-		const markerPath = join(directory, `.project.publish.${randomUUID()}.json`);
+		const token = randomUUID();
+		const markerPath = join(directory, `.project.publish.${token}.json`);
+		const readyPath = join(directory, `.project.${token}.ready`);
 		mkdirSync(directory, { recursive: true });
 		writeFileSync(markerPath, content);
+		writeFileSync(readyPath, "ready");
 		const staleTime = new Date(Date.now() - 60_000);
 		utimesSync(markerPath, staleTime, staleTime);
 
 		const result = ProjectIdentityStore.open(root);
 
 		expect(result.status).toBe("bound");
-		expect(existsSync(markerPath)).toBe(true);
+		expect(existsSync(markerPath)).toBe(false);
+		expect(existsSync(readyPath)).toBe(false);
 	});
 
-	it("waits out a recent malformed marker and then ignores it without deletion", () => {
+	it("waits out a recent malformed marker and then reclaims it", () => {
 		const root = initGit();
 		const directory = join(root, ".omp", "compliance");
 		const markerPath = join(directory, `.project.publish.${randomUUID()}.json`);
@@ -530,10 +544,10 @@ describe("ProjectIdentityStore", () => {
 		const result = ProjectIdentityStore.open(root);
 
 		expect(result.status).toBe("bound");
-		expect(readFileSync(markerPath, "utf8")).toBe('{"token":');
+		expect(existsSync(markerPath)).toBe(false);
 	});
 
-	it("ignores a stale marker whose PID belongs to a newer process instance", () => {
+	it("reclaims a stale marker whose PID belongs to a newer process instance", () => {
 		const root = initGit();
 		const directory = join(root, ".omp", "compliance");
 		const token = randomUUID();
@@ -546,10 +560,10 @@ describe("ProjectIdentityStore", () => {
 		const result = ProjectIdentityStore.open(root);
 
 		expect(result.status).toBe("bound");
-		expect(existsSync(markerPath)).toBe(true);
+		expect(existsSync(markerPath)).toBe(false);
 	});
 
-	it("ignores a stale marker with an out-of-range owner PID", () => {
+	it("reclaims a stale marker with an out-of-range owner PID", () => {
 		const root = initGit();
 		const directory = join(root, ".omp", "compliance");
 		const token = randomUUID();
@@ -565,10 +579,10 @@ describe("ProjectIdentityStore", () => {
 		const result = ProjectIdentityStore.open(root);
 
 		expect(result.status).toBe("bound");
-		expect(existsSync(markerPath)).toBe(true);
+		expect(existsSync(markerPath)).toBe(false);
 	});
 
-	it("ignores an expired marker when the owner process probe is unknown", () => {
+	it("reclaims an expired marker when the owner process probe is unknown", () => {
 		const root = initGit();
 		const directory = join(root, ".omp", "compliance");
 		const token = randomUUID();
@@ -591,7 +605,7 @@ describe("ProjectIdentityStore", () => {
 		} finally {
 			process.kill = originalKill;
 		}
-		expect(existsSync(markerPath)).toBe(true);
+		expect(existsSync(markerPath)).toBe(false);
 	});
 
 	it("does not read or publish while a valid active marker exists", () => {
@@ -599,13 +613,50 @@ describe("ProjectIdentityStore", () => {
 		const directory = join(root, ".omp", "compliance");
 		const token = randomUUID();
 		const markerPath = join(directory, `.project.publish.${token}.json`);
+		const temporaryPath = join(directory, `.project.${token}.tmp`);
+		const readyPath = join(directory, `.project.${token}.ready`);
 		mkdirSync(directory, { recursive: true });
 		writeFileSync(markerPath, JSON.stringify({ token, pid: process.pid, createdAt: new Date().toISOString() }));
+		writeFileSync(temporaryPath, "temporary");
+		writeFileSync(readyPath, "ready");
 
 		expect(() => ProjectIdentityStore.open(root)).toThrow(PROJECT_IDENTITY_INVALID_ERROR);
 		expect(existsSync(bindingPath(root))).toBe(false);
 		expect(existsSync(markerPath)).toBe(true);
+		expect(readFileSync(temporaryPath, "utf8")).toBe("temporary");
+		expect(readFileSync(readyPath, "utf8")).toBe("ready");
 	}, 8_000);
+
+	it("fails closed without deleting a prepared file replaced after identity capture", async () => {
+		const root = initGit();
+		const directory = join(root, ".omp", "compliance");
+		const token = randomUUID();
+		const markerPath = join(directory, `.project.publish.${token}.json`);
+		const readyPath = join(directory, `.project.${token}.ready`);
+		const replacementPath = join(root, "replacement-ready");
+		const modulePath = join(import.meta.dir, "../../src/project/project-identity.ts");
+		mkdirSync(directory, { recursive: true });
+		const staleTime = new Date(0);
+		writeFileSync(markerPath, JSON.stringify({ token, pid: process.pid, createdAt: staleTime.toISOString() }));
+		writeFileSync(readyPath, "stale-ready");
+		writeFileSync(replacementPath, "replacement-ready");
+		utimesSync(markerPath, staleTime, staleTime);
+		const canonicalReadyPath = realpathSync(readyPath);
+		const child = Bun.spawn(
+			[
+				process.execPath,
+				"-e",
+				`import { mock } from "bun:test"; import * as fs from "node:fs"; const lstatSync = fs.lstatSync.bind(fs); const renameSync = fs.renameSync.bind(fs); let readyIdentityReads = 0; mock.module("node:fs", () => ({ ...fs, lstatSync(path, options) { if (path === ${JSON.stringify(canonicalReadyPath)} && options?.bigint === true && ++readyIdentityReads === 2) renameSync(${JSON.stringify(replacementPath)}, path); return lstatSync(path, options); } })); const { ProjectIdentityStore } = await import(${JSON.stringify(modulePath)}); try { ProjectIdentityStore.open(${JSON.stringify(root)}); } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exit(2); }`,
+			],
+			{ stderr: "pipe", stdout: "pipe" },
+		);
+		const stderr = await new Response(child.stderr).text();
+
+		expect(await child.exited).toBe(2);
+		expect(stderr).toContain(PROJECT_IDENTITY_INVALID_ERROR);
+		expect(readFileSync(readyPath, "utf8")).toBe("replacement-ready");
+		expect(existsSync(markerPath)).toBe(true);
+	});
 
 	it.each(["before", "after"])("recovers when a publisher crashes %s the final link", async (crashPoint) => {
 		const root = initGit();
@@ -628,8 +679,33 @@ describe("ProjectIdentityStore", () => {
 		const recovered = ProjectIdentityStore.open(root);
 		expect(recovered.status).toBe("bound");
 		if (projectBeforeRecovery) expect(recovered.binding.projectId).toBe(projectBeforeRecovery.projectId);
-		expect(readdirSync(directory).some((name) => name.endsWith(".ready"))).toBe(true);
-		expect(readdirSync(directory).some((name) => name.startsWith(".project.publish."))).toBe(true);
+		expect(readdirSync(directory)).toEqual(["project.json"]);
+	});
+
+	it("converges to project.json after multiple publishers crash before the final link", async () => {
+		const root = initGit();
+		const directory = join(root, ".omp", "compliance");
+		const modulePath = join(import.meta.dir, "../../src/project/project-identity.ts");
+		mkdirSync(directory, { recursive: true });
+		writeFileSync(join(directory, "keep.txt"), "not a publication artifact");
+
+		for (let index = 0; index < 5; index += 1) {
+			const child = Bun.spawn(
+				[
+					process.execPath,
+					"-e",
+					`import { mock } from "bun:test"; import * as fs from "node:fs"; mock.module("node:fs", () => ({ ...fs, linkSync() { process.exit(81); } })); const { ProjectIdentityStore } = await import(${JSON.stringify(modulePath)}); ProjectIdentityStore.open(${JSON.stringify(root)});`,
+				],
+				{ stderr: "pipe", stdout: "pipe" },
+			);
+			expect(await child.exited).toBe(81);
+		}
+
+		const recovered = ProjectIdentityStore.open(root);
+
+		expect(recovered.status).toBe("bound");
+		expect(readdirSync(directory).sort()).toEqual(["keep.txt", "project.json"]);
+		expect(readFileSync(join(directory, "keep.txt"), "utf8")).toBe("not a publication artifact");
 	});
 
 	it("rejects malformed project publication artifact names", () => {

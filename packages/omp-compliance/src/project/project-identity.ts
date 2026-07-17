@@ -522,11 +522,55 @@ function waitForActivePublishers(directory: string, storageIdentity: StorageIden
 	while (true) {
 		assertStorageIdentity(storageIdentity);
 		const markerPaths = listPublishMarkerPaths(directory);
-		const active = markerPaths.some((markerPath) => isPublishMarkerActive(markerPath));
-		if (!active) return;
+		let active = false;
+		for (const markerPath of markerPaths) {
+			const snapshot = readPublishMarkerSnapshot(markerPath);
+			if (!snapshot) continue;
+			if (isPublishMarkerActive(snapshot)) {
+				active = true;
+				continue;
+			}
+			reclaimExpiredPublication(markerPath, snapshot, directory, storageIdentity);
+		}
+		if (!active && listPublishMarkerPaths(directory).length === 0) return;
 		if (Date.now() >= deadline) throw new Error("Timed out waiting for OMP project identity publishers");
 		Atomics.wait(SLEEP_BUFFER, 0, 0, 10);
 	}
+}
+
+function reclaimExpiredPublication(
+	marker: PublishMarkerPath,
+	snapshot: PublishMarkerSnapshot,
+	directory: string,
+	storageIdentity: StorageIdentity,
+): void {
+	const preparedPaths = [
+		join(directory, `.project.${marker.token}.tmp`),
+		join(directory, `.project.${marker.token}.ready`),
+	];
+	assertStorageIdentity(storageIdentity);
+	if (!matchesRegularFileIdentity(marker.path, snapshot)) return;
+
+	for (const preparedPath of preparedPaths) {
+		const preparedIdentity = captureOptionalRegularFileIdentity(preparedPath);
+		assertStorageIdentity(storageIdentity);
+		if (!matchesRegularFileIdentity(marker.path, snapshot)) return;
+		if (!preparedIdentity) {
+			if (pathExists(preparedPath)) return;
+			continue;
+		}
+		if (!removeFileIfIdentityMatches(preparedPath, preparedIdentity)) return;
+		fsyncDirectory(directory, storageIdentity.compliance);
+		assertStorageIdentity(storageIdentity);
+	}
+
+	if (preparedPaths.some((preparedPath) => pathExists(preparedPath))) {
+		throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
+	}
+	assertStorageIdentity(storageIdentity);
+	if (!removeFileIfIdentityMatches(marker.path, snapshot)) return;
+	fsyncDirectory(directory, storageIdentity.compliance);
+	assertStorageIdentity(storageIdentity);
 }
 
 function pathExists(path: string): boolean {
@@ -762,6 +806,16 @@ function captureExistingRegularFileIdentity(path: string): FileIdentity {
 	});
 }
 
+function captureOptionalRegularFileIdentity(path: string): FileIdentity | undefined {
+	try {
+		return captureExistingRegularFileIdentity(path);
+	} catch (error) {
+		if (isNotFound(error)) return undefined;
+		if (error instanceof Error && error.message === PROJECT_IDENTITY_INVALID_ERROR) throw error;
+		throw new Error(PROJECT_IDENTITY_INVALID_ERROR, { cause: error });
+	}
+}
+
 function assertRegularFileIdentity(path: string, identity: FileIdentity): void {
 	try {
 		const stats = lstatSync(path, { bigint: true });
@@ -782,6 +836,31 @@ function removeFileNodeIfUnchanged(path: string, identity: FileNodeIdentity): vo
 		}
 	} catch {
 		// Best-effort cleanup must not remove a replacement path.
+	}
+}
+
+function matchesRegularFileIdentity(path: string, identity: FileIdentity): boolean {
+	try {
+		const stats = lstatSync(path, { bigint: true });
+		return !stats.isSymbolicLink() && stats.isFile() && sameFileIdentity(identity, stats);
+	} catch (error) {
+		if (isNotFound(error)) return false;
+		throw new Error(PROJECT_IDENTITY_INVALID_ERROR, { cause: error });
+	}
+}
+
+function removeFileIfIdentityMatches(path: string, identity: FileIdentity): boolean {
+	try {
+		const stats = lstatSync(path, { bigint: true });
+		if (stats.isSymbolicLink() || !stats.isFile() || !sameFileIdentity(identity, stats)) {
+			throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
+		}
+		unlinkSync(path);
+		return true;
+	} catch (error) {
+		if (isNotFound(error)) return false;
+		if (error instanceof Error && error.message === PROJECT_IDENTITY_INVALID_ERROR) throw error;
+		throw new Error(PROJECT_IDENTITY_INVALID_ERROR, { cause: error });
 	}
 }
 
@@ -825,9 +904,7 @@ function readPublishMarkerSnapshot(marker: PublishMarkerPath): PublishMarkerSnap
 	}
 }
 
-function isPublishMarkerActive(marker: PublishMarkerPath): boolean {
-	const snapshot = readPublishMarkerSnapshot(marker);
-	if (!snapshot) return false;
+function isPublishMarkerActive(snapshot: PublishMarkerSnapshot): boolean {
 	const ageMs = Date.now() - nanosecondsToMilliseconds(snapshot.mtimeNs);
 	if (!snapshot.owner) return ageMs < PUBLISH_RECOVERY_GRACE_MS;
 	const ownerState = probePublishOwner(snapshot.owner, snapshot);
