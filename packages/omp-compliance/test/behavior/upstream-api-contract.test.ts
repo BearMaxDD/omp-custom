@@ -25,6 +25,16 @@ const HOST_PACKAGE = "/Users/mima1234/Code/super/.worktrees/oh-my-pi-v17-advisor
 const HOST_HEAD = "2adbf91f6d73534342f194f99b1a305db37ae1cf";
 const PACKAGE_ROOT = join(import.meta.dir, "../..");
 const ROOT_TYPES_MODULE = join(PACKAGE_ROOT, "src/types");
+const ADVISOR_INDEX_MODULE = "@oh-my-pi/pi-coding-agent/advisor/index";
+const PROTOCOL_CALLERS = [
+	"src/advisor/compliance-advisor-hook.ts",
+	"src/advisor/review-envelope.ts",
+	"src/brainstorm/advisor-hook.ts",
+	"src/brainstorm/brainstorm-runtime.ts",
+	"src/extension.ts",
+	"src/runtime/compliance-runtime.ts",
+	"test/support/fake-extension-api.ts",
+] as const;
 
 function collectTypeScriptFiles(directory: string): string[] {
 	return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
@@ -184,6 +194,33 @@ describe("upstream API contract — REAL shapes", () => {
 						.filter((specifier) => resolvesToRootTypes(file, specifier))
 						.map((specifier) => `${file}: ${specifier}`),
 				);
+
+			expect(violations).toEqual([]);
+		});
+
+		it("does not declare catch-all JavaScript ambient modules", () => {
+			const declarationPath = join(PACKAGE_ROOT, "src/host-assets.d.ts");
+			const sourceFile = ts.createSourceFile(
+				declarationPath,
+				readFileSync(declarationPath, "utf8"),
+				ts.ScriptTarget.Latest,
+				true,
+			);
+			const ambientModuleNames = sourceFile.statements
+				.filter(ts.isModuleDeclaration)
+				.flatMap((statement) => (ts.isStringLiteral(statement.name) ? [statement.name.text] : []));
+
+			expect(ambientModuleNames).not.toContain("*.js");
+			expect(ambientModuleNames).not.toContain("*");
+		});
+
+		it("imports protocol-only Host types from the narrow review-protocol entrypoint", () => {
+			const violations = PROTOCOL_CALLERS.flatMap((relativePath) => {
+				const file = join(PACKAGE_ROOT, relativePath);
+				return collectModuleSpecifiers(file)
+					.filter((specifier) => specifier === ADVISOR_INDEX_MODULE)
+					.map((specifier) => `${relativePath}: ${specifier}`);
+			});
 
 			expect(violations).toEqual([]);
 		});

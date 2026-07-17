@@ -17,7 +17,7 @@
  * intervention).
  */
 
-import type { AdvisorBeforeRunEvent, AdvisorRunAugmentation } from "@oh-my-pi/pi-coding-agent/advisor/index";
+import type { AdvisorBeforeRunEvent, AdvisorRunAugmentation } from "@oh-my-pi/pi-coding-agent/advisor/review-protocol";
 import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { BRAINSTORM_READ_ONLY_TOOL_NAMES } from "./advisor-rules";
 import { renderDecisionCard } from "./decision-card";

@@ -8,7 +8,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "@oh-my-pi/pi-coding-agent/advisor/index";
+import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "@oh-my-pi/pi-coding-agent/advisor/review-protocol";
 import type { CollectorRuntime } from "../signals/collector-runtime";
 import { BRAINSTORM_REVIEW_RULES } from "./advisor-rules";
 import { buildTopicCodebaseEvidence } from "./codebase-evidence";

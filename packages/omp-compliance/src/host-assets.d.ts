@@ -33,6 +33,14 @@ declare module "*.css" {
 	export default content;
 }
 
-declare module "*.js";
+declare module "*/template.js" {
+	const content: string;
+	export default content;
+}
+
+declare module "*.generated.js" {
+	const content: string;
+	export default content;
+}
 
 declare module "turndown-plugin-gfm";

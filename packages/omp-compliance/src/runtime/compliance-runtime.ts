@@ -11,7 +11,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import type { AdvisorReviewReceipt } from "@oh-my-pi/pi-coding-agent/advisor/index";
+import type { AdvisorReviewReceipt } from "@oh-my-pi/pi-coding-agent/advisor/review-protocol";
 import type { CustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { buildCompletionContext } from "../advisor/completion-context";
 import { renderCompletionRules } from "../advisor/default-rule-pack";

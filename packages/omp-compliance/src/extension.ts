@@ -4,7 +4,7 @@ import type {
 	AdvisorReviewReceipt,
 	AdvisorReviewRequest,
 	AdvisorRunAugmentation,
-} from "@oh-my-pi/pi-coding-agent/advisor/index";
+} from "@oh-my-pi/pi-coding-agent/advisor/review-protocol";
 import type {
 	AgentEndEvent,
 	BeforeAgentStartEvent,

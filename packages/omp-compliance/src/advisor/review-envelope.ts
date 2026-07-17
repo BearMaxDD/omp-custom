@@ -11,7 +11,7 @@
  * processing.
  */
 import { createHash } from "node:crypto";
-import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "@oh-my-pi/pi-coding-agent/advisor/index";
+import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "@oh-my-pi/pi-coding-agent/advisor/review-protocol";
 
 // ─── Input shape for createEnvelope ────────────────────────────────
 
