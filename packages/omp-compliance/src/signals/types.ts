@@ -64,6 +64,8 @@ export interface CodebaseMemoryEvidence {
 export interface TaskDelegationEvidence {
 	/** The agent id assigned to the subtask, if available. */
 	agentId?: string;
+	/** The background job id assigned to an asynchronous task call, if available. */
+	jobId?: string;
 	/** The agent definition used by the host, kept separate from the run id. */
 	agent?: string;
 	/** A short summary or assignment string. */

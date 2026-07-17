@@ -24,7 +24,8 @@ const TASK_TOOL_NAME = "task";
  * Normalize paired call/result entries into task delegation evidence.
  *
  * Filters to entries whose toolName === "task" and produces structured
- * evidence records. Every call produces exactly one evidence entry.
+ * evidence records. Batch calls can produce one entry per result plus an
+ * asynchronous call-level placeholder while background work is unresolved.
  */
 export function normalizeTaskDelegation(
 	paired: ReadonlyArray<{ call: ToolCallRecord; result?: ToolResultRecord }>,
@@ -61,9 +62,9 @@ export function normalizeTaskDelegation(
 		// Structured v17 details are authoritative; resultRef is only a text fallback.
 		const details = { ...parseResultDetails(result.resultRef), ...result.details };
 		if (isTaskToolDetails(details)) {
+			const asyncDetails = readRecord(details.async);
 			if (details.results.length === 0) {
-				const asyncState = readRecord(details.async)?.state;
-				results.push(emptyEvidence(call, asyncState === "failed" ? "aborted" : "insufficient"));
+				results.push(asyncEvidence(call, asyncDetails));
 				continue;
 			}
 
@@ -73,7 +74,7 @@ export function normalizeTaskDelegation(
 				if (!single) continue;
 				const exitCode = toFiniteNumber(single.exitCode);
 				const aborted = single.aborted === true || hasNonEmptyString(single.error);
-				const outputArtifacts = collectOutputArtifacts(single, details.outputPaths);
+				const outputArtifacts = collectOutputArtifacts(single);
 				const codebaseRefs = extractCodebaseRefs(`${outputArtifacts.join(" ")} ${safeStringify(single)}`);
 
 				results.push({
@@ -88,6 +89,9 @@ export function normalizeTaskDelegation(
 				});
 			}
 			if (results.length === evidenceCount) results.push(emptyEvidence(call, "insufficient"));
+			if (asyncDetails?.state === "running" || asyncDetails?.state === "failed") {
+				results.push(asyncEvidence(call, asyncDetails));
+			}
 			continue;
 		}
 
@@ -138,7 +142,7 @@ function parseResultDetails(ref: string): Record<string, unknown> {
 	}
 }
 
-function collectOutputArtifacts(details: Record<string, unknown>, sharedOutputs?: unknown): string[] {
+function collectOutputArtifacts(details: Record<string, unknown>): string[] {
 	const artifacts: string[] = [];
 	for (const value of [
 		details.artifacts,
@@ -147,7 +151,6 @@ function collectOutputArtifacts(details: Record<string, unknown>, sharedOutputs?
 		details.outputPath,
 		details.patchPath,
 		details.branchName,
-		sharedOutputs,
 	]) {
 		if (Array.isArray(value)) {
 			artifacts.push(...value.map(String));
@@ -196,6 +199,13 @@ function emptyEvidence(call: ToolCallRecord, status: TaskDelegationEvidence["sta
 		taskSummary: extractTaskSummary(call.params),
 		outputArtifacts: [],
 		codebaseRefs: [],
+	};
+}
+
+function asyncEvidence(call: ToolCallRecord, asyncDetails?: Record<string, unknown>): TaskDelegationEvidence {
+	return {
+		...emptyEvidence(call, asyncDetails?.state === "failed" ? "aborted" : "insufficient"),
+		jobId: toOptionalString(asyncDetails?.jobId),
 	};
 }
 

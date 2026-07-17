@@ -72,10 +72,11 @@ describe("task-delegation v17 details 领域归一化", () => {
 							agent: "implementer",
 							assignment: "修复归一化",
 							output: "Changed packages/omp-compliance/src/signals/task-delegation.ts",
+							outputPath: "/tmp/run-b.txt",
 							durationMs: 654,
 						}),
 					],
-					outputPaths: ["/tmp/batch-summary.json"],
+					outputPaths: ["/tmp/run-a.txt", "/tmp/run-b.txt"],
 				}),
 			),
 		);
@@ -94,15 +95,18 @@ describe("task-delegation v17 details 领域归一化", () => {
 				"/tmp/run-a.txt",
 				"/tmp/run-a.patch",
 				"task/run-a",
-				"/tmp/batch-summary.json",
 			],
-			codebaseRefs: ["packages/omp-compliance/src/extension.ts", "/tmp/batch-summary.json"],
+			codebaseRefs: ["packages/omp-compliance/src/extension.ts"],
 		});
-		expect(evidence[1]).toMatchObject({
+		expect(evidence[1]).toEqual({
 			agentId: "run-b",
 			agent: "implementer",
 			taskSummary: "修复归一化",
 			status: "completed",
+			durationMs: 654,
+			exitCode: 0,
+			outputArtifacts: ["Changed packages/omp-compliance/src/signals/task-delegation.ts", "/tmp/run-b.txt"],
+			codebaseRefs: ["packages/omp-compliance/src/signals/task-delegation.ts"],
 		});
 	});
 
@@ -127,21 +131,18 @@ describe("task-delegation v17 details 领域归一化", () => {
 			),
 		);
 		expect(collector.snapshot().subagentDelegations).toEqual([
-			expect.objectContaining({ status: "insufficient", taskSummary: "后台任务" }),
+			expect.objectContaining({ jobId: "job-1", status: "insufficient", taskSummary: "后台任务" }),
 		]);
 	});
 
-	it("results 非空时忽略 async.running 并逐项保留真实状态", () => {
+	it("results 有 completed 且 async.running 时保留完成项并追加可追踪的未完成占位", () => {
 		const collector = new ToolEventCollector();
 		collector.recordCall(taskCall({ task: "混合运行任务" }, "mixed-running"));
 		collector.recordResult(
 			taskResult(
 				"mixed-running",
 				taskDetails({
-					results: [
-						singleResult({ id: "running-completed", assignment: "已完成项" }),
-						singleResult({ index: 1, id: "running-aborted", assignment: "已终止项", exitCode: 2 }),
-					],
+					results: [singleResult({ id: "running-completed", assignment: "已完成项" })],
 					async: { state: "running", jobId: "job-running", type: "task" },
 				}),
 			),
@@ -149,7 +150,7 @@ describe("task-delegation v17 details 领域归一化", () => {
 
 		expect(collector.snapshot().subagentDelegations).toEqual([
 			expect.objectContaining({ agentId: "running-completed", taskSummary: "已完成项", status: "completed" }),
-			expect.objectContaining({ agentId: "running-aborted", taskSummary: "已终止项", status: "aborted" }),
+			expect.objectContaining({ jobId: "job-running", taskSummary: "混合运行任务", status: "insufficient" }),
 		]);
 	});
 
@@ -162,25 +163,17 @@ describe("task-delegation v17 details 领域归一化", () => {
 				taskDetails({ results: [], async: { state: "failed", jobId: "job-2", type: "task" } }),
 			),
 		);
-		expect(collector.snapshot().subagentDelegations[0]?.status).toBe("aborted");
+		expect(collector.snapshot().subagentDelegations[0]).toMatchObject({ jobId: "job-2", status: "aborted" });
 	});
 
-	it("results 非空时忽略 async.failed 并逐项保留真实状态", () => {
+	it("results 有 completed 且 async.failed 时保留完成项并追加失败占位", () => {
 		const collector = new ToolEventCollector();
 		collector.recordCall(taskCall({ task: "混合失败任务" }, "mixed-failed"));
 		collector.recordResult(
 			taskResult(
 				"mixed-failed",
 				taskDetails({
-					results: [
-						singleResult({ id: "failed-completed", assignment: "已完成项" }),
-						singleResult({
-							index: 1,
-							id: "failed-aborted",
-							assignment: "已终止项",
-							error: "provider failed",
-						}),
-					],
+					results: [singleResult({ id: "failed-completed", assignment: "已完成项" })],
 					async: { state: "failed", jobId: "job-failed", type: "task" },
 				}),
 			),
@@ -188,7 +181,7 @@ describe("task-delegation v17 details 领域归一化", () => {
 
 		expect(collector.snapshot().subagentDelegations).toEqual([
 			expect.objectContaining({ agentId: "failed-completed", taskSummary: "已完成项", status: "completed" }),
-			expect.objectContaining({ agentId: "failed-aborted", taskSummary: "已终止项", status: "aborted" }),
+			expect.objectContaining({ jobId: "job-failed", taskSummary: "混合失败任务", status: "aborted" }),
 		]);
 	});
 
