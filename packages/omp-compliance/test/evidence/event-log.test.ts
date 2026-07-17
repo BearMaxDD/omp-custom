@@ -137,15 +137,47 @@ describe("EventLog", () => {
 
 	it("读取时按 eventId 去重跨进程重试留下的重复行", () => {
 		const path = join(temporaryRoot(), "events.jsonl");
-		const event = { eventId: "stable-event", type: "completion" };
+		const event = { eventId: eventId("stable-disk-event"), type: "completion" };
 		writeFileSync(path, `${JSON.stringify(event)}\n${JSON.stringify(event)}\n`, "utf8");
 
 		expect(new EventLog<TestEvent>(path).readAll()).toEqual([event]);
 	});
 
+	it("读取磁盘记录时保留合法 UUID 并将非法标识按完整原始行稳定规范化为 UUIDv5", () => {
+		const path = join(temporaryRoot(), "events.jsonl");
+		const lines = [
+			JSON.stringify({ eventId: "550e8400-e29b-41d4-a716-446655440000", type: "valid-v4" }),
+			JSON.stringify({ eventId: "550e8400-e29b-51d4-b716-446655440000", type: "valid-v5" }),
+			JSON.stringify({ eventId: "01890f9e-7b5a-7cc3-98f4-446655440000", type: "valid-v7" }),
+			JSON.stringify({ type: "missing", value: 1 }),
+			JSON.stringify({ eventId: "not-a-uuid", type: "non-uuid", value: 2 }),
+			JSON.stringify({ eventId: "550e8400-e29b-61d4-a716-446655440000", type: "wrong-version", value: 3 }),
+			JSON.stringify({ eventId: "550e8400-e29b-41d4-7716-446655440000", type: "wrong-variant", value: 4 }),
+			JSON.stringify({ eventId: "not-a-uuid", type: "different-line", value: 5 }),
+		];
+		writeFileSync(path, `${lines.join("\n")}\n`, "utf8");
+
+		const log = new EventLog<TestEvent>(path);
+		const firstRead = log.readAll();
+		const secondRead = log.readAll();
+
+		expect(firstRead.slice(0, 3).map((event) => event.eventId)).toEqual([
+			"550e8400-e29b-41d4-a716-446655440000",
+			"550e8400-e29b-51d4-b716-446655440000",
+			"01890f9e-7b5a-7cc3-98f4-446655440000",
+		]);
+		const normalizedIds = firstRead.slice(3).map((event) => event.eventId);
+		expect(normalizedIds).toEqual(lines.slice(3).map((line) => deterministicEvidenceEventId(`legacy_event\0${line}`)));
+		expect(normalizedIds).toHaveLength(new Set(normalizedIds).size);
+		for (const normalizedId of normalizedIds) {
+			expect(normalizedId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+		}
+		expect(secondRead).toEqual(firstRead);
+	});
+
 	it("忽略截断末行并只追加一次可审计 recovery 事件", () => {
 		const path = join(temporaryRoot(), "events.jsonl");
-		const valid = { eventId: "event-1", type: "first" };
+		const valid = { eventId: eventId("valid-before-truncated-tail"), type: "first" };
 		writeFileSync(path, `${JSON.stringify(valid)}\n{"eventId":"broken`, "utf8");
 		const log = new EventLog<TestEvent>(path);
 
@@ -179,14 +211,15 @@ describe("EventLog", () => {
 
 	it("完整 JSON 仅缺换行时补换行且不生成 recovery", () => {
 		const path = join(temporaryRoot(), "events.jsonl");
-		writeFileSync(path, '{"eventId":"valid-no-newline","type":"first"}', "utf8");
+		const validEventId = eventId("valid-no-newline");
+		writeFileSync(path, JSON.stringify({ eventId: validEventId, type: "first" }), "utf8");
 		const log = new EventLog<TestEvent>(path);
 
 		const goodEventId = eventId("good-event");
 		log.append({ eventId: goodEventId, type: "completion" });
 
 		const events = log.readAll();
-		expect(events.map((event) => event.eventId)).toEqual(["valid-no-newline", goodEventId]);
+		expect(events.map((event) => event.eventId)).toEqual([validEventId, goodEventId]);
 		expect(events.some((event) => event.type === "recovery_truncated_tail")).toBeFalse();
 	});
 

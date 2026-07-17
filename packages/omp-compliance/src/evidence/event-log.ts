@@ -87,7 +87,8 @@ function parseEvents<T extends EvidenceEvent>(content: string): ParsedEvents<T> 
 		if (!line.trim()) continue;
 		try {
 			const event = JSON.parse(line) as Partial<T>;
-			const eventId = typeof event.eventId === "string" ? event.eventId : legacyEventIdFor(line);
+			const eventId =
+				typeof event.eventId === "string" && isEvidenceEventId(event.eventId) ? event.eventId : legacyEventIdFor(line);
 			if (seen.has(eventId)) continue;
 			seen.add(eventId);
 			events.push({ ...event, eventId } as T);
