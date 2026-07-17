@@ -24,6 +24,10 @@ export interface ToolCallRecord {
 	serverName?: string;
 	/** A redacted / limited parameter summary (keys preserved, values truncated). */
 	params: Record<string, unknown>;
+	/** Working directory supplied by the extension context. */
+	cwd?: string;
+	/** Active session id supplied by the extension context. */
+	sessionId?: string;
 	/** ISO timestamp of the call. */
 	timestamp: string;
 }
@@ -36,6 +40,8 @@ export interface ToolResultRecord {
 	success: boolean;
 	/** A reference or truncated representation of the result payload. */
 	resultRef: string;
+	/** Serializable structured result details, preserved without text truncation. */
+	details?: Record<string, unknown>;
 	/** ISO timestamp of the result. */
 	timestamp: string;
 }

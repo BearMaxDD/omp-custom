@@ -73,22 +73,21 @@ export function validateTopicReadyInput(raw: Record<string, unknown>): TopicRead
 		errors.push({ field: "candidate_decision", message: "candidate_decision must be at most 4,000 characters" });
 	}
 
-	// constraints — optional, must be array of strings, max 30 items
-	if (raw.constraints !== undefined) {
-		if (!Array.isArray(raw.constraints) || !raw.constraints.every((i) => typeof i === "string")) {
-			errors.push({ field: "constraints", message: "constraints must be an array of strings" });
-		} else if (raw.constraints.length > 30) {
-			errors.push({ field: "constraints", message: "constraints must have at most 30 items" });
-		}
+	// constraints — required, must be array of strings, max 30 items
+	if (!isStringArray(raw.constraints)) {
+		errors.push({ field: "constraints", message: "constraints is required and must be an array of strings" });
+	} else if (raw.constraints.length > 30) {
+		errors.push({ field: "constraints", message: "constraints must have at most 30 items" });
 	}
 
-	// success_criteria — optional, array of strings, max 30 items
-	if (raw.success_criteria !== undefined) {
-		if (!Array.isArray(raw.success_criteria) || !raw.success_criteria.every((i) => typeof i === "string")) {
-			errors.push({ field: "success_criteria", message: "success_criteria must be an array of strings" });
-		} else if (raw.success_criteria.length > 30) {
-			errors.push({ field: "success_criteria", message: "success_criteria must have at most 30 items" });
-		}
+	// success_criteria — required, array of strings, max 30 items
+	if (!isStringArray(raw.success_criteria)) {
+		errors.push({
+			field: "success_criteria",
+			message: "success_criteria is required and must be an array of strings",
+		});
+	} else if (raw.success_criteria.length > 30) {
+		errors.push({ field: "success_criteria", message: "success_criteria must have at most 30 items" });
 	}
 
 	// unresolved_questions — optional, array of strings, max 30 items
@@ -103,21 +102,19 @@ export function validateTopicReadyInput(raw: Record<string, unknown>): TopicRead
 		}
 	}
 
-	// codebase_relevance — optional (defaults to "none"), must be valid enum
-	if (raw.codebase_relevance !== undefined && !isCodebaseRelevance(raw.codebase_relevance)) {
+	// codebase_relevance — required, must be valid enum
+	if (!isCodebaseRelevance(raw.codebase_relevance)) {
 		errors.push({
 			field: "codebase_relevance",
-			message: `codebase_relevance must be one of: ${[...VALID_RELEVANCE].join(" | ")}`,
+			message: `codebase_relevance is required and must be one of: ${[...VALID_RELEVANCE].join(" | ")}`,
 		});
 	}
 
-	// discussion_summary — optional, string, max 8,000 chars
-	if (raw.discussion_summary !== undefined) {
-		if (typeof raw.discussion_summary !== "string") {
-			errors.push({ field: "discussion_summary", message: "discussion_summary must be a string" });
-		} else if (raw.discussion_summary.length > 8_000) {
-			errors.push({ field: "discussion_summary", message: "discussion_summary must be at most 8,000 characters" });
-		}
+	// discussion_summary — required, string, max 8,000 chars
+	if (typeof raw.discussion_summary !== "string") {
+		errors.push({ field: "discussion_summary", message: "discussion_summary is required and must be a string" });
+	} else if (raw.discussion_summary.length > 8_000) {
+		errors.push({ field: "discussion_summary", message: "discussion_summary must be at most 8,000 characters" });
 	}
 
 	if (errors.length > 0) return { ok: false, errors };
@@ -125,14 +122,14 @@ export function validateTopicReadyInput(raw: Record<string, unknown>): TopicRead
 	return {
 		ok: true,
 		value: {
-			topic_kind: isTopicKind(raw.topic_kind) ? raw.topic_kind : "risk",
-			title: typeof raw.title === "string" ? raw.title : "",
-			candidate_decision: typeof raw.candidate_decision === "string" ? raw.candidate_decision : "",
-			constraints: isStringArray(raw.constraints) ? raw.constraints : [],
-			success_criteria: isStringArray(raw.success_criteria) ? raw.success_criteria : [],
+			topic_kind: raw.topic_kind as BrainstormTopicKind,
+			title: raw.title as string,
+			candidate_decision: raw.candidate_decision as string,
+			constraints: raw.constraints as string[],
+			success_criteria: raw.success_criteria as string[],
 			unresolved_questions: isStringArray(raw.unresolved_questions) ? raw.unresolved_questions : undefined,
-			codebase_relevance: isCodebaseRelevance(raw.codebase_relevance) ? raw.codebase_relevance : "none",
-			discussion_summary: typeof raw.discussion_summary === "string" ? raw.discussion_summary : "",
+			codebase_relevance: raw.codebase_relevance as BrainstormTopicReadyInput["codebase_relevance"],
+			discussion_summary: raw.discussion_summary as string,
 		},
 	};
 }

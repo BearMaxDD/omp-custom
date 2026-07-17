@@ -14,7 +14,11 @@
  *   producing the snapshot. Orphan results are stored but flagged.
  */
 
-import type { ToolCallEvent, ToolResultEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type {
+	ExtensionContext,
+	ToolCallEvent,
+	ToolResultEvent,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { normalizeCodebaseMemory } from "./codebase-memory";
 import { normalizeTaskDelegation } from "./task-delegation";
 import type { EvidenceSnapshot, ToolCallRecord, ToolResultRecord } from "./types";
@@ -61,7 +65,7 @@ export class ToolEventCollector {
 	 * indicators) to keep the evidence log compact and avoid leaking
 	 * large prompts.
 	 */
-	recordCall(event: ToolCallEvent | LegacySyntheticToolCallEvent): void {
+	recordCall(event: ToolCallEvent | LegacySyntheticToolCallEvent, context?: ExtensionContext): void {
 		let toolName: string;
 		let toolCallId: string;
 		let serverName: string | undefined;
@@ -83,6 +87,8 @@ export class ToolEventCollector {
 			toolCallId,
 			serverName,
 			params: this.truncateParams(input),
+			cwd: context?.cwd,
+			sessionId: context?.sessionManager.getSessionId(),
 			timestamp: new Date().toISOString(),
 		});
 	}
@@ -94,8 +100,9 @@ export class ToolEventCollector {
 	 * indicator, and a result reference string (truncated to avoid storing
 	 * large blobs in memory).
 	 */
-	recordResult(event: ToolResultEvent | LegacySyntheticToolResultEvent): void {
+	recordResult(event: ToolResultEvent | LegacySyntheticToolResultEvent, _context?: ExtensionContext): void {
 		const ref = this.extractResultRef(event);
+		const details = this.extractStructuredDetails(event);
 		let toolCallId: string;
 		let isError: boolean;
 		if (isOfficialToolResultEvent(event)) {
@@ -110,6 +117,7 @@ export class ToolEventCollector {
 			toolCallId,
 			success: !isError,
 			resultRef: ref,
+			details,
 			timestamp: new Date().toISOString(),
 		});
 	}
@@ -207,6 +215,23 @@ export class ToolEventCollector {
 			return json.length > 200 ? `${json.slice(0, 200)}…` : json;
 		} catch {
 			return "[unserializable]";
+		}
+	}
+
+	private extractStructuredDetails(
+		event: ToolResultEvent | LegacySyntheticToolResultEvent,
+	): Record<string, unknown> | undefined {
+		const value = isOfficialToolResultEvent(event) ? event.details : event.result;
+		if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+		try {
+			const serialized = JSON.stringify(value);
+			if (!serialized) return undefined;
+			const parsed: unknown = JSON.parse(serialized);
+			return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+				? (parsed as Record<string, unknown>)
+				: undefined;
+		} catch {
+			return undefined;
 		}
 	}
 }

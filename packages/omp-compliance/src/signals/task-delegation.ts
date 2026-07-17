@@ -58,18 +58,19 @@ export function normalizeTaskDelegation(
 			continue;
 		}
 
-		// Parse result details from the resultRef (JSON)
-		const details = parseResultDetails(result.resultRef);
+		// Structured v17 details are authoritative; resultRef is only a text fallback.
+		const details = { ...parseResultDetails(result.resultRef), ...result.details };
 
 		const agentId = details.agentId ?? details.agent ?? call.params.agent ?? call.params.name;
 		const exitCode = details.exitCode ?? details.exit ?? details.code;
 		const aborted = details.aborted ?? details.cancelled ?? false;
 		const durationMs = details.durationMs ?? details.duration;
-		const output = details.output ?? details.outputs ?? details.artifacts;
-		const outputArtifacts = Array.isArray(output) ? output.map(String) : typeof output === "string" ? [output] : [];
+		const outputArtifacts = collectOutputArtifacts(details);
 
 		// Extract codebase references from output text
-		const codebaseRefs = extractCodebaseRefs(`${outputArtifacts.join(" ")} ${result.resultRef}`);
+		const codebaseRefs = extractCodebaseRefs(
+			`${outputArtifacts.join(" ")} ${JSON.stringify(details)} ${result.resultRef}`,
+		);
 
 		results.push({
 			agentId: agentId != null ? String(agentId) : undefined,
@@ -105,6 +106,18 @@ function parseResultDetails(ref: string): Record<string, unknown> {
 		// Not JSON — return as raw output
 		return { output: ref };
 	}
+}
+
+function collectOutputArtifacts(details: Record<string, unknown>): string[] {
+	const artifacts: string[] = [];
+	for (const value of [details.artifacts, details.outputs, details.output]) {
+		if (Array.isArray(value)) {
+			artifacts.push(...value.map(String));
+		} else if (typeof value === "string") {
+			artifacts.push(value);
+		}
+	}
+	return [...new Set(artifacts)];
 }
 
 /**
@@ -147,5 +160,5 @@ function extractCodebaseRefs(text: string): string[] {
 			}
 		}
 	}
-	return refs;
+	return [...new Set(refs)];
 }

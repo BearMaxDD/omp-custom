@@ -55,13 +55,38 @@ describe("validateTopicReadyInput", () => {
 		if (!validation.ok) expect(validation.errors.some((error) => error.field === "codebase_relevance")).toBe(true);
 	});
 
-	it("accepts minimal required fields only", () => {
-		const errors = validateTopicReadyInput({
-			topic_kind: "risk",
-			title: "Minimal topic",
-			candidate_decision: "A test decision.",
+	it("keeps schema required fields aligned with validator requirements", () => {
+		const tool = createTopicReadyTool({
+			runtime: {} as unknown as BrainstormRuntime,
+			sessionId: () => "session-1",
 		});
-		expect(errors).toEqual([]);
+		const required = [
+			"topic_kind",
+			"title",
+			"candidate_decision",
+			"constraints",
+			"success_criteria",
+			"codebase_relevance",
+			"discussion_summary",
+		];
+		const validInput: Record<string, unknown> = {
+			topic_kind: "risk",
+			title: "Required fields",
+			candidate_decision: "Keep the public contract strict.",
+			constraints: [],
+			success_criteria: [],
+			codebase_relevance: "none",
+			discussion_summary: "The required contract is settled.",
+		};
+
+		expect((tool.parameters as { required?: string[] }).required).toEqual(required);
+		for (const field of required) {
+			const input = { ...validInput };
+			delete input[field];
+			const errors = validateTopicReadyInput(input);
+			expect(errors.some((error) => error.field === field)).toBe(true);
+		}
+		expect(validateTopicReadyInput(validInput)).toEqual([]);
 	});
 
 	it("rejects missing topic_kind", () => {
@@ -219,6 +244,10 @@ describe("createTopicReadyTool", () => {
 				topic_kind: "risk",
 				title: "Failure",
 				candidate_decision: "Exercise error handling.",
+				constraints: [],
+				success_criteria: [],
+				codebase_relevance: "none",
+				discussion_summary: "Exercise the handler failure path.",
 			},
 			undefined,
 			undefined,

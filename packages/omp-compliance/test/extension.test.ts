@@ -8,7 +8,7 @@ import { EvidenceStore } from "../src/evidence/evidence-store";
 import { bindCollectorEvents } from "../src/extension";
 import { ComplianceRuntime } from "../src/runtime/compliance-runtime";
 import { CollectorRuntime } from "../src/signals/collector-runtime";
-import { FakeExtensionAPI } from "./support/fake-extension-api";
+import { FakeExtensionAPI, createFakeExtensionContext } from "./support/fake-extension-api";
 
 describe("extension v17 tool event wiring", () => {
 	it("preserves official input and correlates the result through the fake host", async () => {
@@ -36,6 +36,65 @@ describe("extension v17 tool event wiring", () => {
 		expect(snapshot.calls[0]?.params).toEqual({ name_pattern: ".*TaskTool.*" });
 		expect(snapshot.results[0]?.toolCallId).toBe("v17-call-1");
 		expect(snapshot.results[0]?.resultRef).toContain("packages/task-tool.ts");
+	});
+
+	it("preserves structured task details when content is ordinary text", async () => {
+		const api = new FakeExtensionAPI();
+		const collector = new CollectorRuntime();
+		const taskOutput = `${"x".repeat(240)} Updated packages/omp-compliance/src/signals/task-delegation.ts`;
+
+		bindCollectorEvents(api.toAPI(), collector);
+		await api.fireToolCall("task", { assignment: "Implement the v17 adapter" }, "v17-task-1");
+		await api.fireToolResult({
+			toolName: "task",
+			toolCallId: "v17-task-1",
+			input: { assignment: "Implement the v17 adapter" },
+			content: [{ type: "text", text: "Task completed successfully." }],
+			isError: false,
+			details: {
+				agentId: "agent-v17",
+				exitCode: 0,
+				durationMs: 4_321,
+				artifacts: ["artifact://task-report"],
+				output: taskOutput,
+			},
+		});
+
+		const snapshot = collector.collector.snapshot();
+		const delegation = snapshot.subagentDelegations[0];
+		expect(snapshot.results[0]?.details?.output).toBe(taskOutput);
+		expect(delegation).toEqual({
+			agentId: "agent-v17",
+			taskSummary: "Implement the v17 adapter",
+			status: "completed",
+			durationMs: 4_321,
+			exitCode: 0,
+			outputArtifacts: ["artifact://task-report", taskOutput],
+			codebaseRefs: ["packages/omp-compliance/src/signals/task-delegation.ts"],
+		});
+	});
+
+	it("records cwd and sessionId from the extension context on calls", async () => {
+		const api = new FakeExtensionAPI(
+			createFakeExtensionContext({ cwd: "/workspace/task-8", sessionId: "session-task-8" }),
+		);
+		const collector = new CollectorRuntime();
+
+		bindCollectorEvents(api.toAPI(), collector);
+		await api.fireToolCall("search_graph", { query: "Task 8" }, "v17-context-1");
+		await api.fireToolResult({
+			toolName: "search_graph",
+			toolCallId: "v17-context-1",
+			input: { query: "Task 8" },
+			content: [{ type: "text", text: "ok" }],
+			isError: false,
+			details: { matches: 1 },
+		});
+
+		expect(collector.collector.snapshot().calls[0]).toMatchObject({
+			cwd: "/workspace/task-8",
+			sessionId: "session-task-8",
+		});
 	});
 });
 

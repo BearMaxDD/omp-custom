@@ -71,8 +71,8 @@ export interface ComplianceExtensionHost {
 }
 
 export function bindCollectorEvents(api: ComplianceExtensionHost, collector: CollectorRuntime): void {
-	api.on("tool_call", (event) => collector.recordToolCall(event));
-	api.on("tool_result", (event) => collector.recordToolResult(event));
+	api.on("tool_call", (event, context) => collector.recordToolCall(event, context));
+	api.on("tool_result", (event, context) => collector.recordToolResult(event, context));
 }
 
 /**

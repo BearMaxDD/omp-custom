@@ -31,6 +31,8 @@ export class FakeExtensionAPI {
 		_request: AdvisorReviewRequest,
 	) => ({ status: "accepted", reviewId: _request.reviewId });
 
+	constructor(private readonly extensionContext: ExtensionContext = createFakeExtensionContext()) {}
+
 	registerTool<TParams extends TSchema = TSchema, TDetails = unknown>(tool: ToolDefinition<TParams, TDetails>): void {
 		this.tools.push(tool.name);
 		this.toolDefinitions.push(tool as ToolDefinition);
@@ -54,22 +56,7 @@ export class FakeExtensionAPI {
 	}
 
 	private createContext(): ExtensionContext {
-		return {
-			ui: {} as ExtensionContext["ui"],
-			getContextUsage: () => undefined,
-			compact: async () => {},
-			hasUI: false,
-			cwd: process.cwd(),
-			sessionManager: { getSessionId: () => "test-session" } as ExtensionContext["sessionManager"],
-			modelRegistry: {} as ExtensionContext["modelRegistry"],
-			model: undefined,
-			models: {} as ExtensionContext["models"],
-			isIdle: () => true,
-			abort: () => {},
-			hasPendingMessages: () => false,
-			shutdown: () => {},
-			getSystemPrompt: () => [],
-		};
+		return this.extensionContext;
 	}
 
 	sendMessage<T = unknown>(
@@ -201,4 +188,25 @@ export class FakeExtensionAPI {
 			},
 		};
 	}
+}
+
+export function createFakeExtensionContext(options: { cwd?: string; sessionId?: string } = {}): ExtensionContext {
+	return {
+		ui: {} as ExtensionContext["ui"],
+		getContextUsage: () => undefined,
+		compact: async () => {},
+		hasUI: false,
+		cwd: options.cwd ?? process.cwd(),
+		sessionManager: {
+			getSessionId: () => options.sessionId ?? "test-session",
+		} as ExtensionContext["sessionManager"],
+		modelRegistry: {} as ExtensionContext["modelRegistry"],
+		model: undefined,
+		models: {} as ExtensionContext["models"],
+		isIdle: () => true,
+		abort: () => {},
+		hasPendingMessages: () => false,
+		shutdown: () => {},
+		getSystemPrompt: () => [],
+	};
 }
