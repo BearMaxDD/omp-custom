@@ -1,7 +1,17 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	readdirSync,
+	realpathSync,
+	renameSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createProjectContext } from "../../src/project/project-context";
@@ -9,6 +19,7 @@ import {
 	PROJECT_IDENTITY_INVALID_ERROR,
 	type ProjectBinding,
 	ProjectIdentityStore,
+	normalizeRemoteIdentity,
 } from "../../src/project/project-identity";
 
 const cleanup: string[] = [];
@@ -45,20 +56,17 @@ function readBinding(root: string): ProjectBinding {
 
 describe("ProjectIdentityStore", () => {
 	it("creates one credential-free UUID binding atomically and reuses it", () => {
-		const root = initGit("https://token-user:secret-token@github.com/acme/widget.git");
+		const root = initGit("https://github.com/acme/platform/widget.git");
 		const nested = join(root, "packages", "app");
 		mkdirSync(nested, { recursive: true });
 
 		const first = ProjectIdentityStore.open(nested);
 		const second = ProjectIdentityStore.open(root);
-		const persisted = readFileSync(bindingPath(root), "utf8");
 
 		expect(first.status).toBe("bound");
 		expect(first.binding.projectId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
 		expect(second.binding.projectId).toBe(first.binding.projectId);
-		expect(first.binding.gitRemoteIdentity).toBe("acme/widget");
-		expect(persisted).not.toContain("token-user");
-		expect(persisted).not.toContain("secret-token");
+		expect(first.binding.gitRemoteIdentity).toBe("github.com/acme/platform/widget");
 		expect(existsSync(`${bindingPath(root)}.tmp`)).toBe(false);
 	});
 
@@ -133,12 +141,9 @@ describe("ProjectIdentityStore", () => {
 				}),
 			),
 		);
-		const leftovers = execFileSync("find", [join(root, ".omp", "compliance"), "-maxdepth", "1", "-type", "f"], {
-			encoding: "utf8",
-		})
-			.trim()
-			.split("\n")
-			.filter(Boolean);
+		const leftovers = readdirSync(join(root, ".omp", "compliance")).map((name) =>
+			join(root, ".omp", "compliance", name),
+		);
 
 		expect(ids.size).toBe(1);
 		expect(leftovers).toEqual([bindingPath(root)]);
@@ -161,6 +166,134 @@ describe("ProjectIdentityStore", () => {
 
 		expect(() => ProjectIdentityStore.open(root)).toThrow(PROJECT_IDENTITY_INVALID_ERROR);
 	});
+
+	it("rejects a spoofed codebase project before persistence", () => {
+		const root = initGit();
+
+		expect(() => ProjectIdentityStore.open(root, { codebaseProjectId: {} } as never)).toThrow(
+			PROJECT_IDENTITY_INVALID_ERROR,
+		);
+		expect(existsSync(bindingPath(root))).toBe(false);
+	});
+
+	it.each([
+		["unknown field", { extra: true }],
+		["non-exact schema version", { schemaVersion: "1" }],
+		["non-ISO createdAt", { createdAt: "2026-01-01" }],
+		["relative canonical root", { canonicalRoot: "repo" }],
+		["empty remote", { gitRemoteIdentity: "" }],
+		["empty codebase project", { codebaseProjectId: "" }],
+		["invalid rebound time", { reboundAt: "yesterday" }],
+	])("rejects identity JSON with %s", (_case, override) => {
+		const root = initGit();
+		mkdirSync(join(root, ".omp", "compliance"), { recursive: true });
+		writeFileSync(
+			bindingPath(root),
+			JSON.stringify({
+				schemaVersion: 1,
+				projectId: randomUUID(),
+				canonicalRoot: realpathSync(root),
+				createdAt: new Date().toISOString(),
+				...override,
+			}),
+		);
+
+		expect(() => ProjectIdentityStore.open(root)).toThrow(PROJECT_IDENTITY_INVALID_ERROR);
+	});
+
+	it.each([".omp", join(".omp", "compliance")])("rejects a %s symlink before writing outside root", (component) => {
+		const root = initGit();
+		const outside = tempProject();
+		if (component.includes("compliance")) mkdirSync(join(root, ".omp"));
+		symlinkSync(outside, join(root, component), process.platform === "win32" ? "junction" : "dir");
+
+		expect(() => ProjectIdentityStore.open(root)).toThrow(PROJECT_IDENTITY_INVALID_ERROR);
+		expect(readdirSync(outside)).toEqual([]);
+	});
+
+	it("recovers a valid stale lock owned by a dead process", async () => {
+		const root = initGit();
+		const directory = join(root, ".omp", "compliance");
+		mkdirSync(directory, { recursive: true });
+		const exitedOwner = Bun.spawn([process.execPath, "-e", ""], { stderr: "ignore", stdout: "ignore" });
+		const deadPid = exitedOwner.pid;
+		await exitedOwner.exited;
+		writeFileSync(
+			join(directory, ".project.lock"),
+			JSON.stringify({ token: randomUUID(), pid: deadPid, createdAt: new Date(0).toISOString() }),
+		);
+
+		const result = ProjectIdentityStore.open(root);
+
+		expect(result.status).toBe("bound");
+		expect(existsSync(join(directory, ".project.lock"))).toBe(false);
+	});
+
+	it("does not recover a lock owned by a live process", async () => {
+		const root = initGit();
+		const directory = join(root, ".omp", "compliance");
+		mkdirSync(directory, { recursive: true });
+		const lockPath = join(directory, ".project.lock");
+		const token = randomUUID();
+		writeFileSync(lockPath, JSON.stringify({ token, pid: process.pid, createdAt: new Date(0).toISOString() }));
+		const modulePath = join(import.meta.dir, "../../src/project/project-identity.ts");
+		const script = `import { ProjectIdentityStore } from ${JSON.stringify(modulePath)}; ProjectIdentityStore.open(${JSON.stringify(root)});`;
+		const child = Bun.spawn([process.execPath, "-e", script], { stderr: "pipe", stdout: "pipe" });
+		await Bun.sleep(100);
+		child.kill();
+		await child.exited;
+
+		expect(JSON.parse(readFileSync(lockPath, "utf8")).token).toBe(token);
+		expect(existsSync(bindingPath(root))).toBe(false);
+	});
+});
+
+describe("normalizeRemoteIdentity", () => {
+	it.each([
+		["https://github.com/acme/platform/widget.git", "github.com/acme/platform/widget"],
+		["ssh://git@github.com/acme/platform/widget.git", "github.com/acme/platform/widget"],
+		["ssh://git@github.com:22/acme/platform/widget.git", "github.com/acme/platform/widget"],
+		["git@github.com:acme/platform/widget.git", "github.com/acme/platform/widget"],
+		["https://github.com:443/acme/platform/widget.git", "github.com/acme/platform/widget"],
+		["ssh://git@[2001:db8::1]:2222/acme/widget.git", "[2001:db8::1]:2222/acme/widget"],
+		["https://GitHub.COM/acme/%77idget.git", "github.com/acme/widget"],
+	])("normalizes %s", (remote, expected) => {
+		expect(normalizeRemoteIdentity(remote)).toBe(expected);
+	});
+
+	it("keeps host, port, and the full namespace collision-resistant", () => {
+		expect(normalizeRemoteIdentity("https://git.example.com:8443/team/platform/widget.git")).not.toBe(
+			normalizeRemoteIdentity("https://git.example.com/team/platform/widget.git"),
+		);
+		expect(normalizeRemoteIdentity("https://git.example.com/team-a/platform/widget.git")).not.toBe(
+			normalizeRemoteIdentity("https://git.example.com/team-b/platform/widget.git"),
+		);
+		expect(normalizeRemoteIdentity("https://one.example.com/team/widget.git")).not.toBe(
+			normalizeRemoteIdentity("https://two.example.com/team/widget.git"),
+		);
+	});
+
+	it.each([
+		"https://user:password@host.example/org/repo.git",
+		"user:password@host.example:org/repo.git",
+		"https://host.example/org/%2Frepo.git",
+		"https://host.example/org/%ZZrepo.git",
+		"https://host.example/org/../repo.git",
+		"host.example:repo.git",
+		"not a remote",
+	])("fails closed for ambiguous remote %s", (remote) => {
+		expect(normalizeRemoteIdentity(remote)).toBeUndefined();
+	});
+
+	it("never persists credentials from an unsafe remote", () => {
+		const root = initGit("https://token-user:secret-token@github.com/acme/widget.git");
+		const result = ProjectIdentityStore.open(root);
+		const persisted = readFileSync(bindingPath(root), "utf8");
+
+		expect(result.binding.gitRemoteIdentity).toBeUndefined();
+		expect(persisted).not.toContain("token-user");
+		expect(persisted).not.toContain("secret-token");
+	});
 });
 
 describe("createProjectContext", () => {
@@ -170,7 +303,7 @@ describe("createProjectContext", () => {
 			root: "/repo",
 			remote: "acme/widget",
 			codebaseProject: "codebase-acme-widget",
-			sessionId: "session-1",
+			sessionId: randomUUID(),
 			cwd: "/repo/packages/app",
 		});
 
@@ -179,10 +312,34 @@ describe("createProjectContext", () => {
 			root: "/repo",
 			remote: "acme/widget",
 			codebaseProject: "codebase-acme-widget",
-			sessionId: "session-1",
+			sessionId: expect.any(String),
 			cwd: "/repo/packages/app",
 		});
 		expect(Object.isFrozen(context)).toBe(true);
 		expect("switchProject" in context).toBe(false);
+	});
+
+	it.each([
+		["projectId", {}],
+		["projectId", "not-a-uuid"],
+		["root", "relative/path"],
+		["root", ""],
+		["remote", ""],
+		["remote", {}],
+		["codebaseProject", ""],
+		["sessionId", "not-a-uuid"],
+		["cwd", "relative/path"],
+	])("rejects invalid runtime field %s", (field, value) => {
+		expect(() =>
+			createProjectContext({
+				projectId: randomUUID(),
+				root: "/repo",
+				remote: "github.com/acme/widget",
+				codebaseProject: "codebase-acme-widget",
+				sessionId: randomUUID(),
+				cwd: "/repo/app",
+				[field]: value,
+			} as never),
+		).toThrow("OMP project context is invalid");
 	});
 });
