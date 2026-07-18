@@ -490,6 +490,53 @@ describe("BrainstormRuntime", () => {
 		expect(restarted.registry.get(reviewId)?.requestedToolNames).toEqual(["search_graph"]);
 	});
 
+	it("Completion in-flight 与 Brainstorm queued 重启后重新启动全局队列", async () => {
+		const topicDir = tempDir();
+		const schedulerStore = new MemorySchedulerStore();
+		const first = createBrainstormRuntimeHarness({
+			topicDir,
+			schedulerStore,
+			requestAdvisorReview: async (request) => ({ status: "accepted", reviewId: request.reviewId }),
+		});
+		await first.scheduler.enqueue({
+			trigger: "compliance_review",
+			priority: 100,
+			projectId: "project-brainstorm",
+			taskId: "task-compliance",
+			contractHash: "sha256:contract",
+			evidenceRevision: "sha256:evidence",
+			gitHead: "a".repeat(40),
+			diffHash: `sha256:${"b".repeat(64)}`,
+		});
+		await first.scheduler.pump();
+		await first.runtime.submitTopic(validTopicInput());
+
+		const restarted = createBrainstormRuntimeHarness({
+			topicDir,
+			schedulerStore,
+			requestAdvisorReview: async (request) => ({ status: "accepted", reviewId: request.reviewId }),
+		});
+		await restarted.runtime.retryDueReviews();
+		expect(restarted.scheduler.snapshot().inFlight?.trigger).toBe("compliance_review");
+		const complianceReviewId = restarted.scheduler.snapshot().inFlight?.reviewId;
+		if (!complianceReviewId) throw new Error("missing restored completion review");
+		await restarted.scheduler.handleLifecycle({
+			type: "advisor_run_completed",
+			reviewId: complianceReviewId,
+			trigger: "compliance_review",
+			priority: 100,
+			primarySessionId: "primary",
+			advisorSessionId: "advisor",
+			timestamp: new Date().toISOString(),
+			verdictSubmitted: true,
+		});
+
+		const brainstormReviewId = restarted.scheduler.snapshot().inFlight?.reviewId;
+		if (!brainstormReviewId) throw new Error("missing queued brainstorm review");
+		expect(restarted.scheduler.snapshot().inFlight?.trigger).toBe("brainstorm_review");
+		expect(restarted.registry.get(brainstormReviewId)).toBeDefined();
+	});
+
 	it("失败 lifecycle 后旧 Advisor 工具的迟到 review 必须被拒绝", async () => {
 		const harness = createBrainstormRuntimeHarness({
 			requestAdvisorReview: async (request) => ({ status: "accepted", reviewId: request.reviewId }),

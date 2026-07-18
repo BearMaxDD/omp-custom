@@ -236,7 +236,7 @@ export class BrainstormRuntime {
 	private async retryDueReviewsExclusive(): Promise<void> {
 		await this.ensureSchedulerReady();
 		let topic = this.config.coordinator.current();
-		const schedulerSnapshot = this.config.scheduler.snapshot();
+		let schedulerSnapshot = this.config.scheduler.snapshot();
 		const persistedIntent = topic
 			? schedulerSnapshot.queued.find(
 					(intent) => intent.taskId === `brainstorm-${topic?.topicId}` && intent.trigger === "brainstorm_review",
@@ -247,12 +247,21 @@ export class BrainstormRuntime {
 			await this.config.coordinator.markReviewRequested(topic.topicId, envelope.reviewId, envelope);
 			this.config.registry.put(envelope);
 			this.activeEnvelope = envelope;
-			await this.config.scheduler.pump();
 			topic = this.config.coordinator.current();
 		}
 		if (topic?.reviewEnvelope && !this.activeEnvelope) {
 			this.activeEnvelope = topic.reviewEnvelope;
 			this.config.registry.put(topic.reviewEnvelope);
+		}
+		const queuedBrainstorm = schedulerSnapshot.queued.find(
+			(intent) => topic && intent.taskId === `brainstorm-${topic.topicId}` && intent.trigger === "brainstorm_review",
+		);
+		const canPumpWithoutPreparingRetry =
+			topic?.status === "ready_for_advisor_review" ||
+			(topic?.status === "advisor_reviewing" && queuedBrainstorm?.attempt === 0);
+		if (!schedulerSnapshot.inFlight && schedulerSnapshot.queued.length > 0 && canPumpWithoutPreparingRetry) {
+			await this.config.scheduler.pump();
+			schedulerSnapshot = this.config.scheduler.snapshot();
 		}
 		if (topic?.status === "advisor_reviewing" && this.activeEnvelope) {
 			const schedulerState = this.config.scheduler.snapshot();
