@@ -531,6 +531,59 @@ describe("ComplianceRuntime — lifecycle 与严格 Verdict 绑定", () => {
 		expect(runtime.currentTaskState?.status).toBe("completed");
 	});
 
+	it("Verdict 提交期间人工 override 必须排队且不能制造矛盾终态", async () => {
+		const { taskId } = await runtime.start("tdd.md");
+		await runtime.requestCompletion({ summary: "Done" });
+		const verdict = advisorVerdict(runtime, { status: "pass" });
+		const persistedEnvelope = await runtimeDependencies.readEnvelope(
+			String(runtime.currentTaskState?.taskId),
+			String(runtime.currentTaskState?.activeReviewId),
+		);
+		if (!persistedEnvelope) throw new Error("missing persisted envelope");
+		let releaseEnvelope: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			releaseEnvelope = resolve;
+		});
+		envelopeOverride = async () => {
+			await gate;
+			return persistedEnvelope;
+		};
+
+		const accepting = runtime.acceptVerdict(verdict);
+		await Bun.sleep(10);
+		const overriding = runtime.overrideCompletion("manual exception");
+		await Bun.sleep(10);
+		expect(runtime.currentTaskState?.status).toBe("advisor_reviewing");
+		releaseEnvelope?.();
+
+		expect((await accepting).accepted).toBe(true);
+		expect((await overriding).status).toBe("completed");
+		expect(runtime.currentTaskState?.status).toBe("completed");
+		const evidence = await store.readAll(taskId);
+		expect(evidence.filter((record) => record.event === "completed")).toHaveLength(1);
+	});
+
+	it("Completion 等待 Host receipt 时 stop 必须排队到事务结束", async () => {
+		let resolveReceipt: ((receipt: AdvisorReviewReceipt) => void) | undefined;
+		reviewDeps.requestAdvisorReview = (request) =>
+			new Promise((resolve) => {
+				resolveReceipt = (receipt) => resolve({ ...receipt, reviewId: request.reviewId });
+			});
+		const { taskId } = await runtime.start("tdd.md");
+		const completion = runtime.requestCompletion({ summary: "Done" });
+		await waitUntil(() => resolveReceipt !== undefined);
+		const stopping = runtime.stop();
+		await Bun.sleep(10);
+		expect(runtime.currentTaskState?.status).toBe("completion_requested");
+
+		resolveReceipt?.({ status: "accepted", reviewId: "ignored" });
+		await completion;
+		expect((await stopping).stopped).toBe(true);
+		expect(runtime.currentTaskState).toBeNull();
+		const evidence = await store.readAll(taskId);
+		expect(evidence.some((record) => record.event === "stopped")).toBe(true);
+	});
+
 	it("并发 completion 请求只持久化一个权威 Envelope", async () => {
 		const { taskId } = await runtime.start("tdd.md");
 		const first = runtime.requestCompletion({ summary: "first" });
@@ -764,6 +817,85 @@ describe("ComplianceRuntime — lifecycle 与严格 Verdict 绑定", () => {
 		expect(
 			recoveredEvidence.some((record) => record.event === "completed" && record.signalDigest === envelope.reviewId),
 		).toBe(true);
+	});
+
+	it("后续 completion 已开始时不得复活旧 remediation journal", async () => {
+		const schedulerStore = new ControllableSchedulerStore();
+		runtimeDependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			schedulerStore,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		});
+		runtime = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps, runtimeDependencies);
+		await runtime.start("tdd.md");
+		await runtime.requestCompletion({ summary: "first" });
+		await runtime.acceptVerdict(
+			advisorVerdict(runtime, {
+				status: "remediate",
+				findings: [finding("round-1", "fix round one", "apply fix")],
+			}),
+		);
+		runtime.resumeAfterRemediation();
+		const second = await runtime.requestCompletion({ summary: "second" });
+
+		const recoveredDependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			schedulerStore,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		});
+		const recovered = new ComplianceRuntime(
+			() => store,
+			new CollectorRuntime(),
+			api,
+			tmpDir,
+			reviewDeps,
+			recoveredDependencies,
+		);
+		const result = await recovered.start("tdd.md");
+
+		expect(result.status).not.toBe("remediation_required");
+		expect(recovered.currentTaskState?.activeReviewId).not.toBe(
+			(await store.readAll(String(recovered.currentTaskState?.taskId))).find(
+				(record) => record.event === "verdict_commit_prepared",
+			)?.signalDigest,
+		);
+		expect(second.reviewId).toBeDefined();
+	});
+
+	it("工作区 Git 上下文变化后不得恢复旧 pass", async () => {
+		const schedulerStore = new ControllableSchedulerStore();
+		runtimeDependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			schedulerStore,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		});
+		runtime = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps, runtimeDependencies);
+		await runtime.start("tdd.md");
+		await runtime.requestCompletion({ summary: "Done" });
+		expect((await runtime.acceptVerdict(advisorVerdict(runtime, { status: "pass" }))).accepted).toBe(true);
+
+		writeFileSync(join(tmpDir, "runtime-change.ts"), "export const changed = true;\n", "utf-8");
+		const recoveredDependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			schedulerStore,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		});
+		const recovered = new ComplianceRuntime(
+			() => store,
+			new CollectorRuntime(),
+			api,
+			tmpDir,
+			reviewDeps,
+			recoveredDependencies,
+		);
+		const result = await recovered.start("tdd.md");
+
+		expect(result.status).toBe("active");
+		expect(recovered.currentTaskState?.status).toBe("active");
 	});
 
 	it("缺任一严格 Verdict 字段均拒绝", async () => {

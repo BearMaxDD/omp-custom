@@ -211,7 +211,8 @@ export class ComplianceRuntime {
 			throw new Error("TaskContract does not match the loaded TDD contract");
 		}
 		const taskId = strictContract.taskId;
-		const recovered = await this.recoverInterruptedVerdictCommit(strictContract, contract);
+		const currentGit = this.authoritativeGit();
+		const recovered = await this.recoverInterruptedVerdictCommit(strictContract, contract, currentGit);
 		if (recovered) {
 			this.taskState = recovered;
 			this.contract = contract;
@@ -219,8 +220,6 @@ export class ComplianceRuntime {
 		}
 		const now = new Date().toISOString();
 		const seedFingerprint = `initial-${Date.now()}`;
-		const currentGit = this.authoritativeGit();
-
 		const state: TaskState = {
 			taskId,
 			projectId: strictContract.projectId,
@@ -271,7 +270,11 @@ export class ComplianceRuntime {
 	 * Records a `stopped` evidence event and clears state.
 	 * Returns false if no task is active.
 	 */
-	async stop(): Promise<{ stopped: boolean }> {
+	stop(): Promise<{ stopped: boolean }> {
+		return this.serializeRuntimeOperation(() => this.stopExclusive());
+	}
+
+	private async stopExclusive(): Promise<{ stopped: boolean }> {
 		if (!this.taskState) {
 			return { stopped: false };
 		}
@@ -797,7 +800,11 @@ export class ComplianceRuntime {
 		this.taskState = transition(this.taskState, { type: "advisor_accepted", reviewId: retryEnvelope.reviewId });
 	}
 
-	overrideCompletion(reason: string): TaskState {
+	overrideCompletion(reason: string): Promise<TaskState> {
+		return this.serializeRuntimeOperation(() => this.overrideCompletionExclusive(reason));
+	}
+
+	private async overrideCompletionExclusive(reason: string): Promise<TaskState> {
 		if (!this.taskState) throw new Error("No active compliance task");
 		if (typeof reason !== "string" || reason.trim().length === 0 || reason.length > 2048) {
 			throw new Error("Override reason must be bounded and non-empty");
@@ -918,12 +925,17 @@ export class ComplianceRuntime {
 	private async recoverInterruptedVerdictCommit(
 		taskContract: TaskContract,
 		contract: ComplianceContract,
+		currentGit: { gitHead: string; diffHash: `sha256:${string}` },
 	): Promise<TaskState | undefined> {
 		const taskId = taskContract.taskId;
 		const records = (await this.evidenceStore.readAll(taskId)) as VerdictCommitEvidenceRecord[];
 		const preparedIndex = records.findLastIndex((record) => record.event === "verdict_commit_prepared");
 		if (preparedIndex < 0) return undefined;
 		const prepared = records[preparedIndex];
+		const laterRecords = records.slice(preparedIndex + 1);
+		if (laterRecords.some((record) => record.event === "completion_requested" || record.event === "completion_retry")) {
+			return undefined;
+		}
 		const recovery = prepared.commitRecovery;
 		if (
 			!recovery ||
@@ -937,6 +949,13 @@ export class ComplianceRuntime {
 			throw new Error("Verdict commit recovery journal is invalid");
 		}
 		if (
+			recovery.reviewEnvelope.gitHead !== currentGit.gitHead ||
+			recovery.reviewEnvelope.diffHash !== currentGit.diffHash
+		) {
+			await this.scheduler.abandonReview(recovery.reviewEnvelope.reviewId);
+			return undefined;
+		}
+		if (
 			recovery.status === "remediate" &&
 			(!Array.isArray(recovery.requiredFixes) ||
 				recovery.requiredFixes.length === 0 ||
@@ -945,9 +964,9 @@ export class ComplianceRuntime {
 			throw new Error("Verdict commit recovery fixes are invalid");
 		}
 		const expectedTerminal = recovery.status === "pass" ? "completed" : "remediation_required";
-		const terminal = records
-			.slice(preparedIndex + 1)
-			.find((record) => record.signalDigest === recovery.reviewEnvelope.reviewId && record.event === expectedTerminal);
+		const terminal = laterRecords.find(
+			(record) => record.signalDigest === recovery.reviewEnvelope.reviewId && record.event === expectedTerminal,
+		);
 		const schedulerState = this.scheduler.snapshot();
 		const schedulerCompleted = schedulerState.completed.some(
 			(intent) => intent.reviewId === recovery.reviewEnvelope.reviewId,
