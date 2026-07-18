@@ -32,7 +32,6 @@ const READ_ONLY_COMMANDS = new Set([
 	"wc",
 	"which",
 ]);
-const READ_ONLY_GIT_COMMANDS = new Set(["diff", "grep", "log", "ls-files", "rev-parse", "show"]);
 const SIMPLE_MUTATION_COMMANDS = new Set(["mkdir", "rm", "rmdir", "touch", "truncate", "unlink"]);
 
 export type PreToolActor = "main" | "advisor";
@@ -411,9 +410,6 @@ function classifyShell(args: Record<string, unknown>): ShellClassification {
 			token.startsWith("--output="),
 	);
 	if (!unsafeReadOption && READ_ONLY_COMMANDS.has(command)) return { kind: "read" };
-	if (!unsafeReadOption && command === "git" && tokens.length > 1 && READ_ONLY_GIT_COMMANDS.has(tokens[1])) {
-		return { kind: "read" };
-	}
 	if (SIMPLE_MUTATION_COMMANDS.has(command)) return { kind: "write", targets: operands(tokens, 1) };
 	if (command === "cp") {
 		const parsed = operands(tokens, 1);

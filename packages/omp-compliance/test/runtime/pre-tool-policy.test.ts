@@ -250,12 +250,32 @@ describe("PreToolPolicy decision matrix", () => {
 	});
 
 	it("allows a proven read-only shell command without write gates", () => {
-		const decision = new PreToolPolicy(recorder().sink).evaluate(builtinCall("bash", { command: "git diff --check" }), {
-			evidenceRevision: REVISION,
-		});
+		const decision = new PreToolPolicy(recorder().sink).evaluate(
+			builtinCall("bash", { command: "cat src/existing.ts" }),
+			{
+				evidenceRevision: REVISION,
+			},
+		);
 
 		expect(decision).toEqual({ allow: true });
 	});
+
+	it.each(["git diff --check", "git show HEAD", "git log -1"])(
+		"does not prove a Git command read-only from its subcommand name: %s",
+		(command) => {
+			const policy = new PreToolPolicy(recorder().sink);
+			expect(
+				policy.evaluate(builtinCall("bash", { command }), {
+					evidenceRevision: REVISION,
+				}),
+			).toEqual({ allow: false, reason: "missing_contract" });
+
+			const valid = trustedEvidence();
+			expect(
+				policy.evaluate(builtinCall("bash", { command }, { evidenceRevision: valid.evidenceRevision }), valid),
+			).toEqual({ allow: false, reason: "scope_violation" });
+		},
+	);
 
 	it("does not treat git status as read-only without a controlled environment", () => {
 		const decision = new PreToolPolicy(recorder().sink).evaluate(
