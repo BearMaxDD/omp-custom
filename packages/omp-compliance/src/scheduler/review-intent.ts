@@ -1,7 +1,20 @@
+import { types as utilTypes } from "node:util";
+
+export const REVIEW_TRIGGER_PRIORITIES = Object.freeze({
+	compliance_review: 100,
+	manual_review: 80,
+	brainstorm_review: 80,
+	git_pre_push: 70,
+	impact_analysis: 60,
+	file_change: 40,
+	scheduled: 20,
+} as const);
+
+export type ReviewTrigger = keyof typeof REVIEW_TRIGGER_PRIORITIES;
 export type ReviewIntentStatus = "queued" | "in_flight" | "stalled" | "completed";
 
 export interface ReviewIntentInput {
-	readonly trigger: string;
+	readonly trigger: ReviewTrigger;
 	readonly priority: number;
 	readonly projectId: string;
 	readonly taskId?: string;
@@ -10,11 +23,13 @@ export interface ReviewIntentInput {
 	readonly evidenceRevision: string;
 	readonly gitHead: string;
 	readonly diffHash: string;
-	readonly forceNonce?: string;
+	readonly force?: boolean;
 	readonly metadata?: Readonly<Record<string, unknown>>;
 }
 
 export interface ReviewIntent extends ReviewIntentInput {
+	readonly baseDedupeKey: string;
+	readonly forceNonce?: string;
 	readonly dedupeKey: string;
 	readonly reviewId: string;
 	readonly status: ReviewIntentStatus;
@@ -22,10 +37,14 @@ export interface ReviewIntent extends ReviewIntentInput {
 	readonly notBefore: number;
 	readonly createdAt: number;
 	readonly updatedAt: number;
+	readonly sequence: number;
 }
 
 export const REVIEW_INTENT_MAX_STRING_LENGTH = 256;
 export const REVIEW_INTENT_MAX_METADATA_BYTES = 32 * 1024;
+export const REVIEW_INTENT_MAX_METADATA_DEPTH = 8;
+export const REVIEW_INTENT_MAX_METADATA_NODES = 512;
+export const REVIEW_INTENT_MAX_METADATA_KEYS = 1_024;
 
 function boundedString(name: string, value: unknown, required: true): string;
 function boundedString(name: string, value: unknown, required: false): string | undefined;
@@ -40,41 +59,100 @@ function boundedString(name: string, value: unknown, required: boolean): string 
 	return value;
 }
 
+interface MetadataBudget {
+	nodes: number;
+	keys: number;
+	readonly seen: WeakSet<object>;
+}
+
+function cloneMetadataValue(value: unknown, depth: number, budget: MetadataBudget): unknown {
+	if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+	if (typeof value === "number") {
+		if (!Number.isFinite(value)) throw new Error("metadata contains a non-finite number");
+		return value;
+	}
+	if (typeof value !== "object") throw new Error("metadata contains an unsupported value");
+	if (utilTypes.isProxy(value)) throw new Error("metadata must not contain Proxy values");
+	if (depth > REVIEW_INTENT_MAX_METADATA_DEPTH) throw new Error("metadata exceeds maximum depth");
+	if (budget.seen.has(value)) throw new Error("metadata must not contain cycles");
+	budget.seen.add(value);
+	budget.nodes++;
+	if (budget.nodes > REVIEW_INTENT_MAX_METADATA_NODES) throw new Error("metadata exceeds node limit");
+
+	const prototype = Object.getPrototypeOf(value);
+	const array = Array.isArray(value);
+	if (array ? prototype !== Array.prototype : prototype !== Object.prototype && prototype !== null) {
+		throw new Error("metadata must contain only plain objects and arrays");
+	}
+	if (Object.getOwnPropertySymbols(value).length > 0) throw new Error("metadata must not contain symbol keys");
+	const descriptors = Object.getOwnPropertyDescriptors(value);
+	const keys = Object.keys(descriptors).filter((key) => key !== "length");
+	budget.keys += keys.length;
+	if (budget.keys > REVIEW_INTENT_MAX_METADATA_KEYS) throw new Error("metadata exceeds key limit");
+
+	if (array) {
+		if (value.length > REVIEW_INTENT_MAX_METADATA_KEYS || keys.length !== value.length) {
+			throw new Error("metadata arrays must be dense and bounded");
+		}
+		const output: unknown[] = [];
+		for (let index = 0; index < value.length; index++) {
+			const descriptor = descriptors[String(index)];
+			if (!descriptor || "get" in descriptor || "set" in descriptor) {
+				throw new Error("metadata must not contain accessors");
+			}
+			output.push(cloneMetadataValue(descriptor.value, depth + 1, budget));
+		}
+		return Object.freeze(output);
+	}
+
+	const output: Record<string, unknown> = {};
+	for (const key of keys) {
+		const descriptor = descriptors[key];
+		if (!descriptor || "get" in descriptor || "set" in descriptor) {
+			throw new Error("metadata must not contain accessors");
+		}
+		Object.defineProperty(output, key, {
+			value: cloneMetadataValue(descriptor.value, depth + 1, budget),
+			enumerable: true,
+			configurable: false,
+			writable: false,
+		});
+	}
+	return Object.freeze(output);
+}
+
 function sanitizeMetadata(metadata: ReviewIntentInput["metadata"]): Readonly<Record<string, unknown>> | undefined {
 	if (metadata === undefined) return undefined;
-	if (metadata === null || Array.isArray(metadata) || typeof metadata !== "object") {
+	let cloned: unknown;
+	try {
+		cloned = cloneMetadataValue(metadata, 0, { nodes: 0, keys: 0, seen: new WeakSet() });
+	} catch {
+		throw new Error("metadata must contain bounded plain JSON values");
+	}
+	if (cloned === null || Array.isArray(cloned) || typeof cloned !== "object") {
 		throw new Error("metadata must be a JSON object");
 	}
-	let serialized: string;
-	try {
-		serialized = JSON.stringify(metadata, (_key, value: unknown) => {
-			if (
-				typeof value === "bigint" ||
-				typeof value === "function" ||
-				typeof value === "symbol" ||
-				typeof value === "undefined" ||
-				(typeof value === "number" && !Number.isFinite(value))
-			) {
-				throw new Error("unsupported metadata value");
-			}
-			return value;
-		});
-	} catch {
-		throw new Error("metadata must contain bounded JSON values");
-	}
+	const serialized = JSON.stringify(cloned);
 	if (new TextEncoder().encode(serialized).byteLength > REVIEW_INTENT_MAX_METADATA_BYTES) {
 		throw new Error(`metadata exceeds ${REVIEW_INTENT_MAX_METADATA_BYTES} bytes`);
 	}
-	return Object.freeze(JSON.parse(serialized) as Record<string, unknown>);
+	return cloned as Readonly<Record<string, unknown>>;
 }
 
 export function normalizeReviewIntentInput(input: ReviewIntentInput): ReviewIntentInput {
-	if (!Number.isInteger(input.priority) || input.priority < -1_000 || input.priority > 1_000) {
-		throw new Error("priority must be an integer between -1000 and 1000");
+	if (input === null || typeof input !== "object" || utilTypes.isProxy(input)) {
+		throw new Error("review intent must be a plain object");
 	}
+	if (!Object.hasOwn(REVIEW_TRIGGER_PRIORITIES, input.trigger)) throw new Error("trigger is not supported");
+	const expectedPriority = REVIEW_TRIGGER_PRIORITIES[input.trigger];
+	if (input.priority !== expectedPriority) {
+		throw new Error(`priority for ${input.trigger} must be ${expectedPriority}`);
+	}
+	if (input.force !== undefined && typeof input.force !== "boolean") throw new Error("force must be boolean");
+	if (input.force && input.trigger !== "manual_review") throw new Error("force is only valid for manual_review");
 	return Object.freeze({
-		trigger: boundedString("trigger", input.trigger, true),
-		priority: input.priority,
+		trigger: input.trigger,
+		priority: expectedPriority,
 		projectId: boundedString("projectId", input.projectId, true),
 		taskId: boundedString("taskId", input.taskId, false),
 		topicId: boundedString("topicId", input.topicId, false),
@@ -82,7 +160,7 @@ export function normalizeReviewIntentInput(input: ReviewIntentInput): ReviewInte
 		evidenceRevision: boundedString("evidenceRevision", input.evidenceRevision, true),
 		gitHead: boundedString("gitHead", input.gitHead, true),
 		diffHash: boundedString("diffHash", input.diffHash, true),
-		forceNonce: boundedString("forceNonce", input.forceNonce, false),
+		force: input.force === true ? true : undefined,
 		metadata: sanitizeMetadata(input.metadata),
 	});
 }

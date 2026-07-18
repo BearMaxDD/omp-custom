@@ -1,4 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type {
 	AdvisorReviewLifecycleEvent,
 	AdvisorReviewReceipt,
@@ -7,6 +10,7 @@ import type {
 import { buildReviewDedupeKey } from "../../src/scheduler/dedupe-key";
 import type { ReviewIntentInput } from "../../src/scheduler/review-intent";
 import {
+	JsonFileReviewSchedulerStore,
 	ReviewScheduler,
 	type ReviewSchedulerState,
 	type ReviewSchedulerStore,
@@ -33,7 +37,7 @@ class MemoryStore implements ReviewSchedulerStore {
 function intent(overrides: Partial<ReviewIntentInput> = {}): ReviewIntentInput {
 	return {
 		trigger: "file_change",
-		priority: 20,
+		priority: 40,
 		projectId: "project-a",
 		taskId: "task-a",
 		contractHash: "sha256:contract-a",
@@ -53,6 +57,7 @@ function defined<T>(value: T | undefined): T {
 function terminal(
 	reviewId: string,
 	type: "advisor_run_completed" | "advisor_run_failed" | "advisor_run_cancelled",
+	verdictSubmitted = true,
 ): AdvisorReviewLifecycleEvent {
 	const base = {
 		reviewId,
@@ -62,7 +67,7 @@ function terminal(
 		advisorSessionId: "advisor",
 		timestamp: "2026-07-18T00:00:01.000Z",
 	};
-	if (type === "advisor_run_completed") return { ...base, type, verdictSubmitted: true };
+	if (type === "advisor_run_completed") return { ...base, type, verdictSubmitted };
 	if (type === "advisor_run_failed") {
 		return { ...base, type, failureClass: "provider", errorSummary: "provider unavailable" };
 	}
@@ -72,12 +77,15 @@ function terminal(
 function harness(
 	options: {
 		receipts?: AdvisorReviewReceipt[];
-		store?: MemoryStore;
+		store?: ReviewSchedulerStore;
 		random?: () => number;
 		maxQueueSize?: number;
+		nonceSource?: () => string;
+		requester?: (request: AdvisorReviewRequest) => Promise<AdvisorReviewReceipt>;
+		clock?: FakeClock;
 	} = {},
 ) {
-	const clock = new FakeClock();
+	const clock = options.clock ?? new FakeClock();
 	const requests: AdvisorReviewRequest[] = [];
 	const receipts = [...(options.receipts ?? [])];
 	const store = options.store ?? new MemoryStore();
@@ -86,10 +94,13 @@ function harness(
 		random: options.random ?? (() => 0.5),
 		store,
 		maxQueueSize: options.maxQueueSize,
-		requester: async (request) => {
-			requests.push(structuredClone(request));
-			return receipts.shift() ?? { reviewId: request.reviewId, status: "accepted" };
-		},
+		nonceSource: options.nonceSource,
+		requester:
+			options.requester ??
+			(async (request) => {
+				requests.push(structuredClone(request));
+				return receipts.shift() ?? { reviewId: request.reviewId, status: "accepted" };
+			}),
 	});
 	return { clock, requests, scheduler, store };
 }
@@ -107,13 +118,13 @@ describe("ReviewScheduler", () => {
 		const active = scheduler.snapshot().inFlight;
 		expect(active?.status).toBe("in_flight");
 
-		await scheduler.enqueue(intent({ trigger: "manual_review", priority: 120, forceNonce: "manual-1" }));
+		await scheduler.enqueue(intent({ trigger: "manual_review", priority: 80, force: true }));
 		await scheduler.pump();
 		expect(requests).toHaveLength(1);
 
 		await scheduler.handleLifecycle(terminal(defined(active).reviewId, "advisor_run_completed"));
 		await scheduler.pump();
-		expect(requests[1]?.priority).toBe(120);
+		expect(requests[1]?.priority).toBe(80);
 	});
 
 	it("uses a stable SHA-256 key over every review identity field", () => {
@@ -142,28 +153,34 @@ describe("ReviewScheduler", () => {
 		expect(first.kind).toBe("enqueued");
 		expect(duplicate.kind).toBe("deduplicated");
 
-		const impact = await scheduler.enqueue(intent({ trigger: "impact_analysis", priority: 40 }));
+		const impact = await scheduler.enqueue(intent({ trigger: "impact_analysis", priority: 60 }));
 		expect(impact.kind).toBe("enqueued");
 		expect(scheduler.snapshot().queued.map((item) => item.trigger)).toEqual(["impact_analysis"]);
-		const absorbed = await scheduler.enqueue(intent({ trigger: "file_change", priority: 20 }));
-		expect(absorbed.kind).toBe("absorbed");
+		const absorbed = await scheduler.enqueue(intent({ trigger: "file_change", priority: 40 }));
+		expect(absorbed.kind).toBe("deduplicated");
+		const fresh = harness().scheduler;
+		await fresh.enqueue(intent({ trigger: "impact_analysis", priority: 60 }));
+		expect((await fresh.enqueue(intent({ trigger: "file_change", priority: 40 }))).kind).toBe("absorbed");
 
-		const manualOne = await scheduler.enqueue(intent({ trigger: "manual_review", priority: 80, forceNonce: "one" }));
-		const manualTwo = await scheduler.enqueue(intent({ trigger: "manual_review", priority: 80, forceNonce: "two" }));
+		const nonceValues = ["one", "two"];
+		const forced = harness({ nonceSource: () => defined(nonceValues.shift()) }).scheduler;
+		const manualOne = await forced.enqueue(intent({ trigger: "manual_review", priority: 80, force: true }));
+		const manualTwo = await forced.enqueue(intent({ trigger: "manual_review", priority: 80, force: true }));
 		expect(manualOne.intent.dedupeKey).not.toBe(manualTwo.intent.dedupeKey);
+		expect(manualOne.intent.baseDedupeKey).toBe(manualTwo.intent.baseDedupeKey);
 	});
 
 	it("allows impact analysis to replace an absorbed file change at queue capacity", async () => {
 		const { scheduler } = harness({ maxQueueSize: 1 });
-		await scheduler.enqueue(intent({ trigger: "file_change", priority: 20 }));
-		await expect(scheduler.enqueue(intent({ trigger: "impact_analysis", priority: 40 }))).resolves.toMatchObject({
+		await scheduler.enqueue(intent({ trigger: "file_change", priority: 40 }));
+		await expect(scheduler.enqueue(intent({ trigger: "impact_analysis", priority: 60 }))).resolves.toMatchObject({
 			kind: "enqueued",
 		});
 		expect(scheduler.snapshot().queued.map((item) => item.trigger)).toEqual(["impact_analysis"]);
 	});
 
 	it("keeps accepted in flight until a lifecycle terminal and retries failures at 5s, 10s, and 20s", async () => {
-		const { clock, requests, scheduler } = harness({ random: () => 0.5 });
+		const { clock, requests, scheduler } = harness({ random: () => 0 });
 		await scheduler.enqueue(intent({ trigger: "compliance_review", priority: 100 }));
 		await scheduler.pump();
 		const reviewId = defined(requests[0]).reviewId;
@@ -208,7 +225,7 @@ describe("ReviewScheduler", () => {
 			await scheduler.pump();
 			const queued = defined(scheduler.snapshot().queued[0]);
 			const base = Math.min(5_000 * 2 ** (attempt - 1), 300_000);
-			expect(queued.notBefore).toBe(before + Math.min(Math.round(base * 1.2), 300_000));
+			expect(queued.notBefore).toBe(before + Math.round(base * 1.2));
 			expect(queued.status).toBe("stalled");
 			clock.advance(queued.notBefore - clock.now());
 		}
@@ -264,7 +281,209 @@ describe("ReviewScheduler", () => {
 		await scheduler.enqueue(intent({ taskId: "two" }));
 		await expect(scheduler.enqueue(intent({ taskId: "three" }))).rejects.toThrow("capacity");
 		await expect(scheduler.enqueue(intent({ projectId: "x".repeat(257) }))).rejects.toThrow("projectId");
-		await expect(scheduler.enqueue(intent({ trigger: "manual_review", forceNonce: "" }))).rejects.toThrow("forceNonce");
+		const available = harness().scheduler;
+		await expect(
+			available.enqueue(intent({ trigger: "manual_review", priority: 80, force: false })),
+		).resolves.toBeDefined();
 		await expect(scheduler.enqueue(intent({ metadata: { payload: "x".repeat(33_000) } }))).rejects.toThrow("metadata");
+	});
+
+	it("does not let an in-flight impact analysis absorb a later file change", async () => {
+		const { scheduler } = harness();
+		await scheduler.enqueue(intent({ trigger: "impact_analysis", priority: 60 }));
+		await scheduler.pump();
+		const result = await scheduler.enqueue(intent({ trigger: "file_change", priority: 40 }));
+		expect(result.kind).toBe("enqueued");
+		expect(scheduler.snapshot().queued).toHaveLength(1);
+	});
+
+	it("stalls completed runs without a verdict and retries without a business limit", async () => {
+		const { clock, scheduler } = harness({ random: () => 0 });
+		await scheduler.enqueue(intent({ trigger: "compliance_review", priority: 100 }));
+		await scheduler.pump();
+		const active = defined(scheduler.snapshot().inFlight);
+		await scheduler.handleLifecycle(terminal(active.reviewId, "advisor_run_completed", false));
+		expect(scheduler.snapshot().completed).toHaveLength(0);
+		expect(scheduler.snapshot().queued[0]).toMatchObject({ status: "stalled", notBefore: clock.now() + 5_000 });
+	});
+
+	it("validates trigger priorities and generates manual force nonces internally", async () => {
+		const nonces = ["nonce-a", "nonce-b"];
+		const { scheduler } = harness({ nonceSource: () => defined(nonces.shift()) });
+		await expect(scheduler.enqueue(intent({ trigger: "unknown", priority: 40 }))).rejects.toThrow("trigger");
+		await expect(scheduler.enqueue(intent({ trigger: "compliance_review", priority: 80 }))).rejects.toThrow("priority");
+		await expect(scheduler.enqueue(intent({ trigger: "file_change", priority: 40, force: true }))).rejects.toThrow(
+			"force",
+		);
+		const first = await scheduler.enqueue(intent({ trigger: "manual_review", priority: 80, force: true }));
+		const second = await scheduler.enqueue(intent({ trigger: "manual_review", priority: 80, force: true }));
+		expect(first.intent.forceNonce).toBe("nonce-a");
+		expect(second.intent.forceNonce).toBe("nonce-b");
+	});
+
+	it("dispatches equal-priority due work by creation order, not notBefore order", async () => {
+		const clock = new FakeClock();
+		const { scheduler, requests } = harness({ clock });
+		await scheduler.enqueue(intent({ taskId: "older" }));
+		clock.advance(1);
+		await scheduler.enqueue(intent({ taskId: "newer" }));
+		const state = scheduler.snapshot();
+		const older = defined(state.queued.find((item) => item.taskId === "older"));
+		const newer = defined(state.queued.find((item) => item.taskId === "newer"));
+		const store = new MemoryStore();
+		store.state = {
+			...state,
+			queued: [
+				{ ...older, notBefore: clock.now() },
+				{ ...newer, notBefore: clock.now() - 1 },
+			],
+		};
+		const restored = harness({ store, clock });
+		await restored.scheduler.restore();
+		await restored.scheduler.pump();
+		expect(restored.requests[0]?.metadata?.taskId).toBe("older");
+		expect(requests).toHaveLength(0);
+	});
+
+	it("does not resurrect a terminal review when requester rejection races lifecycle completion", async () => {
+		let rejectRequest: ((reason: Error) => void) | undefined;
+		const requester = () =>
+			new Promise<AdvisorReviewReceipt>((_resolve, reject) => {
+				rejectRequest = reject;
+			});
+		const { scheduler } = harness({ requester });
+		await scheduler.enqueue(intent({ trigger: "compliance_review", priority: 100 }));
+		const pumping = scheduler.pump();
+		while (!scheduler.snapshot().inFlight) await Promise.resolve();
+		const reviewId = defined(scheduler.snapshot().inFlight).reviewId;
+		await scheduler.handleLifecycle(terminal(reviewId, "advisor_run_completed"));
+		defined(rejectRequest)(new Error("late rejection"));
+		await pumping;
+		expect(scheduler.snapshot()).toMatchObject({ queued: [], inFlight: undefined });
+		expect(scheduler.snapshot().completed).toHaveLength(1);
+	});
+
+	it("serializes persistence so an older snapshot cannot overwrite a newer enqueue", async () => {
+		let releaseFirst: (() => void) | undefined;
+		let saves = 0;
+		let concurrent = 0;
+		let maxConcurrent = 0;
+		const store: ReviewSchedulerStore & { state?: ReviewSchedulerState } = {
+			async load() {
+				return structuredClone(this.state);
+			},
+			async save(state) {
+				saves++;
+				concurrent++;
+				maxConcurrent = Math.max(maxConcurrent, concurrent);
+				if (saves === 1) {
+					await new Promise<void>((resolve) => {
+						releaseFirst = resolve;
+					});
+				}
+				this.state = structuredClone(state);
+				concurrent--;
+			},
+		};
+		const { scheduler } = harness({ store });
+		const one = scheduler.enqueue(intent({ taskId: "one" }));
+		while (!releaseFirst) await Promise.resolve();
+		const two = scheduler.enqueue(intent({ taskId: "two" }));
+		defined(releaseFirst)();
+		await Promise.all([one, two]);
+		expect(maxConcurrent).toBe(1);
+		expect(store.state?.queued).toHaveLength(2);
+	});
+
+	it("keeps a permanent dedupe ledger after completed history compaction", async () => {
+		const { scheduler } = harness();
+		const firstInput = intent({ taskId: "task-0" });
+		for (let index = 0; index < 257; index++) {
+			await scheduler.enqueue(intent({ taskId: `task-${index}` }));
+			await scheduler.pump();
+			const reviewId = defined(scheduler.snapshot().inFlight).reviewId;
+			await scheduler.handleLifecycle(terminal(reviewId, "advisor_run_completed"));
+		}
+		expect(scheduler.snapshot().completed).toHaveLength(256);
+		expect((await scheduler.enqueue(firstInput)).kind).toBe("deduplicated");
+	});
+
+	it("rejects accessor, proxy, toJSON and mutable nested metadata", async () => {
+		const { scheduler } = harness();
+		const accessor = Object.defineProperty({}, "secret", { enumerable: true, get: () => "x" });
+		await expect(scheduler.enqueue(intent({ metadata: accessor }))).rejects.toThrow("metadata");
+		await expect(scheduler.enqueue(intent({ metadata: new Proxy({}, {}) }))).rejects.toThrow("metadata");
+		await expect(scheduler.enqueue(intent({ metadata: { toJSON: () => "forged" } }))).rejects.toThrow("metadata");
+		const result = await scheduler.enqueue(intent({ metadata: { nested: { value: "original" } } }));
+		const nested = result.intent.metadata?.nested as { value: string };
+		expect(() => {
+			nested.value = "changed";
+		}).toThrow();
+		expect((scheduler.snapshot().queued[0]?.metadata?.nested as { value: string }).value).toBe("original");
+		expect(() => (scheduler.snapshot().queued as ReviewIntentInput[]).push(intent())).toThrow();
+	});
+
+	it("restores atomically and rejects duplicate keys or forged derived review IDs", async () => {
+		const store = new MemoryStore();
+		const { scheduler } = harness({ store });
+		await scheduler.enqueue(intent({ taskId: "valid" }));
+		const before = scheduler.snapshot();
+		const duplicate = defined(store.state?.queued[0]);
+		store.state = { ...defined(store.state), queued: [duplicate, duplicate] };
+		await expect(scheduler.restore()).rejects.toThrow("duplicate");
+		expect(scheduler.snapshot()).toEqual(before);
+		store.state = { ...defined(store.state), queued: [{ ...duplicate, reviewId: "review:forged:0" }] };
+		await expect(scheduler.restore()).rejects.toThrow("reviewId");
+		expect(scheduler.snapshot()).toEqual(before);
+	});
+
+	it("rejects non-finite clocks and oversized persisted state files", async () => {
+		const invalidClock = new FakeClock();
+		invalidClock.nowMs = Number.NaN;
+		const { scheduler } = harness({ clock: invalidClock });
+		await expect(scheduler.enqueue(intent())).rejects.toThrow("clock");
+
+		const directory = await mkdtemp(join(tmpdir(), "omp-review-store-"));
+		try {
+			const path = join(directory, "state.json");
+			await writeFile(path, "x".repeat(8 * 1024 * 1024 + 1));
+			await expect(new JsonFileReviewSchedulerStore(path).load()).rejects.toThrow("size");
+		} finally {
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed without losing work when retry time or attempt arithmetic overflows", async () => {
+		const nearLimit = new FakeClock();
+		nearLimit.nowMs = Number.MAX_SAFE_INTEGER;
+		const overflow = harness({
+			clock: nearLimit,
+			receipts: [{ reviewId: "rejected", status: "rejected" }],
+			random: () => 0,
+		});
+		await overflow.scheduler.enqueue(intent());
+		await expect(overflow.scheduler.pump()).rejects.toThrow("retry time");
+		expect(overflow.scheduler.snapshot().inFlight).toBeDefined();
+
+		const store = new MemoryStore();
+		const seeded = harness({ store });
+		await seeded.scheduler.enqueue(intent());
+		const state = defined(store.state);
+		const queued = defined(state.queued[0]);
+		store.state = {
+			...state,
+			queued: [
+				{
+					...queued,
+					status: "stalled",
+					attempt: 1_000_000,
+					reviewId: `review:${queued.dedupeKey.slice("sha256:".length)}:1000000`,
+				},
+			],
+		};
+		const restored = harness({ store });
+		await restored.scheduler.restore();
+		await expect(restored.scheduler.pump()).rejects.toThrow("attempt capacity");
+		expect(restored.scheduler.snapshot().queued).toHaveLength(1);
 	});
 });

@@ -1,8 +1,12 @@
 import { createHash } from "node:crypto";
 import type { ReviewIntentInput } from "./review-intent";
 
+function sha256(identity: readonly unknown[]): string {
+	return `sha256:${createHash("sha256").update(JSON.stringify(identity)).digest("hex")}`;
+}
+
 export function buildReviewDedupeKey(input: ReviewIntentInput): string {
-	const identity = [
+	return sha256([
 		input.trigger,
 		input.projectId,
 		input.taskId ?? null,
@@ -11,7 +15,9 @@ export function buildReviewDedupeKey(input: ReviewIntentInput): string {
 		input.evidenceRevision,
 		input.gitHead,
 		input.diffHash,
-		input.forceNonce ?? null,
-	];
-	return `sha256:${createHash("sha256").update(JSON.stringify(identity)).digest("hex")}`;
+	]);
+}
+
+export function buildForcedReviewDedupeKey(baseDedupeKey: string, nonce: string): string {
+	return sha256([baseDedupeKey, nonce]);
 }
