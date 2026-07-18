@@ -370,7 +370,7 @@ describe("ComplianceRuntime — persisted recovery", () => {
 		expect(recoveredRuntime.currentTaskState?.activeReviewId).not.toBe(persisted.activeEnvelope?.reviewId);
 	});
 
-	it("session 恢复会续提已提交但终态 state 未落盘的 Verdict journal", async () => {
+	it("session 恢复会续提 remediate journal 并重新下发修复任务", async () => {
 		const schedulerStore = new ControllableSchedulerStore();
 		let persisted: ComplianceRuntimePersistenceSnapshot | undefined;
 		const firstDependencies = createStrictRuntimeDependencies({
@@ -399,7 +399,12 @@ describe("ComplianceRuntime — persisted recovery", () => {
 			attempt: persisted.taskState.attempt,
 			event: "verdict_commit_prepared",
 			signalDigest: persisted.activeEnvelope.reviewId,
-			commitRecovery: { reviewEnvelope: persisted.activeEnvelope, status: "pass" },
+			commitRecovery: {
+				reviewEnvelope: persisted.activeEnvelope,
+				status: "remediate",
+				summary: "需要补充恢复验证",
+				requiredFixes: ["补充崩溃恢复测试"],
+			},
 		} as never);
 		await firstDependencies.scheduler.handleLifecycle(
 			{
@@ -430,10 +435,13 @@ describe("ComplianceRuntime — persisted recovery", () => {
 			recoveredDependencies,
 		);
 		await recoveredDependencies.scheduler.restore();
+		const messagesBeforeRecovery = api.sentMessages.length;
 		await recovered.restorePersistedState(firstDependencies.strictEvidence().taskContract, persisted);
 
-		expect(recovered.currentTaskState?.status).toBe("completed");
-		expect((await store.readAll(taskId)).some((record) => record.event === "completed")).toBe(true);
+		expect(recovered.currentTaskState?.status).toBe("remediation_required");
+		expect((await store.readAll(taskId)).some((record) => record.event === "remediation_required")).toBe(true);
+		expect(api.sentMessages.length).toBe(messagesBeforeRecovery + 1);
+		expect(JSON.stringify(api.sentMessages.at(-1))).toContain("补充崩溃恢复测试");
 	});
 });
 

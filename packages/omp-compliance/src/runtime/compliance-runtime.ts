@@ -242,6 +242,21 @@ export class ComplianceRuntime {
 				this.taskState = recoveredCommit;
 				this.contract = contract;
 				this.activeAdvisorEnvelope = undefined;
+				if (recoveredCommit.status === "remediation_required") {
+					const fixes = recoveredCommit.lastVerdict?.requiredFixes ?? [];
+					injectRemediation(this.api, {
+						taskId: recoveredCommit.taskId,
+						contractHash: recoveredCommit.contractHash,
+						findings: fixes.map((requiredFix, index) => ({
+							id: `recovered-finding-${index + 1}`,
+							reason:
+								recoveredCommit.lastVerdict?.summary ??
+								"Advisor identified issues requiring remediation before the interrupted restart",
+							requiredFix,
+							evidenceRefs: [`evidence://${recoveredCommit.taskId}`],
+						})),
+					});
+				}
 				return recoveredCommit;
 			}
 			const queuedCompliance = this.scheduler
