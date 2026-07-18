@@ -253,6 +253,14 @@ export class BrainstormRuntime {
 			this.activeEnvelope = topic.reviewEnvelope;
 			this.config.registry.put(topic.reviewEnvelope);
 		}
+		if (topic?.status === "advisor_reviewing" && topic.pendingReview && this.activeEnvelope) {
+			const completed = await this.config.scheduler.completeReview(this.activeEnvelope.reviewId);
+			if (!completed) throw new Error("Prepared Brainstorm review has no matching Scheduler intent");
+			this.config.registry.consume(this.activeEnvelope.reviewId);
+			await this.config.coordinator.commitPreparedReview(topic.topicId);
+			await this.dispatchFollowingReviews();
+			return;
+		}
 		const queuedBrainstorm = schedulerSnapshot.queued.find(
 			(intent) => topic && intent.taskId === `brainstorm-${topic.topicId}` && intent.trigger === "brainstorm_review",
 		);
@@ -331,24 +339,20 @@ export class BrainstormRuntime {
 		}
 		this.config.registry.consume(envelope.reviewId);
 		try {
-			await this.config.coordinator.acceptReview(review);
+			await this.config.coordinator.prepareReview(review);
 		} catch (error) {
 			this.config.registry.put(envelope);
 			throw error;
 		}
-		await this.config.scheduler.handleLifecycle(
-			{
-				type: "advisor_run_completed",
-				reviewId: envelope.reviewId,
-				trigger: "brainstorm_review",
-				priority: 80,
-				primarySessionId: this.config.sessionId(),
-				advisorSessionId: "brainstorm-runtime",
-				timestamp: new Date().toISOString(),
-				verdictSubmitted: true,
-			},
-			false,
-		);
+		try {
+			const completed = await this.config.scheduler.completeReview(envelope.reviewId);
+			if (!completed) throw new Error("Brainstorm Scheduler intent is no longer active");
+		} catch (error) {
+			await this.config.coordinator.rollbackPreparedReview(envelope.topicId);
+			this.config.registry.put(envelope);
+			throw error;
+		}
+		await this.config.coordinator.commitPreparedReview(envelope.topicId);
 		await this.dispatchFollowingReviews();
 		const accepted = this.config.coordinator.current();
 		if (!accepted) throw new Error("Brainstorm topic disappeared after review acceptance");
@@ -374,6 +378,14 @@ export class BrainstormRuntime {
 		} catch {
 			// The accepted review is already durable; a later turn retries queued work.
 		}
+	}
+
+	restoreAdvisorEnvelope(reviewId: string): boolean {
+		const envelope = this.config.coordinator.current()?.reviewEnvelope;
+		if (!envelope || envelope.reviewId !== reviewId) return false;
+		this.activeEnvelope = envelope;
+		this.config.registry.put(envelope);
+		return true;
 	}
 
 	private envelopeFromIntent(topic: BrainstormTopicState, intent: ReviewIntent) {

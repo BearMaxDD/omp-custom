@@ -42,10 +42,12 @@ interface BrainstormRuntimeHarnessOverrides {
 
 class MemorySchedulerStore implements ReviewSchedulerStore {
 	state: ReviewSchedulerState | undefined;
+	failWhen?: (state: ReviewSchedulerState) => boolean;
 	async load(): Promise<ReviewSchedulerState | undefined> {
 		return this.state ? structuredClone(this.state) : undefined;
 	}
 	async save(state: ReviewSchedulerState): Promise<void> {
+		if (this.failWhen?.(state)) throw new Error("scheduler disk down");
 		this.state = structuredClone(state);
 	}
 }
@@ -603,5 +605,98 @@ describe("BrainstormRuntime", () => {
 		expect(harness.coordinator.current()?.status).toBe("awaiting_user_decision");
 		expect(harness.scheduler.snapshot().completed).toHaveLength(1);
 		expect(harness.scheduler.snapshot().queued).toHaveLength(0);
+	});
+
+	it("Scheduler 完成落盘失败时回滚 prepared review 并可重试", async () => {
+		const harness = createBrainstormRuntimeHarness({
+			requestAdvisorReview: async (request) => ({ status: "accepted", reviewId: request.reviewId }),
+		});
+		const submitted = await harness.runtime.submitTopic(validTopicInput());
+		if (!submitted.reviewId) throw new Error("missing review id");
+		const tool = createBrainstormAdvisorHook(
+			harness.registry,
+			harness.coordinator,
+			() => {},
+			(envelope, review) => harness.runtime.acceptReview(envelope, review),
+		)({
+			type: "advisor_before_run",
+			reviewId: submitted.reviewId,
+			trigger: "brainstorm_review",
+			priority: 80,
+			metadata: {},
+			primarySessionId: "primary",
+			advisorSessionId: "advisor",
+		})?.additionalTools?.[0];
+		if (!tool) throw new Error("missing review tool");
+		harness.schedulerStore.failWhen = (state) => state.completed.length > 0;
+
+		await expect(tool.execute("review-fail", validReview(submitted.topic) as never)).rejects.toThrow(
+			"scheduler disk down",
+		);
+		expect(harness.coordinator.current()?.status).toBe("advisor_reviewing");
+		expect(harness.coordinator.current()?.pendingReview).toBeUndefined();
+		expect(harness.registry.get(submitted.reviewId)).toBeDefined();
+		expect(harness.scheduler.snapshot().inFlight?.reviewId).toBe(submitted.reviewId);
+
+		harness.schedulerStore.failWhen = undefined;
+		await tool.execute("review-retry", validReview(submitted.topic) as never);
+		expect(harness.coordinator.current()?.status).toBe("awaiting_user_decision");
+	});
+
+	it("新 Runtime 可按持久化 reviewId 主动恢复 Advisor Hook Envelope", async () => {
+		const first = createBrainstormRuntimeHarness({
+			requestAdvisorReview: async (request) => ({ status: "accepted", reviewId: request.reviewId }),
+		});
+		const submitted = await first.runtime.submitTopic(validTopicInput());
+		if (!submitted.reviewId) throw new Error("missing review id");
+		const restarted = createBrainstormRuntimeHarness({
+			topicDir: first.topicDir,
+			schedulerStore: first.schedulerStore,
+			requestAdvisorReview: async (request) => ({ status: "accepted", reviewId: request.reviewId }),
+		});
+
+		expect(restarted.registry.get(submitted.reviewId)).toBeUndefined();
+		expect(restarted.runtime.restoreAdvisorEnvelope(submitted.reviewId)).toBe(true);
+		expect(restarted.registry.get(submitted.reviewId)).toBeDefined();
+	});
+
+	it("Scheduler 已完成但 Topic 提交中断时重启后续提 prepared review", async () => {
+		const first = createBrainstormRuntimeHarness({
+			requestAdvisorReview: async (request) => ({ status: "accepted", reviewId: request.reviewId }),
+		});
+		const submitted = await first.runtime.submitTopic(validTopicInput());
+		if (!submitted.reviewId) throw new Error("missing review id");
+		const originalCommit = first.coordinator.commitPreparedReview.bind(first.coordinator);
+		first.coordinator.commitPreparedReview = async () => {
+			throw new Error("topic disk interrupted");
+		};
+		const tool = createBrainstormAdvisorHook(
+			first.registry,
+			first.coordinator,
+			() => {},
+			(envelope, review) => first.runtime.acceptReview(envelope, review),
+		)({
+			type: "advisor_before_run",
+			reviewId: submitted.reviewId,
+			trigger: "brainstorm_review",
+			priority: 80,
+			metadata: {},
+			primarySessionId: "primary",
+			advisorSessionId: "advisor",
+		})?.additionalTools?.[0];
+		if (!tool) throw new Error("missing review tool");
+		await expect(tool.execute("review", validReview(submitted.topic) as never)).rejects.toThrow("interrupted");
+		expect(first.scheduler.snapshot().completed).toHaveLength(1);
+		expect(first.coordinator.current()?.pendingReview).toBeDefined();
+		first.coordinator.commitPreparedReview = originalCommit;
+
+		const restarted = createBrainstormRuntimeHarness({
+			topicDir: first.topicDir,
+			schedulerStore: first.schedulerStore,
+			requestAdvisorReview: async (request) => ({ status: "accepted", reviewId: request.reviewId }),
+		});
+		await restarted.runtime.retryDueReviews();
+		expect(restarted.coordinator.current()?.status).toBe("awaiting_user_decision");
+		expect(restarted.coordinator.current()?.pendingReview).toBeUndefined();
 	});
 });

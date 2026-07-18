@@ -449,6 +449,27 @@ export class ReviewScheduler {
 		});
 	}
 
+	completeReview(reviewId: string): Promise<boolean> {
+		return this.#serialize(async () => {
+			if (this.#completed.some((intent) => intent.reviewId === reviewId)) return true;
+			const intent = [...this.#queued, ...(this.#inFlight ? [this.#inFlight] : [])].find(
+				(candidate) => candidate.reviewId === reviewId,
+			);
+			if (!intent) return false;
+			await this.#transaction(() => {
+				this.#queued = this.#queued.filter((candidate) => candidate.reviewId !== reviewId);
+				if (this.#inFlight?.reviewId === reviewId) this.#inFlight = undefined;
+				this.#completed = [
+					...this.#completed,
+					Object.freeze({ ...intent, status: "completed" as const, updatedAt: safeNow(this.#clock) }),
+				].slice(-MAX_COMPLETED_HISTORY);
+				this.#lifecycleWaiters.get(reviewId)?.();
+				this.#lifecycleWaiters.delete(reviewId);
+			});
+			return true;
+		});
+	}
+
 	snapshot(): ReviewSchedulerState {
 		return frozenClone(this.#state());
 	}

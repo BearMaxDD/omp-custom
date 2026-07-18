@@ -126,11 +126,13 @@ describe("TopicCoordinator", () => {
 		expect(coordinator.current()?.status).toBe("review_unavailable");
 	});
 
-	it("allows retry from review_unavailable -> awaiting_user_decision", async () => {
+	it("retry 必须重新进入 advisor_reviewing 后才接受 review", async () => {
 		const coordinator = fixtureCoordinator();
 		const { topic } = await coordinator.submit(validTopicInput(), fullCodebaseSnapshot());
 		await coordinator.markReviewRequested(topic.topicId, "review-1");
 		await coordinator.markReviewUnavailable(topic.topicId, "timeout");
+		await coordinator.markReady(topic.topicId);
+		await coordinator.markReviewRequested(topic.topicId, "review-2");
 		await coordinator.acceptReview(validReview(topic));
 
 		expect(coordinator.current()?.status).toBe("awaiting_user_decision");

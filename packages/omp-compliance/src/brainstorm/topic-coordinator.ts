@@ -153,20 +153,40 @@ export class TopicCoordinator {
 	 *              review_unavailable -> awaiting_user_decision (retry)
 	 */
 	async acceptReview(review: BrainstormReview): Promise<void> {
+		await this.prepareReview(review);
+		await this.commitPreparedReview(review.topic_id);
+	}
+
+	async prepareReview(review: BrainstormReview): Promise<void> {
 		const topic = this.getCurrentOrThrow();
 		this.assertTopicId(topic, review.topic_id);
-
-		const fromStatus = topic.status;
-		if (fromStatus === "advisor_reviewing" || fromStatus === "review_unavailable") {
-			topic.status = "awaiting_user_decision";
-			topic.review = review;
-			await this.store.saveState(topic);
-			await this.store.appendEvent(topic.topicId, "review_received", {
-				reviewStatus: review.status,
-			});
-		} else {
-			throw new Error(`Cannot accept review: cannot transition from "${fromStatus}"`);
+		if (topic.status !== "advisor_reviewing") {
+			throw new Error(`Cannot prepare review: cannot transition from "${topic.status}"`);
 		}
+		topic.pendingReview = review;
+		await this.store.saveState(topic);
+	}
+
+	async commitPreparedReview(topicId: string): Promise<void> {
+		const topic = this.getCurrentOrThrow();
+		this.assertTopicId(topic, topicId);
+		if (topic.status !== "advisor_reviewing" || !topic.pendingReview) {
+			throw new Error("Cannot commit review: no prepared review is active");
+		}
+		const review = topic.pendingReview;
+		topic.status = "awaiting_user_decision";
+		topic.review = review;
+		topic.pendingReview = undefined;
+		await this.store.saveState(topic);
+		await this.store.appendEvent(topic.topicId, "review_received", { reviewStatus: review.status });
+	}
+
+	async rollbackPreparedReview(topicId: string): Promise<void> {
+		const topic = this.getCurrentOrThrow();
+		this.assertTopicId(topic, topicId);
+		if (topic.status !== "advisor_reviewing") return;
+		topic.pendingReview = undefined;
+		await this.store.saveState(topic);
 	}
 
 	/**

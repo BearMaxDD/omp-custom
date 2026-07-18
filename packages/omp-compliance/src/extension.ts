@@ -237,6 +237,7 @@ export default function activate(api: ComplianceExtensionHost): void {
 		if (complianceResult) return complianceResult;
 		// Brainstorm hook — only init when compliance didn't match
 		if (e.trigger === "brainstorm_review") {
+			getBrainstormRuntime().restoreAdvisorEnvelope(e.reviewId);
 			return createBrainstormAdvisorHook(
 				brainstormRegistry,
 				getBrainstormInfra().coordinator,
