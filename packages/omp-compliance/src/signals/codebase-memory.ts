@@ -63,6 +63,7 @@ const PACK_TOOL_MAX_ITEMS = 256;
 export interface TrustedCodebaseValidationContextInput {
 	readonly taskContract: import("../contract/types").TaskContract;
 	readonly codebaseProjectId: string;
+	readonly currentDiffHash: `sha256:${string}`;
 	readonly indexRevision: string;
 	readonly queriedAt: string;
 	readonly changedFiles: readonly string[];
@@ -190,6 +191,7 @@ const CODEBASE_PROJECT_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/
 const CONTEXT_INPUT_KEYS = new Set([
 	"taskContract",
 	"codebaseProjectId",
+	"currentDiffHash",
 	"indexRevision",
 	"queriedAt",
 	"changedFiles",
@@ -221,7 +223,7 @@ const PACK_KEYS = new Set([
 const CONTEXT_KEYS = new Set([
 	"taskContract",
 	"codebaseProjectId",
-	"diffHash",
+	"currentDiffHash",
 	"indexRevision",
 	"queriedAt",
 	"changedFiles",
@@ -600,16 +602,6 @@ function captureCollectorPairs(
 	return safePairs;
 }
 
-function computeDiffHash(
-	gitHead: string,
-	changedFiles: readonly string[],
-	newFiles: readonly string[],
-): `sha256:${string}` {
-	const revision = canonicalArgsFingerprint({ gitHead, changedFiles, newFiles });
-	if (!revision) throw new TypeError("invalid_diff_snapshot");
-	return revision;
-}
-
 export function createTrustedCodebaseValidationContext(
 	reader: TrustedCodebaseEvidenceReader,
 	input: TrustedCodebaseValidationContextInput,
@@ -620,6 +612,7 @@ export function createTrustedCodebaseValidationContext(
 	const taskContract = validateTaskContractIntegrity(safe.taskContract);
 	const task = taskBinding(taskContract);
 	const codebaseProjectId = strictCodebaseProjectId(safe.codebaseProjectId);
+	const currentDiffHash = strictHash(safe.currentDiffHash, "current_diff_hash");
 	const indexRevision = boundedPackString(safe.indexRevision, "context_index_revision");
 	const queriedAt = strictIso(safe.queriedAt, "queried_at");
 	const changedFiles = normalizePackPaths(safe.changedFiles, true, "changed_files");
@@ -628,9 +621,7 @@ export function createTrustedCodebaseValidationContext(
 	const unresolvedClaims = normalizeClaims(safe.unresolvedClaims);
 	const requiredSymbols = normalizeClaims(safe.requiredSymbols);
 	if (task.source === "tdd" && requiredSymbols.length === 0) throw new TypeError("missing_required_symbols");
-	if (task.source === "tdd" && changedFiles.length === 0) throw new TypeError("missing_changed_files");
 	const changedSet = new Set(changedFiles);
-	for (const file of task.affectedFiles) if (!changedSet.has(file)) throw new TypeError(`missing_changed_file:${file}`);
 	for (const file of newFiles) if (!changedSet.has(file)) throw new TypeError(`new_file_not_changed:${file}`);
 	for (const pair of pairs) {
 		const tool = normalizePair(pair);
@@ -647,7 +638,7 @@ export function createTrustedCodebaseValidationContext(
 	const context = deepFreezeValue({
 		taskContract,
 		codebaseProjectId,
-		diffHash: computeDiffHash(task.gitHead, changedFiles, newFiles),
+		currentDiffHash,
 		indexRevision,
 		queriedAt,
 		changedFiles,
@@ -709,7 +700,7 @@ export function createCodebaseEvidencePack(context: TrustedCodebaseValidationCon
 		codebaseProjectId,
 		indexRevision: boundedPackString(safe.indexRevision, "context_index_revision"),
 		gitHead: task.gitHead,
-		diffHash: strictHash(safe.diffHash, "diff_hash"),
+		diffHash: strictHash(safe.currentDiffHash, "current_diff_hash"),
 		queriedAt,
 		tools,
 		symbols: deriveSymbols(tools),
@@ -736,7 +727,7 @@ export function validateCodebasePack(pack: CodebaseEvidencePack, context: Truste
 	assertKeys(safeContext, CONTEXT_KEYS, "trusted_validation_context");
 	const task = taskBinding(safeContext.taskContract);
 	const contextCodebaseProjectId = strictCodebaseProjectId(safeContext.codebaseProjectId);
-	const contextDiffHash = strictHash(safeContext.diffHash, "context_diff_hash");
+	const contextDiffHash = strictHash(safeContext.currentDiffHash, "current_diff_hash");
 	const contextIndexRevision = boundedPackString(safeContext.indexRevision, "context_index_revision");
 	const requiredSymbols = normalizeClaims(safeContext.requiredSymbols);
 	strictProjectId(safePack.projectId);
@@ -773,7 +764,6 @@ export function validateCodebasePack(pack: CodebaseEvidencePack, context: Truste
 	if (canonicalJson(safePack.requiredSymbols) !== canonicalJson(requiredSymbols))
 		errors.push("required_symbols_mismatch");
 	if (safePack.queriedAt !== safeContext.queriedAt) errors.push("queried_at_mismatch");
-	if (computeDiffHash(task.gitHead, changed, newFiles) !== contextDiffHash) errors.push("diff_hash_mismatch");
 	const trusted: CodebaseToolEvidence[] = [];
 	const ids = new Map<string, string>();
 	for (const raw of safePack.tools) {

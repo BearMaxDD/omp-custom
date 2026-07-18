@@ -359,6 +359,7 @@ describe("Codebase Evidence Pack", () => {
 		return createTrustedCodebaseValidationContext(controlledReader(fixtures), {
 			taskContract: contract,
 			codebaseProjectId,
+			currentDiffHash: `sha256:${"e".repeat(64)}`,
 			indexRevision: "idx-1",
 			queriedAt,
 			changedFiles: contract.affectedFiles,
@@ -404,6 +405,7 @@ describe("Codebase Evidence Pack", () => {
 			createTrustedCodebaseValidationContext(collector(attackerFixtures) as never, {
 				taskContract: taskContract(),
 				codebaseProjectId,
+				currentDiffHash: `sha256:${"e".repeat(64)}`,
 				indexRevision: "idx-1",
 				queriedAt,
 				changedFiles: ["src/a.ts"],
@@ -417,6 +419,7 @@ describe("Codebase Evidence Pack", () => {
 			createTrustedCodebaseValidationContext(new CollectorRuntime() as never, {
 				taskContract: taskContract(),
 				codebaseProjectId,
+				currentDiffHash: `sha256:${"e".repeat(64)}`,
 				indexRevision: "idx-1",
 				queriedAt,
 				changedFiles: ["src/a.ts"],
@@ -437,7 +440,7 @@ describe("Codebase Evidence Pack", () => {
 			codebaseProjectId,
 			indexRevision: "idx-1",
 			gitHead,
-			diffHash: trusted.diffHash,
+			diffHash: trusted.currentDiffHash,
 			queriedAt,
 			changedFiles: ["src/a.ts"],
 			requiredSymbols: ["demo.a"],
@@ -511,7 +514,6 @@ describe("Codebase Evidence Pack", () => {
 		expect(errors).toContain("allowed_new_file_roots_mismatch");
 		expect(errors).toContain("changed_files_mismatch");
 		expect(errors).toContain("diff_hash_mismatch");
-		expect(() => context(validFixtures(), { changedFiles: [] })).toThrow("missing_changed_files");
 		const claimContext = context(validFixtures(), { unresolvedClaims: ["claim-a"] });
 		const claimPack = createCodebaseEvidencePack(claimContext);
 		const claimBody = { ...claimPack, unresolvedClaims: [] as string[] };
@@ -522,6 +524,41 @@ describe("Codebase Evidence Pack", () => {
 		};
 		expect(validateCodebasePack(forgedClaims, claimContext)).toContain("unresolved_claims_mismatch");
 		expect(validateCodebasePack(forgedClaims, claimContext)).toContain("unresolved_claim:claim-a");
+	});
+
+	it("相同文件路径的可信 diff 摘要变化会使旧 Pack 失效并改变 evidenceRevision", () => {
+		const firstContext = context(validFixtures(), { currentDiffHash: `sha256:${"a".repeat(64)}` });
+		const firstPack = createCodebaseEvidencePack(firstContext);
+		const nextContext = context(validFixtures(), { currentDiffHash: `sha256:${"b".repeat(64)}` });
+		const nextPack = createCodebaseEvidencePack(nextContext);
+
+		expect(firstPack.changedFiles).toEqual(nextPack.changedFiles);
+		expect(firstPack.newFiles).toEqual(nextPack.newFiles);
+		expect(firstPack.diffHash).not.toBe(nextPack.diffHash);
+		expect(firstPack.evidenceRevision).not.toBe(nextPack.evidenceRevision);
+		expect(validateCodebasePack(firstPack, nextContext)).toContain("diff_hash_mismatch");
+		expect(() => context(validFixtures(), { currentDiffHash: "sha256:bad" })).toThrow("invalid_current_diff_hash");
+	});
+
+	it("formal actual changes 只需是 affectedFiles 的子集", () => {
+		const contract = taskContract("tdd", ["src/a.ts", "src/b.ts", "src/c.ts"]);
+		const trusted = context(validFixtures(), {
+			taskContract: contract,
+			changedFiles: ["src/a.ts", "src/b.ts"],
+		});
+		const errors = validateCodebasePack(createCodebaseEvidencePack(trusted), trusted);
+
+		expect(errors).not.toContain("uncovered_file:src/a.ts");
+		expect(errors).not.toContain("uncovered_file:src/b.ts");
+	});
+
+	it("formal 写前允许空 changedFiles 和 newFiles", () => {
+		const trusted = context(validFixtures(), { changedFiles: [], newFiles: [] });
+		const pack = createCodebaseEvidencePack(trusted);
+
+		expect(pack.changedFiles).toEqual([]);
+		expect(pack.newFiles).toEqual([]);
+		expect(validateCodebasePack(pack, trusted)).toEqual([]);
 	});
 
 	it("formal requiredSymbols 是硬门，unrelated symbol 即使伪装 affected path 也失败", () => {
@@ -658,6 +695,16 @@ describe("Codebase Evidence Pack", () => {
 		});
 		expect(validateCodebasePack(createCodebaseEvidencePack(outside), outside)).toContain(
 			"new_file_outside_allowed_root:other/item.ts",
+		);
+		const outsideExisting = context(validFixtures(), {
+			changedFiles: ["src/a.ts", "other/existing.ts"],
+			newFiles: [],
+		});
+		expect(validateCodebasePack(createCodebaseEvidencePack(outsideExisting), outsideExisting)).toContain(
+			"uncovered_file:other/existing.ts",
+		);
+		expect(() => context(validFixtures(), { changedFiles: ["src/a.ts"], newFiles: ["src/new/item.ts"] })).toThrow(
+			"new_file_not_changed:src/new/item.ts",
 		);
 		const unresolved = context(validFixtures(), { unresolvedClaims: ["无法定位写入者"] });
 		expect(validateCodebasePack(createCodebaseEvidencePack(unresolved), unresolved)).toContain(

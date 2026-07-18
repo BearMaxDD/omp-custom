@@ -129,7 +129,7 @@ export interface TrustedCodebaseValidationContext {
 	readonly [trustedCodebaseValidationContext]: true;
 	readonly taskContract: TaskContract;
 	readonly codebaseProjectId: string;
-	readonly diffHash: `sha256:${string}`;
+	readonly currentDiffHash: `sha256:${string}`;
 	readonly indexRevision: string;
 	readonly queriedAt: string;
 	readonly changedFiles: readonly string[];
