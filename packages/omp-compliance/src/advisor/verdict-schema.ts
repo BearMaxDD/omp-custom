@@ -13,7 +13,9 @@
  * context binding.
  */
 
+import { types as utilTypes } from "node:util";
 import type { SHA256Hash } from "../contract/types";
+import { canonicalJson } from "../xdev/tool-identity";
 
 // ─── Verdict Schema (version 1) ──────────────────────────────────────
 
@@ -41,8 +43,14 @@ export interface ComplianceFinding {
  */
 export interface ComplianceVerdict {
 	schema_version: typeof VERDICT_SCHEMA_VERSION;
+	review_id: string;
 	task_id: string;
+	project_id: string;
 	contract_hash: SHA256Hash;
+	evidence_revision: SHA256Hash;
+	git_head: string;
+	diff_hash: SHA256Hash;
+	trigger: "compliance_review";
 	attempt: number;
 	status: "pass" | "remediate";
 	findings: ComplianceFinding[];
@@ -50,8 +58,14 @@ export interface ComplianceVerdict {
 
 /** Expected context for verdict validation. */
 export interface VerdictContext {
+	reviewId?: string;
 	taskId: string;
+	projectId?: string;
 	contractHash: SHA256Hash;
+	evidenceRevision?: string;
+	gitHead?: string;
+	diffHash?: string;
+	trigger?: "compliance_review";
 	attempt: number;
 }
 
@@ -61,6 +75,49 @@ export interface VerdictContext {
 export interface VerdictValidationErrorInfo {
 	field: string;
 	message: string;
+}
+
+function plainDataDescriptors(value: unknown, label: string): PropertyDescriptorMap {
+	if (
+		value === null ||
+		typeof value !== "object" ||
+		utilTypes.isProxy(value) ||
+		(Array.isArray(value)
+			? Object.getPrototypeOf(value) !== Array.prototype
+			: Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)
+	) {
+		throw new VerdictValidationError(`${label} must be plain data`);
+	}
+	const descriptors = Object.getOwnPropertyDescriptors(value);
+	if (Object.values(descriptors).some((descriptor) => "get" in descriptor || "set" in descriptor)) {
+		throw new VerdictValidationError(`${label} must not contain accessors`);
+	}
+	return descriptors;
+}
+
+function normalizeOptionalFields(input: Record<string, unknown>): Record<string, unknown> {
+	const descriptors = plainDataDescriptors(input, "verdict");
+	const output: Record<string, unknown> = {};
+	for (const [key, descriptor] of Object.entries(descriptors)) {
+		if (descriptor.value === undefined) continue;
+		if (key !== "findings") {
+			output[key] = descriptor.value;
+			continue;
+		}
+		const findings = descriptor.value;
+		const arrayDescriptors = plainDataDescriptors(findings, "findings");
+		if (!Array.isArray(findings) || findings.length > 512) throw new VerdictValidationError("findings must be bounded");
+		output.findings = findings.map((_, index) => {
+			const item = arrayDescriptors[String(index)]?.value;
+			const itemDescriptors = plainDataDescriptors(item, `findings[${index}]`);
+			return Object.fromEntries(
+				Object.entries(itemDescriptors)
+					.filter(([, itemDescriptor]) => itemDescriptor.value !== undefined)
+					.map(([itemKey, itemDescriptor]) => [itemKey, itemDescriptor.value]),
+			);
+		});
+	}
+	return output;
 }
 
 /**
@@ -81,8 +138,53 @@ export interface VerdictValidationErrorInfo {
  *  8. remediate → every finding MUST have a non-empty required_fix
  *  9. Each finding must have a non-empty id and reason
  */
-export function parseVerdict(raw: Record<string, unknown>, expectedContext: VerdictContext): ComplianceVerdict {
+export function parseVerdict(input: Record<string, unknown>, expectedContext: VerdictContext): ComplianceVerdict {
 	const errors: VerdictValidationErrorInfo[] = [];
+	const canonical = canonicalJson(normalizeOptionalFields(input));
+	if (canonical === null) throw new VerdictValidationError("verdict exceeds the bounded JSON data contract");
+	const raw = JSON.parse(canonical) as Record<string, unknown>;
+	if (
+		raw === null ||
+		typeof raw !== "object" ||
+		Array.isArray(raw) ||
+		utilTypes.isProxy(raw) ||
+		(Object.getPrototypeOf(raw) !== Object.prototype && Object.getPrototypeOf(raw) !== null) ||
+		Object.values(Object.getOwnPropertyDescriptors(raw)).some(
+			(descriptor) => "get" in descriptor || "set" in descriptor,
+		)
+	) {
+		throw new VerdictValidationError("verdict must be a plain data object");
+	}
+	const allowed = new Set([
+		"schema_version",
+		"review_id",
+		"task_id",
+		"project_id",
+		"contract_hash",
+		"evidence_revision",
+		"git_head",
+		"diff_hash",
+		"trigger",
+		"attempt",
+		"status",
+		"findings",
+	]);
+	for (const key of Object.keys(raw)) if (!allowed.has(key)) errors.push({ field: key, message: "unknown field" });
+	if (expectedContext.reviewId !== undefined) {
+		for (const [field, expected] of [
+			["review_id", expectedContext.reviewId],
+			["project_id", expectedContext.projectId],
+			["evidence_revision", expectedContext.evidenceRevision],
+			["git_head", expectedContext.gitHead],
+			["diff_hash", expectedContext.diffHash],
+			["trigger", expectedContext.trigger],
+		] as const) {
+			const value = raw[field];
+			if (typeof value !== "string" || value.length === 0 || value.length > 256 || value !== expected) {
+				errors.push({ field, message: `expected ${JSON.stringify(expected)}` });
+			}
+		}
+	}
 
 	// ── Schema version ──
 	if (raw.schema_version !== VERDICT_SCHEMA_VERSION) {
@@ -217,7 +319,15 @@ export function parseVerdict(raw: Record<string, unknown>, expectedContext: Verd
 
 	// After validation, narrow the raw object — findings meet the
 	// structural rules verified above.
-	return raw as unknown as ComplianceVerdict;
+	return deepFreeze(raw as unknown as ComplianceVerdict);
+}
+
+function deepFreeze<T>(value: T): T {
+	if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+		for (const child of Object.values(value)) deepFreeze(child);
+		Object.freeze(value);
+	}
+	return value;
 }
 
 // ─── Error type ──────────────────────────────────────────────────────

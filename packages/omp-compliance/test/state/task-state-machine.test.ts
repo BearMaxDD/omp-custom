@@ -25,9 +25,13 @@ function stalledState(): TaskState {
 function minimalState(status: TaskState["status"], overrides: Partial<TaskState> = {}): TaskState {
 	return {
 		taskId: "test-task",
+		projectId: "project-1",
 		status,
 		attempt: 1,
 		contractHash: "sha256:abc123" as `sha256:${string}`,
+		evidenceRevision: "sha256:evidence",
+		gitHead: "a".repeat(40),
+		diffHash: "sha256:diff",
 		tddPath: "tasks/test-task.md",
 		worktreeFingerprint: "initial",
 		createdAt: "2025-01-01T00:00:00.000Z",
@@ -56,10 +60,35 @@ const remediation = (fingerprint: string): TaskEvent => ({ type: "remediation", 
 const activity = (wf: string): TaskEvent => ({ type: "activity", worktreeFingerprint: wf });
 
 describe("TaskStateMachine — 只有有效 pass verdict 能完成任务", () => {
-	it("completion_requested from active transitions to advisor_reviewing", () => {
+	it("completion_requested from active stays completion_requested until host accepts", () => {
 		const state = activeTask();
-		const next = transition(state, completionRequested());
-		expect(next.status).toBe("advisor_reviewing");
+		const requested = transition(state, {
+			...completionRequested(),
+			reviewId: "review:1",
+			evidenceRevision: "sha256:evidence-2",
+			gitHead: "b".repeat(40),
+			diffHash: "sha256:diff-2",
+		});
+		expect(requested.status).toBe("completion_requested");
+		expect(requested.activeReviewId).toBe("review:1");
+		const reviewing = transition(requested, { type: "advisor_accepted", reviewId: "review:1" });
+		expect(reviewing.status).toBe("advisor_reviewing");
+	});
+
+	it("review failure stalls and retry returns to completion_requested", () => {
+		const reviewing = minimalState("advisor_reviewing", { activeReviewId: "review:1" });
+		const stalled = transition(reviewing, { type: "review_failed", reviewId: "review:1", reason: "no_verdict" });
+		expect(stalled.status).toBe("stalled");
+		const retry = transition(stalled, { type: "retry", reviewId: "review:2" });
+		expect(retry.status).toBe("completion_requested");
+		expect(retry.activeReviewId).toBe("review:2");
+	});
+
+	it("user override is terminal and distinct from pass", () => {
+		const overridden = transition(activeTask(), { type: "override", reason: "紧急人工放行", actor: "user" });
+		expect(overridden.status).toBe("overridden");
+		expect(overridden.lastVerdict?.status).not.toBe("pass");
+		expect(transition(overridden, passVerdict())).toBe(overridden);
 	});
 
 	it("advisor_silent from active does NOT transition to completed", () => {
@@ -76,8 +105,15 @@ describe("TaskStateMachine — 只有有效 pass verdict 能完成任务", () =>
 
 	it("pass verdict through correct flow transitions to completed", () => {
 		const state = activeTask();
-		const afterRequest = transition(state, completionRequested());
-		const afterPass = transition(afterRequest, passVerdict({ summary: "All tests pass" }));
+		const afterRequest = transition(state, {
+			...completionRequested(),
+			reviewId: "review:1",
+			evidenceRevision: state.evidenceRevision,
+			gitHead: state.gitHead,
+			diffHash: state.diffHash,
+		});
+		const reviewing = transition(afterRequest, { type: "advisor_accepted", reviewId: "review:1" });
+		const afterPass = transition(reviewing, passVerdict({ summary: "All tests pass" }));
 		expect(afterPass.status).toBe("completed");
 	});
 
@@ -89,11 +125,11 @@ describe("TaskStateMachine — 只有有效 pass verdict 能完成任务", () =>
 	});
 });
 
-describe("TaskStateMachine — 无 verdict 或协议错误保持在 advisor_reviewing", () => {
-	it("advisor_silent from advisor_reviewing stays in advisor_reviewing", () => {
+describe("TaskStateMachine — 无 verdict 或协议错误失败关闭", () => {
+	it("advisor_silent from advisor_reviewing enters stalled", () => {
 		const state = minimalState("advisor_reviewing");
 		const next = transition(state, advisorSilent());
-		expect(next.status).toBe("advisor_reviewing");
+		expect(next.status).toBe("stalled");
 	});
 
 	it("protocol_error from advisor_reviewing stays in advisor_reviewing with error", () => {
@@ -187,7 +223,9 @@ describe("TaskStateMachine — 完整生命周期", () => {
 		let s: TaskState = minimalState("inactive");
 		s = transition(s, activity("work1"));
 		expect(s.status).toBe("active");
-		s = transition(s, completionRequested());
+		s = transition(s, { ...completionRequested(), reviewId: "review:happy" });
+		expect(s.status).toBe("completion_requested");
+		s = transition(s, { type: "advisor_accepted", reviewId: "review:happy" });
 		expect(s.status).toBe("advisor_reviewing");
 		s = transition(s, passVerdict({ summary: "pass" }));
 		expect(s.status).toBe("completed");
@@ -195,7 +233,8 @@ describe("TaskStateMachine — 完整生命周期", () => {
 
 	it("full remediation path: active -> ... -> remediation_required -> active again", () => {
 		let s: TaskState = minimalState("active");
-		s = transition(s, completionRequested());
+		s = transition(s, { ...completionRequested(), reviewId: "review:remediate" });
+		s = transition(s, { type: "advisor_accepted", reviewId: "review:remediate" });
 		s = transition(s, remediateVerdict(["fix it"]));
 		expect(s.status).toBe("remediation_required");
 		s = transition(s, activity("rework"));
@@ -206,7 +245,8 @@ describe("TaskStateMachine — 完整生命周期", () => {
 		let s: TaskState = minimalState("stalled");
 		s = transition(s, activity("new-work"));
 		expect(s.status).toBe("active");
-		s = transition(s, completionRequested());
+		s = transition(s, { ...completionRequested(), reviewId: "review:resume" });
+		s = transition(s, { type: "advisor_accepted", reviewId: "review:resume" });
 		s = transition(s, passVerdict());
 		expect(s.status).toBe("completed");
 	});

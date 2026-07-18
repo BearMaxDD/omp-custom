@@ -34,6 +34,8 @@ export type VerdictAcceptResult =
 
 /** A persisted verdict record in the sink store. */
 export interface VerdictRecord {
+	reviewId: string;
+	projectId: string;
 	taskId: string;
 	contractHash: SHA256Hash;
 	attempt: number;
@@ -53,6 +55,7 @@ export interface VerdictStore {
 	 * Each key is `${taskId}:${contractHash}:${attempt}`.
 	 */
 	acceptedKeys: Set<string>;
+	acceptedDigests?: Record<string, string>;
 }
 
 // ─── Sink ────────────────────────────────────────────────────────────
@@ -65,6 +68,7 @@ export const defaultStore: VerdictStore = {
 	records: [],
 	lastPass: {},
 	acceptedKeys: new Set(),
+	acceptedDigests: {},
 };
 
 /**
@@ -110,7 +114,7 @@ export function acceptVerdict(
 		}
 	}
 
-	const { task_id, contract_hash, attempt, status, findings } = resolved;
+	const { review_id, task_id, project_id, contract_hash, attempt, status, findings } = resolved;
 
 	// Step 2: Stale attempt check — older attempt after a newer pass is a protocol error
 	const passKey = `${task_id}:${contract_hash}`;
@@ -133,16 +137,23 @@ export function acceptVerdict(
 	}
 
 	// Step 4: Idempotency — O(1) check via Set
-	const verdictKey = `${task_id}:${contract_hash}:${attempt}`;
+	const verdictKey = review_id ?? `${task_id}:${contract_hash}:${attempt}`;
+	const digest = JSON.stringify(resolved);
 	if (store.acceptedKeys.has(verdictKey)) {
+		const conflict = store.acceptedDigests?.[verdictKey] !== undefined && store.acceptedDigests[verdictKey] !== digest;
 		return {
 			status: "rejected",
-			reason: `Verdict for (${task_id}, ${contract_hash}, attempt=${attempt}) already processed`,
+			reason: conflict
+				? `Conflicting verdict for review ${review_id}`
+				: `Verdict for review ${review_id} already processed`,
+			protocolError: conflict || undefined,
 		};
 	}
 
 	// Step 5: Persist
 	const record: VerdictRecord = {
+		reviewId: review_id ?? verdictKey,
+		projectId: project_id ?? "legacy",
 		taskId: task_id,
 		contractHash: contract_hash,
 		attempt,
@@ -153,6 +164,8 @@ export function acceptVerdict(
 
 	store.records.push(record);
 	store.acceptedKeys.add(verdictKey);
+	if (!store.acceptedDigests) store.acceptedDigests = {};
+	store.acceptedDigests[verdictKey] = digest;
 
 	if (status === "pass") {
 		store.lastPass[passKey] = attempt;

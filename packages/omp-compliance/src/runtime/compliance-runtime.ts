@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 /**
  * Compliance Runtime — coordinates completion gate, state machine,
  * evidence store, signal collection, and remediation injection.
@@ -9,13 +10,16 @@
  *  - recordVerification (test convenience)
  *  - resumeAfterRemediation
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { AdvisorReviewReceipt } from "@oh-my-pi/pi-coding-agent/advisor/review-protocol";
+import type {
+	AdvisorReviewLifecycleEvent,
+	AdvisorReviewReceipt,
+} from "@oh-my-pi/pi-coding-agent/advisor/review-protocol";
 import type { CustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { buildCompletionContext } from "../advisor/completion-context";
 import { renderCompletionRules } from "../advisor/default-rule-pack";
-import { createEnvelope } from "../advisor/review-envelope";
 import type { ComplianceReviewDependencies, ComplianceReviewEnvelope } from "../advisor/review-envelope";
 import { VerdictValidationError, parseVerdict } from "../advisor/verdict-schema";
 import type { ComplianceFinding, ComplianceVerdict } from "../advisor/verdict-schema";
@@ -23,11 +27,21 @@ import { acceptVerdict as sinkAcceptVerdict } from "../advisor/verdict-sink";
 import type { VerdictStore } from "../advisor/verdict-sink";
 import { loadComplianceContract } from "../contract/load-contract";
 import type { ComplianceContract } from "../contract/types";
+import type { TaskContract } from "../contract/types";
+import { createReviewEnvelope } from "../contracts/review-envelope";
+import type { ReviewEnvelope } from "../contracts/review-envelope";
+import { validateTaskContractIntegrity } from "../contracts/task-contract";
+import { delegationSatisfiesGate } from "../delegation/delegation-supervisor";
+import type { DelegationRecord } from "../delegation/delegation-supervisor";
 import type { EvidenceRecord, EvidenceStore } from "../evidence/evidence-store";
 import { injectRemediation } from "../remediation/inject-required-fix";
 import type { RemediationFinding } from "../remediation/inject-required-fix";
+import { ReviewScheduler } from "../scheduler/review-scheduler";
+import type { ReviewSchedulerState, ReviewSchedulerStore } from "../scheduler/review-scheduler";
+import { validateCodebasePack } from "../signals/codebase-memory";
 import type { CollectorRuntime } from "../signals/collector-runtime";
 import type { EvidenceSnapshot } from "../signals/types";
+import type { CodebaseEvidencePack, TrustedCodebaseValidationContext } from "../signals/types";
 import { transition } from "../state/task-state-machine";
 import type { TaskState } from "../state/types";
 import type { CompletionSnapshot } from "./completion-gate";
@@ -36,6 +50,57 @@ import { buildCompletionSnapshot } from "./completion-gate";
 // ─── Transient task state key for evidence store isolation ──────────
 
 const _TASK_STATE_KEY = "_runtime_task_state";
+
+class RuntimeSchedulerStore implements ReviewSchedulerStore {
+	state: ReviewSchedulerState | undefined;
+	async load(): Promise<ReviewSchedulerState | undefined> {
+		return this.state;
+	}
+	async save(state: ReviewSchedulerState): Promise<void> {
+		this.state = structuredClone(state);
+	}
+}
+
+function sha256(value: string): `sha256:${string}` {
+	return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function projectIdFor(root: string): string {
+	const hex = createHash("sha256").update(root).digest("hex");
+	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
+function gitContext(root: string): { gitHead: string; diffHash: `sha256:${string}` } {
+	try {
+		const gitHead = execFileSync("git", ["rev-parse", "HEAD"], {
+			cwd: root,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+		}).trim();
+		const diff = execFileSync("git", ["status", "--porcelain=v1", "-uall"], {
+			cwd: root,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		const trackedDiff = execFileSync("git", ["diff", "--binary", "HEAD"], {
+			cwd: root,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		const untracked = execFileSync("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
+			cwd: root,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+		})
+			.split("\0")
+			.filter(Boolean)
+			.sort();
+		const untrackedDigest = untracked.map((path) => [path, sha256(readFileSync(join(root, path), "utf8"))]);
+		return { gitHead, diffHash: sha256(JSON.stringify([diff, trackedDiff, untrackedDigest])) };
+	} catch {
+		return { gitHead: "0".repeat(40), diffHash: sha256("") };
+	}
+}
 
 /** Convenience verification record (for test use). */
 export interface VerificationRecord {
@@ -50,6 +115,13 @@ export interface ComplianceRuntimeHost {
 	): void;
 }
 
+export interface StrictCompletionEvidence {
+	readonly taskContract: TaskContract;
+	readonly codebasePack: CodebaseEvidencePack;
+	readonly codebaseContext: TrustedCodebaseValidationContext;
+	readonly delegations: readonly DelegationRecord[];
+}
+
 /**
  * Runtime coordinator for a single managed compliance task.
  *
@@ -61,6 +133,9 @@ export class ComplianceRuntime {
 	private contract: ComplianceContract | null = null;
 	private _store: EvidenceStore | null = null;
 	private readonly verdictStore: VerdictStore = { records: [], lastPass: {}, acceptedKeys: new Set() };
+	private readonly scheduler: ReviewScheduler;
+	private activeEnvelope: ReviewEnvelope | undefined;
+	private latestReceipt: AdvisorReviewReceipt | undefined;
 
 	constructor(
 		private readonly getEvidenceStore: () => EvidenceStore,
@@ -68,7 +143,73 @@ export class ComplianceRuntime {
 		private readonly api: ComplianceRuntimeHost,
 		private readonly repoRoot: string,
 		private readonly reviewDeps: ComplianceReviewDependencies,
-	) {}
+		private readonly strictEvidence?: () => StrictCompletionEvidence,
+	) {
+		this.scheduler = new ReviewScheduler({
+			clock: { now: () => Date.now() },
+			random: () => 0,
+			store: new RuntimeSchedulerStore(),
+			requester: async (request) => {
+				if (this.taskState?.status === "stalled" && this.activeEnvelope) {
+					const reviewAttempt = request.metadata?.attempt;
+					if (!Number.isSafeInteger(reviewAttempt) || (reviewAttempt as number) < 1) {
+						throw new Error("Scheduler retry attempt is invalid");
+					}
+					const retryEnvelope = createReviewEnvelope(
+						{
+							taskId: this.activeEnvelope.taskId,
+							projectId: this.activeEnvelope.projectId,
+							contractHash: this.activeEnvelope.contractHash,
+							evidenceRevision: this.activeEnvelope.evidenceRevision,
+							gitHead: this.activeEnvelope.gitHead,
+							diffHash: this.activeEnvelope.diffHash,
+							attempt: this.activeEnvelope.attempt,
+							trigger: "compliance_review",
+							createdAt: new Date().toISOString(),
+						},
+						reviewAttempt as number,
+					);
+					if (retryEnvelope.reviewId !== request.reviewId) throw new Error("Scheduler retry identity mismatch");
+					await this.writeEvidenceRecord("completion_retry", { signalDigest: retryEnvelope.envelopeHash });
+					this.activeEnvelope = retryEnvelope;
+					this.taskState = transition(this.taskState, { type: "retry", reviewId: request.reviewId });
+				}
+				let hostReceipt: AdvisorReviewReceipt;
+				try {
+					hostReceipt = await this.reviewDeps.requestAdvisorReview(request);
+				} catch (error) {
+					this.latestReceipt = {
+						status: "rejected",
+						reviewId: request.reviewId,
+						reason: error instanceof Error ? error.message : "advisor request failed",
+					};
+					if (this.taskState) {
+						this.taskState = transition(this.taskState, {
+							type: "review_failed",
+							reviewId: request.reviewId,
+							reason: error instanceof Error ? error.message : "advisor request failed",
+						});
+					}
+					throw error;
+				}
+				const receipt =
+					hostReceipt.status === "accepted"
+						? { ...hostReceipt, reviewId: request.reviewId }
+						: { ...hostReceipt, reviewId: request.reviewId };
+				this.latestReceipt = receipt;
+				if (receipt.status === "accepted" && this.taskState) {
+					this.taskState = transition(this.taskState, { type: "advisor_accepted", reviewId: request.reviewId });
+				} else if (this.taskState) {
+					this.taskState = transition(this.taskState, {
+						type: "review_failed",
+						reviewId: request.reviewId,
+						reason: receipt.reason ?? "advisor request rejected",
+					});
+				}
+				return receipt;
+			},
+		});
+	}
 
 	// ─── Lifecycle: start / stop / resume ──────────────────────────
 
@@ -88,15 +229,26 @@ export class ComplianceRuntime {
 		}
 		const resolvedTddPath = tddPath.startsWith("/") ? tddPath : join(this.repoRoot, tddPath);
 		const contract = loadComplianceContract(resolvedTddPath, this.repoRoot);
-		const taskId = randomUUID();
+		const strictContract = this.strictEvidence
+			? validateTaskContractIntegrity(this.strictEvidence().taskContract)
+			: undefined;
+		if (strictContract && strictContract.contractHash !== contract.contractHash) {
+			throw new Error("TaskContract does not match the loaded TDD contract");
+		}
+		const taskId = strictContract?.taskId ?? randomUUID();
 		const now = new Date().toISOString();
 		const seedFingerprint = `initial-${Date.now()}`;
+		const currentGit = gitContext(this.repoRoot);
 
 		const state: TaskState = {
 			taskId,
+			projectId: strictContract?.projectId ?? projectIdFor(this.repoRoot),
 			status: "active",
 			attempt: 1,
 			contractHash: contract.contractHash,
+			evidenceRevision: sha256("initial"),
+			gitHead: strictContract?.gitHead ?? currentGit.gitHead,
+			diffHash: currentGit.diffHash,
 			tddPath: contract.tddPath,
 			worktreeFingerprint: seedFingerprint,
 			createdAt: now,
@@ -240,9 +392,6 @@ export class ComplianceRuntime {
 			throw new Error("No contract loaded for compliance task");
 		}
 
-		const newState = transition(this.taskState, { type: "completion_requested" });
-		this.taskState = newState;
-
 		const taskFingerprint = this.taskState.worktreeFingerprint;
 		const snapshot = buildCompletionSnapshot(
 			this.taskState,
@@ -255,55 +404,94 @@ export class ComplianceRuntime {
 			},
 		);
 
+		if (this.strictEvidence && snapshot.verifications.length === 0) {
+			throw new Error("Completion Gate requires a real verification Tool Result");
+		}
+		const currentGit = gitContext(this.repoRoot);
+		const evidenceRevision = this.validateStrictEvidence(currentGit, snapshot);
+
 		// Build context and rules from the snapshot
 		const sessionId = this.reviewDeps.sessionId();
 		const context = buildCompletionContext(snapshot, activeContract.policy);
 		const rules = renderCompletionRules(activeContract.policy);
 
-		// Create frozen envelope with stable reviewId
-		const envelope = createEnvelope({
-			sessionId,
+		const strictEnvelope = createReviewEnvelope({
 			taskId: this.taskState.taskId,
+			projectId: this.taskState.projectId,
 			contractHash: this.taskState.contractHash,
+			evidenceRevision,
+			gitHead: currentGit.gitHead,
+			diffHash: currentGit.diffHash,
 			attempt: this.taskState.attempt,
+			trigger: "compliance_review",
+			createdAt: new Date().toISOString(),
+		});
+		this.activeEnvelope = strictEnvelope;
+
+		// Envelope persistence is the commit point: state cannot advance before this succeeds.
+		await this.writeEvidenceRecord("completion_requested", {
+			signalDigest: strictEnvelope.envelopeHash,
+			reviewEnvelope: strictEnvelope,
+		});
+
+		this.taskState = transition(this.taskState, {
+			type: "completion_requested",
+			reviewId: strictEnvelope.reviewId,
+			evidenceRevision,
+			gitHead: currentGit.gitHead,
+			diffHash: currentGit.diffHash,
+		});
+		const envelope: ComplianceReviewEnvelope = Object.freeze({
+			reviewId: strictEnvelope.reviewId,
+			sessionId,
+			taskId: strictEnvelope.taskId,
+			contractHash: strictEnvelope.contractHash as `sha256:${string}`,
+			attempt: strictEnvelope.attempt,
 			context,
 			rules,
+			createdAt: strictEnvelope.createdAt,
 		});
-
-		// Write completion_requested evidence before registry put
-		await this.writeEvidenceRecord("completion_requested", {
-			signalDigest: snapshot.diffFingerprint,
-		});
-
-		// Register envelope (available for the advisor_before_run hook)
 		this.reviewDeps.registry.put(envelope);
 
-		// Request Advisor review — may throw if harness cannot accommodate
 		let receipt: AdvisorReviewReceipt;
 		try {
-			receipt = await this.reviewDeps.requestAdvisorReview({
-				reviewId: envelope.reviewId,
+			await this.scheduler.enqueue({
 				trigger: "compliance_review",
 				priority: 100,
+				projectId: strictEnvelope.projectId,
+				taskId: strictEnvelope.taskId,
+				contractHash: strictEnvelope.contractHash,
+				evidenceRevision: strictEnvelope.evidenceRevision,
+				gitHead: strictEnvelope.gitHead,
+				diffHash: strictEnvelope.diffHash,
 				metadata: {
 					sessionId,
-					taskId: this.taskState.taskId,
-					contractHash: this.taskState.contractHash,
-					attempt: this.taskState.attempt,
+					envelopeHash: strictEnvelope.envelopeHash,
 					context,
 					rules,
 				},
 			});
+			await this.scheduler.pump();
+			receipt = this.latestReceipt ?? {
+				reviewId: strictEnvelope.reviewId,
+				status: "rejected",
+				reason: "Advisor receipt unavailable",
+			};
 		} catch (err: unknown) {
 			const reason = err instanceof Error ? err.message : String(err);
+			this.taskState = transition(this.taskState, {
+				type: "review_failed",
+				reviewId: strictEnvelope.reviewId,
+				reason,
+			});
 			await this.writeEvidenceRecord("advisor_unavailable", {
 				signalDigest: "advisor-unavailable",
 			});
 			return {
-				status: newState.status,
+				status: this.taskState.status,
 				completionSnapshot: snapshot,
-				reviewId: envelope.reviewId,
-				receipt: { reviewId: envelope.reviewId, status: "rejected" as const, reason },
+				reviewId: strictEnvelope.reviewId,
+				receipt: { reviewId: strictEnvelope.reviewId, status: "rejected" as const, reason },
 			};
 		}
 
@@ -314,9 +502,9 @@ export class ComplianceRuntime {
 		}
 
 		return {
-			status: newState.status,
+			status: this.taskState.status,
 			completionSnapshot: snapshot,
-			reviewId: envelope.reviewId,
+			reviewId: strictEnvelope.reviewId,
 			receipt,
 		};
 	}
@@ -342,10 +530,25 @@ export class ComplianceRuntime {
 		}
 
 		// Step 1: Schema + context validation via parseVerdict
+		const strictVerdict =
+			this.strictEvidence !== undefined ||
+			["review_id", "project_id", "evidence_revision", "git_head", "diff_hash", "trigger"].some((key) =>
+				Object.hasOwn(verdict, key),
+			);
 		const ctx = {
 			taskId: this.taskState.taskId,
 			contractHash: this.taskState.contractHash,
 			attempt: this.taskState.attempt,
+			...(strictVerdict
+				? {
+						reviewId: this.taskState.activeReviewId ?? "",
+						projectId: this.taskState.projectId,
+						evidenceRevision: this.taskState.evidenceRevision,
+						gitHead: this.taskState.gitHead,
+						diffHash: this.taskState.diffHash,
+						trigger: "compliance_review" as const,
+					}
+				: {}),
 		};
 		let parsed: ComplianceVerdict;
 		try {
@@ -374,12 +577,63 @@ export class ComplianceRuntime {
 			// Idempotent reject (already processed) → no-op
 			return { accepted: false, reason: sinkResult.reason };
 		}
+		if (this.taskState.activeReviewId) {
+			await this.scheduler.handleLifecycle({
+				type: "advisor_run_completed",
+				reviewId: this.taskState.activeReviewId,
+				trigger: "compliance_review",
+				priority: 100,
+				primarySessionId: this.reviewDeps.sessionId(),
+				advisorSessionId: "advisor",
+				timestamp: new Date().toISOString(),
+				verdictSubmitted: true,
+			});
+		}
 
 		// Step 3: Map parsed verdict to state machine transitions
 		const isPass = parsed.status === "pass";
 		const findings = parsed.findings as ComplianceFinding[];
 
 		if (isPass) {
+			const currentGit = gitContext(this.repoRoot);
+			const evidence = this.collector.collector.snapshot();
+			let currentEvidenceRevision: string;
+			try {
+				currentEvidenceRevision = this.validateStrictEvidence(
+					currentGit,
+					buildCompletionSnapshot(
+						this.taskState,
+						this.contract as ComplianceContract,
+						evidence,
+						this.taskState.worktreeFingerprint,
+						{ summary: "pass revalidation" },
+					),
+				);
+			} catch {
+				return { accepted: false, reason: "Completion evidence validation failed before pass" };
+			}
+			const latestVerifications = new Map(evidence.verifications.map((item) => [item.command, item]));
+			const verificationPassed =
+				this.strictEvidence === undefined ||
+				(latestVerifications.size > 0 && [...latestVerifications.values()].every((item) => item.passed));
+			const delegationPassed =
+				this.strictEvidence === undefined ||
+				!this.contract?.policy.requiresSubagentDelegation ||
+				evidence.subagentDelegations.some((item) => item.status === "completed" && item.exitCode === 0);
+			const envelopePersisted =
+				this.activeEnvelope !== undefined &&
+				this.activeEnvelope.reviewId === this.taskState.activeReviewId &&
+				this.activeEnvelope.envelopeHash.length === 71;
+			if (
+				currentGit.gitHead !== this.taskState.gitHead ||
+				currentGit.diffHash !== this.taskState.diffHash ||
+				currentEvidenceRevision !== this.taskState.evidenceRevision ||
+				!verificationPassed ||
+				!delegationPassed ||
+				!envelopePersisted
+			) {
+				return { accepted: false, reason: "Completion evidence or Git context changed before pass" };
+			}
 			this.taskState = transition(this.taskState, {
 				type: "verdict",
 				status: "pass",
@@ -427,6 +681,35 @@ export class ComplianceRuntime {
 			});
 		}
 		return { accepted: true };
+	}
+
+	async handleAdvisorLifecycle(event: AdvisorReviewLifecycleEvent): Promise<void> {
+		await this.scheduler.handleLifecycle(event);
+		if (!this.taskState || event.reviewId !== this.taskState.activeReviewId) return;
+		if (
+			event.type === "advisor_run_failed" ||
+			event.type === "advisor_run_cancelled" ||
+			(event.type === "advisor_run_completed" && !event.verdictSubmitted)
+		) {
+			this.taskState = transition(this.taskState, {
+				type: "review_failed",
+				reviewId: event.reviewId,
+				reason: event.type === "advisor_run_completed" ? "no_verdict" : event.type,
+			});
+		}
+	}
+
+	async retryDueReviews(): Promise<void> {
+		await this.scheduler.pump();
+	}
+
+	overrideCompletion(reason: string): TaskState {
+		if (!this.taskState) throw new Error("No active compliance task");
+		if (typeof reason !== "string" || reason.trim().length === 0 || reason.length > 2048) {
+			throw new Error("Override reason must be bounded and non-empty");
+		}
+		this.taskState = transition(this.taskState, { type: "override", actor: "user", reason: reason.trim() });
+		return this.taskState;
 	}
 
 	/**
@@ -484,13 +767,44 @@ export class ComplianceRuntime {
 	}
 
 	// ─── Private helpers ───────────────────────────────────────────
+	private validateStrictEvidence(
+		currentGit: { gitHead: string; diffHash: `sha256:${string}` },
+		snapshot: CompletionSnapshot,
+	): string {
+		if (!this.strictEvidence) {
+			return sha256(JSON.stringify([this.taskState?.attempt ?? 0, this.collector.collector.snapshot()]));
+		}
+		const evidence = this.strictEvidence();
+		const contract = validateTaskContractIntegrity(evidence.taskContract);
+		if (
+			!this.taskState ||
+			contract.taskId !== this.taskState.taskId ||
+			contract.projectId !== this.taskState.projectId ||
+			contract.contractHash !== this.taskState.contractHash ||
+			contract.gitHead !== currentGit.gitHead
+		) {
+			throw new Error("TaskContract context mismatch");
+		}
+		const packErrors = validateCodebasePack(evidence.codebasePack, evidence.codebaseContext);
+		if (packErrors.length > 0 || evidence.codebasePack.diffHash !== currentGit.diffHash) {
+			throw new Error(`Codebase Evidence Pack rejected: ${packErrors.join(",")}`);
+		}
+		if (snapshot.verifications.length === 0) throw new Error("Verification Tool Result missing");
+		if (contract.delegationRequired && !evidence.delegations.some(delegationSatisfiesGate)) {
+			throw new Error("Trusted delegation Gate is insufficient");
+		}
+		return evidence.codebasePack.evidenceRevision;
+	}
 
-	private async writeEvidenceRecord(event: string, extra: Partial<EvidenceRecord>): Promise<void> {
+	private async writeEvidenceRecord(
+		event: string,
+		extra: Partial<EvidenceRecord> & { reviewEnvelope?: ReviewEnvelope },
+	): Promise<void> {
 		if (!this.taskState || !this.contract) {
 			return;
 		}
 
-		const record: EvidenceRecord = {
+		const record: EvidenceRecord & { reviewEnvelope?: ReviewEnvelope } = {
 			schemaVersion: 1,
 			timestamp: new Date().toISOString(),
 			taskId: this.taskState.taskId,
@@ -501,6 +815,7 @@ export class ComplianceRuntime {
 			signalDigest: extra.signalDigest ?? "",
 			verdictSummary: extra.verdictSummary,
 			worktreeFingerprint: extra.worktreeFingerprint ?? this.taskState.worktreeFingerprint,
+			...(extra.reviewEnvelope ? { reviewEnvelope: extra.reviewEnvelope } : {}),
 		};
 
 		await this.evidenceStore.append(record);

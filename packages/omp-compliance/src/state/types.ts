@@ -25,7 +25,8 @@ export type TaskStatus =
 	| "advisor_reviewing"
 	| "completed"
 	| "remediation_required"
-	| "stalled";
+	| "stalled"
+	| "overridden";
 
 /**
  * A compliance verdict issued by the advisor.
@@ -42,9 +43,14 @@ export interface ComplianceVerdict {
  */
 export interface TaskState {
 	taskId: string;
+	projectId: string;
 	status: TaskStatus;
 	attempt: number;
 	contractHash: SHA256Hash;
+	evidenceRevision: string;
+	gitHead: string;
+	diffHash: string;
+	activeReviewId?: string;
 	tddPath: string;
 	worktreeFingerprint: string;
 	createdAt: string;
@@ -62,7 +68,17 @@ export interface TaskState {
  */
 export type TaskEvent =
 	| { type: "activity"; worktreeFingerprint: string }
-	| { type: "completion_requested" }
+	| {
+			type: "completion_requested";
+			reviewId?: string;
+			evidenceRevision?: string;
+			gitHead?: string;
+			diffHash?: string;
+	  }
+	| { type: "advisor_accepted"; reviewId: string }
+	| { type: "review_failed"; reviewId: string; reason: string }
+	| { type: "retry"; reviewId: string }
+	| { type: "override"; reason: string; actor: "user" }
 	| { type: "advisor_silent" }
 	| { type: "verdict"; status: "pass"; summary?: string; schemaValid?: boolean }
 	| {

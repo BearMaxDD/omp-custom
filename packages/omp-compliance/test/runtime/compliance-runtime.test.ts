@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "@oh-my-pi/pi-coding-agent/advisor/index";
 import { ComplianceReviewRegistry } from "../../src/advisor/review-envelope";
 import type { ComplianceReviewDependencies } from "../../src/advisor/review-envelope";
+import { createReviewEnvelope } from "../../src/contracts/review-envelope";
 import { EvidenceStore } from "../../src/evidence/evidence-store";
 import { buildCompletionSnapshot } from "../../src/runtime/completion-gate";
 import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
@@ -53,13 +54,44 @@ function advisorVerdict(
 	if (!state) throw new Error("No active task — verdict helper called at wrong time");
 	return {
 		schema_version: 1,
+		review_id: state.activeReviewId,
 		task_id: state.taskId,
+		project_id: state.projectId,
 		contract_hash: state.contractHash,
+		evidence_revision: state.evidenceRevision,
+		git_head: state.gitHead,
+		diff_hash: state.diffHash,
+		trigger: "compliance_review",
 		attempt: state.attempt,
 		status: opts.status,
 		findings: opts.findings ?? [],
 	};
 }
+
+describe("ReviewEnvelope — 严格上下文", () => {
+	it("相同输入生成稳定 reviewId 并深冻结", () => {
+		const input = {
+			taskId: "task-1",
+			projectId: "project-1",
+			contractHash: `sha256:${"a".repeat(64)}`,
+			evidenceRevision: `sha256:${"b".repeat(64)}`,
+			gitHead: "c".repeat(40),
+			diffHash: `sha256:${"d".repeat(64)}`,
+			attempt: 1,
+			trigger: "compliance_review" as const,
+			createdAt: "2026-07-18T00:00:00.000Z",
+		};
+		const first = createReviewEnvelope(input);
+		const second = createReviewEnvelope(input);
+		expect(first.reviewId).toBe(second.reviewId);
+		expect(Object.isFrozen(first)).toBe(true);
+	});
+
+	it("拒绝 accessor 与无界字段", () => {
+		const hostile = Object.defineProperty({}, "taskId", { get: () => "task-1", enumerable: true });
+		expect(() => createReviewEnvelope(hostile as never)).toThrow();
+	});
+});
 
 function finding(
 	id: string,
@@ -115,6 +147,7 @@ beforeEach(() => {
 		},
 	};
 	runtime = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps);
+	runtime.recordVerification({ command: "bun test", exitCode: 0 });
 });
 
 // ─── Tests: Start ───────────────────────────────────────────────────
@@ -213,6 +246,18 @@ describe("ComplianceRuntime — requestCompletion", () => {
 // ─── Tests: Request Completion — Advisor Review Path ─────────────────
 
 describe("ComplianceRuntime — requestCompletion advisor review path", () => {
+	it("Envelope 持久化失败时保持 active 且不入队", async () => {
+		await runtime.start("tdd.md");
+		const original = store.append.bind(store);
+		store.append = async (record) => {
+			if (record.event === "completion_requested") throw new Error("disk down");
+			await original(record);
+		};
+		await expect(runtime.requestCompletion({ summary: "Done" })).rejects.toThrow("disk down");
+		expect(runtime.currentTaskState?.status).toBe("active");
+		expect(mockRequestReviewCalls).toHaveLength(0);
+	});
+
 	it("应调用 requestAdvisorReview 并正确设置 trigger/metadata", async () => {
 		await runtime.start("tdd.md");
 		runtime.recordVerification({ command: "bun test", exitCode: 0 });
@@ -221,7 +266,7 @@ describe("ComplianceRuntime — requestCompletion advisor review path", () => {
 		// One call to requestAdvisorReview
 		expect(mockRequestReviewCalls.length).toBe(1);
 		const req = mockRequestReviewCalls[0];
-		expect(req.reviewId).toMatch(/^compliance:/);
+		expect(req.reviewId).toMatch(/^review:/);
 		expect(req).toMatchObject({ trigger: "compliance_review", priority: 100 });
 		// Metadata binds task/hash/attempt
 		expect(req.metadata?.taskId).toBe(result.completionSnapshot.taskId);
@@ -237,7 +282,7 @@ describe("ComplianceRuntime — requestCompletion advisor review path", () => {
 	});
 
 	it("registry envelope 应包含 Completion Evidence 和 compliance_verdict rules", async () => {
-		await runtime.start("tdd.md");
+		const { taskId } = await runtime.start("tdd.md");
 		runtime.recordVerification({ command: "bun test", exitCode: 0 });
 		const result = await runtime.requestCompletion({ summary: "Done" });
 
@@ -247,9 +292,29 @@ describe("ComplianceRuntime — requestCompletion advisor review path", () => {
 		expect(env.context).toContain("compliance-task");
 		expect(env.context).toContain("completion_claim");
 		expect(env.rules).toContain("compliance_verdict");
+		const persisted = await store.readAll(taskId);
+		const requested = persisted.find((record) => record.event === "completion_requested") as
+			| ((typeof persisted)[number] & { reviewEnvelope?: { reviewId: string } })
+			| undefined;
+		expect(requested?.reviewEnvelope?.reviewId).toBe(result.reviewId);
 	});
 
-	it("rejected receipt 应写 advisor_unavailable Evidence 并保持 advisor_reviewing", async () => {
+	it("宿主 accepted 解决前状态保持 completion_requested", async () => {
+		let resolveReceipt: ((receipt: AdvisorReviewReceipt) => void) | undefined;
+		reviewDeps.requestAdvisorReview = (request) =>
+			new Promise((resolve) => {
+				resolveReceipt = (receipt) => resolve({ ...receipt, reviewId: request.reviewId });
+			});
+		await runtime.start("tdd.md");
+		const pending = runtime.requestCompletion({ summary: "Done" });
+		await Bun.sleep(10);
+		expect(runtime.currentTaskState?.status).toBe("completion_requested");
+		resolveReceipt?.({ status: "accepted", reviewId: "ignored" });
+		await pending;
+		expect(runtime.currentTaskState?.status).toBe("advisor_reviewing");
+	});
+
+	it("rejected receipt 应写 advisor_unavailable Evidence 并进入 stalled", async () => {
 		await runtime.start("tdd.md");
 		runtime.recordVerification({ command: "bun test", exitCode: 0 });
 
@@ -259,13 +324,71 @@ describe("ComplianceRuntime — requestCompletion advisor review path", () => {
 
 		const result = await runtime.requestCompletion({ summary: "Done" });
 
-		// Status stays advisor_reviewing
+		// Fail closed until the scheduler retries.
 		expect(result.receipt.status).toBe("rejected");
 		expect(result.receipt.reason).toContain("Advisor pool exhausted");
 
 		expect(runtime.currentTaskState).toBeDefined();
 		const state = runtime.currentTaskState as NonNullable<typeof runtime.currentTaskState>;
-		expect(state.status).toBe("advisor_reviewing");
+		expect(state.status).toBe("stalled");
+	});
+});
+
+describe("ComplianceRuntime — lifecycle 与严格 Verdict 绑定", () => {
+	it("宿主完成但没有 Verdict 时进入 stalled", async () => {
+		await runtime.start("tdd.md");
+		await runtime.requestCompletion({ summary: "Done" });
+		const reviewId = runtime.currentTaskState?.activeReviewId;
+		if (!reviewId) throw new Error("missing review id");
+		await runtime.handleAdvisorLifecycle({
+			type: "advisor_run_completed",
+			reviewId,
+			trigger: "compliance_review",
+			priority: 100,
+			primarySessionId: "primary",
+			advisorSessionId: "advisor",
+			timestamp: "2026-07-18T00:00:00.000Z",
+			verdictSubmitted: false,
+		});
+		expect(runtime.currentTaskState?.status).toBe("stalled");
+	});
+
+	it("拒绝跨项目 Verdict", async () => {
+		await runtime.start("tdd.md");
+		await runtime.requestCompletion({ summary: "Done" });
+		const verdict = advisorVerdict(runtime, { status: "pass" });
+		verdict.project_id = "another-project";
+		const result = await runtime.acceptVerdict(verdict);
+		expect(result.accepted).toBe(false);
+		expect(runtime.currentTaskState?.status).toBe("advisor_reviewing");
+	});
+
+	it("拒绝同 reviewId 的冲突重复 Verdict", async () => {
+		await runtime.start("tdd.md");
+		await runtime.requestCompletion({ summary: "Done" });
+		const first = advisorVerdict(runtime, {
+			status: "remediate",
+			findings: [finding("f1", "fix", "first")],
+		});
+		expect((await runtime.acceptVerdict(first)).accepted).toBe(true);
+		const conflict = { ...first, findings: [finding("f2", "different", "second")] };
+		const second = await runtime.acceptVerdict(conflict);
+		expect(second.accepted).toBe(false);
+		expect(second.reason).toContain("Conflicting verdict");
+	});
+
+	it("pass 前 Git diff 漂移会被拒绝", async () => {
+		Bun.spawnSync(["git", "init"], { cwd: tmpDir });
+		Bun.spawnSync(["git", "config", "user.email", "test@example.com"], { cwd: tmpDir });
+		Bun.spawnSync(["git", "config", "user.name", "Test"], { cwd: tmpDir });
+		Bun.spawnSync(["git", "add", "tdd.md"], { cwd: tmpDir });
+		Bun.spawnSync(["git", "commit", "-m", "init"], { cwd: tmpDir });
+		await runtime.start("tdd.md");
+		await runtime.requestCompletion({ summary: "Done" });
+		writeFileSync(join(tmpDir, "changed.ts"), "export const changed = true;\n");
+		const result = await runtime.acceptVerdict(advisorVerdict(runtime, { status: "pass" }));
+		expect(result.accepted).toBe(false);
+		expect(runtime.currentTaskState?.status).toBe("advisor_reviewing");
 	});
 });
 

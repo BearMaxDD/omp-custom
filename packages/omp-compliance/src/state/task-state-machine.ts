@@ -29,9 +29,11 @@ const STALLED_THRESHOLD = 3;
  * Invalid events set the error field rather than throwing.
  */
 export function transition(state: TaskState, event: TaskEvent): TaskState {
-	// completed is terminal — no events accepted
-	if (state.status === "completed") {
+	if (state.status === "completed" || state.status === "overridden") {
 		return state;
+	}
+	if (event.type === "override") {
+		return update(state, { status: "overridden", error: `Overridden by ${event.actor}: ${event.reason}` });
 	}
 
 	switch (state.status) {
@@ -69,7 +71,14 @@ function transitionActive(state: TaskState, event: TaskEvent): TaskState {
 		case "activity":
 			return update(state, { worktreeFingerprint: event.worktreeFingerprint });
 		case "completion_requested":
-			return update(state, { status: "advisor_reviewing" });
+			return update(state, {
+				status: "completion_requested",
+				activeReviewId: event.reviewId ?? state.activeReviewId,
+				evidenceRevision: event.evidenceRevision ?? state.evidenceRevision,
+				gitHead: event.gitHead ?? state.gitHead,
+				diffHash: event.diffHash ?? state.diffHash,
+				error: undefined,
+			});
 		default:
 			return withError(state, `Cannot handle ${event.type} from active`);
 	}
@@ -86,11 +95,14 @@ function transitionActive(state: TaskState, event: TaskEvent): TaskState {
  * remediation_required).
  */
 function transitionCompletionRequested(state: TaskState, event: TaskEvent): TaskState {
-	if (event.type === "advisor_silent") {
-		return update(state, { status: "advisor_reviewing" });
+	if (event.type === "advisor_accepted" && event.reviewId === state.activeReviewId) {
+		return update(state, { status: "advisor_reviewing", error: undefined });
 	}
-	if (event.type === "verdict") {
-		return processVerdict(update(state, { status: "advisor_reviewing" }), event);
+	if (event.type === "advisor_silent") {
+		return update(state, { status: "stalled", error: "Advisor silent — no verdict issued" });
+	}
+	if (event.type === "review_failed" && event.reviewId === state.activeReviewId) {
+		return update(state, { status: "stalled", error: event.reason });
 	}
 	return withError(state, `Cannot handle ${event.type} from completion_requested`);
 }
@@ -98,7 +110,11 @@ function transitionCompletionRequested(state: TaskState, event: TaskEvent): Task
 function transitionAdvisorReviewing(state: TaskState, event: TaskEvent): TaskState {
 	switch (event.type) {
 		case "advisor_silent":
-			return update(state, { error: "Advisor silent — no verdict issued" });
+			return update(state, { status: "stalled", error: "Advisor silent — no verdict issued" });
+		case "review_failed":
+			return event.reviewId === state.activeReviewId
+				? update(state, { status: "stalled", error: event.reason })
+				: withError(state, "Review identity mismatch");
 		case "protocol_error":
 			return update(state, { error: event.error });
 		case "verdict":
@@ -139,6 +155,9 @@ function transitionRemediationRequired(state: TaskState, event: TaskEvent): Task
 }
 
 function transitionStalled(state: TaskState, event: TaskEvent): TaskState {
+	if (event.type === "retry") {
+		return update(state, { status: "completion_requested", activeReviewId: event.reviewId, error: undefined });
+	}
 	if (event.type === "activity") {
 		if (event.worktreeFingerprint === state.worktreeFingerprint) {
 			return state;

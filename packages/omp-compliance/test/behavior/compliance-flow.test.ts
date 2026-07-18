@@ -115,6 +115,20 @@ function setupFixture(tddContent: string = DEFAULT_TDD_MD): FixtureSetup {
 		requestAdvisorReview: (_req: AdvisorReviewRequest) =>
 			Promise.resolve<AdvisorReviewReceipt>({ status: "accepted" as const, reviewId: "test-review" }),
 	});
+	const strictAccept = runtime.acceptVerdict.bind(runtime);
+	runtime.acceptVerdict = (verdict: Record<string, unknown>) => {
+		const state = runtime.currentTaskState;
+		if (!state) return strictAccept(verdict);
+		return strictAccept({
+			review_id: state.activeReviewId,
+			project_id: state.projectId,
+			evidence_revision: state.evidenceRevision,
+			git_head: state.gitHead,
+			diff_hash: state.diffHash,
+			trigger: "compliance_review",
+			...verdict,
+		});
+	};
 	const fakeAdvisor = new FakeAdvisor();
 	const fakeTask = new FakeTaskTool(collector.collector);
 	const fakeCbm = new FakeCodebaseMemory(collector.collector);
@@ -652,16 +666,28 @@ describe("End-to-end compliance flow — stalled scenario", () => {
 
 		const verdictPayload = {
 			schema_version: 1,
+			review_id: "review:dup",
 			task_id: "dup-test",
+			project_id: "project-dup",
 			contract_hash: "sha256:dup-hash",
+			evidence_revision: "sha256:evidence",
+			git_head: "a".repeat(40),
+			diff_hash: "sha256:diff",
+			trigger: "compliance_review",
 			attempt: 1,
 			status: "remediate",
 			findings: [{ id: "f1", reason: "Fix needed", required_fix: "Apply fix" }],
 		};
 
 		const context = {
+			reviewId: "review:dup",
 			taskId: "dup-test",
+			projectId: "project-dup",
 			contractHash: "sha256:dup-hash",
+			evidenceRevision: "sha256:evidence",
+			gitHead: "a".repeat(40),
+			diffHash: "sha256:diff",
+			trigger: "compliance_review" as const,
 			attempt: 1,
 		};
 
