@@ -1,7 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import type { ToolCallEvent, ToolResultEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { SingleResult, TaskToolDetails } from "@oh-my-pi/pi-coding-agent/task/types";
+import { normalizeDelegationEvents } from "../../src/signals/task-delegation";
 import { ToolEventCollector } from "../../src/signals/tool-event-collector";
+import type { ToolCallRecord, ToolResultRecord } from "../../src/signals/types";
 
 function taskCall(input: Record<string, unknown>, toolCallId: string): ToolCallEvent {
 	return { type: "tool_call", toolName: "task", toolCallId, input };
@@ -387,5 +389,146 @@ describe("task-delegation v17 details 领域归一化", () => {
 		const collector = new ToolEventCollector();
 		collector.recordCall({ type: "tool_call", toolName: "bash", toolCallId: "bash-1", input: { command: "ls" } });
 		expect(collector.snapshot().subagentDelegations).toHaveLength(0);
+	});
+});
+
+function storedCall(toolName: "task" | "hub", toolCallId: string, params: Record<string, unknown>): ToolCallRecord {
+	return {
+		toolName,
+		toolCallId,
+		params,
+		sessionId: "session-14",
+		timestamp: "2026-07-18T10:00:00.000Z",
+	};
+}
+
+function storedResult(toolCallId: string, details?: Record<string, unknown>): ToolResultRecord {
+	return {
+		toolCallId,
+		success: true,
+		resultRef: "Task completed successfully.",
+		source: "official",
+		details,
+		timestamp: "2026-07-18T10:01:00.000Z",
+	};
+}
+
+describe("task/hub 统一委派事件", () => {
+	it("从真实 task details 产生 completed 事件和工具 Evidence ID", () => {
+		const call = storedCall("task", "task-call-14", { task: "实现任务 14" });
+		const events = normalizeDelegationEvents([{ call, result: storedResult(call.toolCallId, taskDetails()) }]);
+		expect(events).toEqual([
+			expect.objectContaining({
+				delegationId: "delegation-1",
+				agentId: "delegation-1",
+				sessionId: "session-14",
+				toolCallId: "task-call-14",
+				transport: "task",
+				status: "completed",
+				workPackage: "实现 fixture",
+				toolEvidenceIds: ["tool-result:task-call-14"],
+			}),
+		]);
+	});
+
+	it("从 task abortReason 归一化 timed_out", () => {
+		const call = storedCall("task", "task-timeout", { task: "超时任务" });
+		const details = taskDetails({
+			results: [singleResult({ id: "agent-timeout", aborted: true, abortReason: "Timed out waiting for model" })],
+		});
+		expect(normalizeDelegationEvents([{ call, result: storedResult(call.toolCallId, details) }])).toEqual([
+			expect.objectContaining({ delegationId: "agent-timeout", status: "timed_out" }),
+		]);
+	});
+
+	it.each(["running", "completed", "failed", "cancelled"] as const)(
+		"从真实 hub jobs[] 归一化 task job 的 %s 生命周期",
+		(status) => {
+			const call = storedCall("hub", `hub-${status}`, { op: "wait", ids: ["agent-hub-14"] });
+			const events = normalizeDelegationEvents([
+				{
+					call,
+					result: storedResult(call.toolCallId, {
+						op: "wait",
+						jobs: [
+							{
+								id: "agent-hub-14",
+								type: "task",
+								status,
+								label: "实现 hub 任务",
+								durationMs: 123,
+							},
+						],
+					}),
+				},
+			]);
+			expect(events).toEqual([
+				expect.objectContaining({
+					delegationId: "agent-hub-14",
+					agentId: "agent-hub-14",
+					sessionId: "session-14",
+					toolCallId: `hub-${status}`,
+					transport: "hub",
+					status,
+					workPackage: "实现 hub 任务",
+					toolEvidenceIds: [`tool-result:hub-${status}`],
+				}),
+			]);
+		},
+	);
+
+	it("hub 普通输出文本不能冒充 task 工具证据", () => {
+		const call = storedCall("hub", "hub-text", { op: "wait" });
+		const result = storedResult(call.toolCallId);
+		result.resultRef = '{"jobs":[{"id":"fake","type":"task","status":"completed"}]}';
+		expect(normalizeDelegationEvents([{ call, result }])).toEqual([]);
+	});
+
+	it("从 hub task job 的结构化 timeout error 归一化 timed_out", () => {
+		const call = storedCall("hub", "hub-timeout", { op: "wait", ids: ["agent-timeout"] });
+		expect(
+			normalizeDelegationEvents([
+				{
+					call,
+					result: storedResult(call.toolCallId, {
+						op: "wait",
+						jobs: [
+							{
+								id: "agent-timeout",
+								type: "task",
+								status: "failed",
+								label: "超时任务",
+								durationMs: 60_000,
+								errorText: "Task timed out",
+							},
+						],
+					}),
+				},
+			]),
+		).toEqual([expect.objectContaining({ delegationId: "agent-timeout", status: "timed_out" })]);
+	});
+
+	it("忽略 hub 中非 task job，task 缺失 result 只产生 queued 且没有工具证据", () => {
+		const task = storedCall("task", "task-queued", { task: "待执行" });
+		const hub = storedCall("hub", "hub-bash", { op: "jobs" });
+		expect(
+			normalizeDelegationEvents([
+				{ call: task },
+				{
+					call: hub,
+					result: storedResult(hub.toolCallId, {
+						op: "jobs",
+						jobs: [{ id: "bash-1", type: "bash", status: "completed", label: "build", durationMs: 1 }],
+					}),
+				},
+			]),
+		).toEqual([
+			expect.objectContaining({
+				delegationId: "task-queued",
+				transport: "task",
+				status: "queued",
+				toolEvidenceIds: [],
+			}),
+		]);
 	});
 });

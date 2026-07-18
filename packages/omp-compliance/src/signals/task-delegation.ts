@@ -19,6 +19,31 @@
 import type { TaskDelegationEvidence, ToolCallRecord, ToolResultRecord } from "./types";
 
 const TASK_TOOL_NAME = "task";
+const HUB_TOOL_NAME = "hub";
+
+export interface NormalizedDelegationEvent {
+	readonly delegationId: string;
+	readonly agentId?: string;
+	readonly sessionId?: string;
+	readonly toolCallId: string;
+	readonly transport: "task" | "hub";
+	readonly status: "queued" | "running" | "completed" | "failed" | "cancelled" | "timed_out";
+	readonly workPackage?: string;
+	readonly actualFiles: readonly string[];
+	readonly toolEvidenceIds: readonly string[];
+}
+
+/** Normalize only official structured task/hub results into supervision events. */
+export function normalizeDelegationEvents(
+	paired: ReadonlyArray<{ call: ToolCallRecord; result?: ToolResultRecord }>,
+): NormalizedDelegationEvent[] {
+	const events: NormalizedDelegationEvent[] = [];
+	for (const pair of paired) {
+		if (pair.call.toolName === TASK_TOOL_NAME) events.push(...normalizeTaskEvents(pair.call, pair.result));
+		if (pair.call.toolName === HUB_TOOL_NAME) events.push(...normalizeHubEvents(pair.call, pair.result));
+	}
+	return events;
+}
 
 /**
  * Normalize paired call/result entries into task delegation evidence.
@@ -124,6 +149,136 @@ export function normalizeTaskDelegation(
 	}
 
 	return results;
+}
+
+function normalizeTaskEvents(call: ToolCallRecord, result?: ToolResultRecord): NormalizedDelegationEvent[] {
+	if (!result) {
+		return [delegationEvent(call, call.toolCallId, "task", "queued", extractTaskSummary(call.params), [])];
+	}
+	if (
+		result.source !== "official" ||
+		result.detailsTruncated ||
+		!result.details ||
+		!isTaskToolDetails(result.details)
+	) {
+		return [];
+	}
+
+	const evidenceIds = [`tool-result:${call.toolCallId}`];
+	const events: NormalizedDelegationEvent[] = [];
+	for (const value of result.details.results) {
+		const single = readRecord(value);
+		if (!single) continue;
+		const id = toOptionalString(single.id);
+		if (!id) continue;
+		events.push({
+			...delegationEvent(
+				call,
+				id,
+				"task",
+				taskResultStatus(single, result.success),
+				extractSingleResultSummary(single) ?? extractTaskSummary(call.params),
+				evidenceIds,
+			),
+			agentId: id,
+		});
+	}
+
+	const asyncDetails = readRecord(result.details.async);
+	const jobId = toOptionalString(asyncDetails?.jobId);
+	if (events.length === 0 && jobId && asyncDetails?.state === "running") {
+		events.push(delegationEvent(call, jobId, "task", "running", extractTaskSummary(call.params), evidenceIds));
+	}
+	if (events.length === 0 && jobId && asyncDetails?.state === "failed") {
+		events.push(delegationEvent(call, jobId, "task", "failed", extractTaskSummary(call.params), evidenceIds));
+	}
+	return events;
+}
+
+function normalizeHubEvents(call: ToolCallRecord, result?: ToolResultRecord): NormalizedDelegationEvent[] {
+	if (
+		!result?.success ||
+		result.source !== "official" ||
+		result.detailsTruncated ||
+		!result.details ||
+		!isHubJobDetails(result.details)
+	) {
+		return [];
+	}
+
+	const evidenceIds = [`tool-result:${call.toolCallId}`];
+	return result.details.jobs
+		.filter((job) => job.type === "task")
+		.map((job) => ({
+			...delegationEvent(call, job.id, "hub", hubJobStatus(job), job.label, evidenceIds),
+			agentId: job.id,
+		}));
+}
+
+function delegationEvent(
+	call: ToolCallRecord,
+	delegationId: string,
+	transport: "task" | "hub",
+	status: NormalizedDelegationEvent["status"],
+	workPackage: string | undefined,
+	toolEvidenceIds: readonly string[],
+): NormalizedDelegationEvent {
+	return {
+		delegationId,
+		sessionId: call.sessionId,
+		toolCallId: call.toolCallId,
+		transport,
+		status,
+		workPackage,
+		actualFiles: [],
+		toolEvidenceIds,
+	};
+}
+
+function taskResultStatus(
+	result: Record<string, unknown>,
+	toolSucceeded: boolean,
+): NormalizedDelegationEvent["status"] {
+	const reason = toOptionalString(result.abortReason)?.toLowerCase() ?? "";
+	if (reason.includes("timed out") || reason.includes("timeout")) return "timed_out";
+	if (!toolSucceeded || hasNonEmptyString(result.error) || toFiniteNumber(result.exitCode) !== 0) return "failed";
+	if (result.aborted !== true) return "completed";
+	return reason.includes("cancel") ? "cancelled" : "failed";
+}
+
+interface HubTaskJob {
+	readonly id: string;
+	readonly type: "task" | "bash";
+	readonly status: "running" | "completed" | "failed" | "cancelled";
+	readonly label: string;
+	readonly durationMs: number;
+	readonly errorText?: string;
+}
+
+function hubJobStatus(job: HubTaskJob): NormalizedDelegationEvent["status"] {
+	if (job.status === "failed" && /timed?\s*out|timeout/i.test(job.errorText ?? "")) return "timed_out";
+	return job.status;
+}
+
+function isHubJobDetails(
+	details: Record<string, unknown>,
+): details is Record<string, unknown> & { jobs: HubTaskJob[] } {
+	if (!Array.isArray(details.jobs)) return false;
+	return details.jobs.every((value) => {
+		const job = readRecord(value);
+		return (
+			job !== undefined &&
+			isNonEmptyString(job.id) &&
+			(job.type === "task" || job.type === "bash") &&
+			(job.status === "running" ||
+				job.status === "completed" ||
+				job.status === "failed" ||
+				job.status === "cancelled") &&
+			isNonEmptyString(job.label) &&
+			isFiniteNumber(job.durationMs) &&
+			(job.errorText === undefined || typeof job.errorText === "string")
+		);
+	});
 }
 
 // ─── Helpers ────────────────────────────────────────────────────
