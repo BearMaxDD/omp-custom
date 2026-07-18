@@ -8,7 +8,7 @@ import type {
 	AdvisorReviewRequest,
 } from "@oh-my-pi/pi-coding-agent/advisor/review-protocol";
 import { buildForcedReviewDedupeKey, buildReviewDedupeKey } from "./dedupe-key";
-import { REVIEW_RETRY_MAX_ATTEMPT, reviewRetryDelayMs } from "./retry-policy";
+import { reviewRetryDelayMs } from "./retry-policy";
 import {
 	REVIEW_INTENT_MAX_STRING_LENGTH,
 	type ReviewIntent,
@@ -103,6 +103,15 @@ export interface ReviewSchedulerOptions {
 	readonly requestReceiptTimeoutMs?: number;
 	readonly requestTimeout?: (delayMs: number, signal: AbortSignal) => Promise<void>;
 	readonly dedupeArchive?: ReviewDedupeArchive;
+}
+
+interface MutableSchedulerSnapshot {
+	readonly queued: ReviewIntent[];
+	readonly inFlight: ReviewIntent | undefined;
+	readonly completed: ReviewIntent[];
+	readonly dedupeLedger: Set<string>;
+	readonly nextSequence: number;
+	readonly lifecycleWaiters: Map<string, () => void>;
 }
 
 function waitForTimeout(delayMs: number, signal: AbortSignal): Promise<void> {
@@ -272,17 +281,18 @@ export class ReviewScheduler {
 			const raw = await this.#store.load();
 			if (!raw) return;
 			const restored = this.#validateState(raw);
-			this.#queued = restored.queued;
-			this.#completed = restored.completed;
-			this.#dedupeLedger = restored.dedupeLedger;
-			this.#nextSequence = restored.nextSequence;
-			if (restored.inFlight) {
-				const now = safeNow(this.#clock);
-				this.#queued.push(Object.freeze({ ...restored.inFlight, status: "stalled", notBefore: now, updatedAt: now }));
-			}
-			this.#inFlight = undefined;
-			sortQueue(this.#queued);
-			await this.#persist();
+			await this.#transaction(() => {
+				this.#queued = [...restored.queued];
+				this.#completed = restored.completed;
+				this.#dedupeLedger = restored.dedupeLedger;
+				this.#nextSequence = restored.nextSequence;
+				if (restored.inFlight) {
+					const now = safeNow(this.#clock);
+					this.#queued.push(Object.freeze({ ...restored.inFlight, status: "stalled", notBefore: now, updatedAt: now }));
+				}
+				this.#inFlight = undefined;
+				sortQueue(this.#queued);
+			});
 		});
 	}
 
@@ -318,24 +328,25 @@ export class ReviewScheduler {
 			const now = safeNow(this.#clock);
 			assertSafeInteger("nextSequence", this.#nextSequence);
 			if (this.#nextSequence === Number.MAX_SAFE_INTEGER) throw new Error("review sequence capacity exceeded");
-			const next: ReviewIntent = Object.freeze({
-				...input,
-				baseDedupeKey,
-				forceNonce,
-				dedupeKey,
-				reviewId: reviewIdFor(dedupeKey, 0),
-				status: "queued",
-				attempt: 0,
-				notBefore: now,
-				createdAt: now,
-				updatedAt: now,
-				sequence: this.#nextSequence++,
+			const next = await this.#transaction(() => {
+				const intent: ReviewIntent = Object.freeze({
+					...input,
+					baseDedupeKey,
+					forceNonce,
+					dedupeKey,
+					reviewId: reviewIdFor(dedupeKey, 0),
+					status: "queued",
+					attempt: 0,
+					notBefore: now,
+					createdAt: now,
+					updatedAt: now,
+					sequence: this.#nextSequence++,
+				});
+				this.#queued = [...nextQueue, intent];
+				this.#dedupeLedger.add(dedupeKey);
+				sortQueue(this.#queued);
+				return intent;
 			});
-			this.#queued = nextQueue;
-			this.#queued.push(next);
-			this.#dedupeLedger.add(dedupeKey);
-			sortQueue(this.#queued);
-			await this.#persist();
 			return frozenClone({ kind: "enqueued" as const, intent: next });
 		});
 	}
@@ -352,18 +363,11 @@ export class ReviewScheduler {
 			const keys = [...this.#dedupeLedger].filter((key) => !retained.has(key));
 			if (keys.length === 0) throw new Error("review dedupe ledger has no compacted keys to archive");
 			const archivedAt = safeNow(this.#clock);
-			const result = await this.#dedupeArchive.archive(
-				frozenClone({ reason: normalizedReason, archivedAt, keys }),
-			);
+			const result = await this.#dedupeArchive.archive(frozenClone({ reason: normalizedReason, archivedAt, keys }));
 			const archiveId = boundedArchiveString("archiveId", result?.archiveId);
-			const previousLedger = this.#dedupeLedger;
-			this.#dedupeLedger = new Set([...previousLedger].filter((key) => retained.has(key)));
-			try {
-				await this.#persist();
-			} catch (error) {
-				this.#dedupeLedger = previousLedger;
-				throw error;
-			}
+			await this.#transaction(() => {
+				this.#dedupeLedger = new Set([...this.#dedupeLedger].filter((key) => retained.has(key)));
+			});
 			return Object.freeze({ archiveId, archivedCount: keys.length, reason: normalizedReason, archivedAt });
 		});
 	}
@@ -376,24 +380,30 @@ export class ReviewScheduler {
 		return this.#pumping;
 	}
 
-	handleLifecycle(event: AdvisorReviewLifecycleEvent): Promise<void> {
-		return this.#serialize(async () => {
+	async handleLifecycle(event: AdvisorReviewLifecycleEvent): Promise<void> {
+		const transitioned = await this.#serialize(async () => {
 			if (!isTerminal(event) || event.reviewId !== this.#inFlight?.reviewId) return;
 			const active = this.#inFlight;
-			if (event.type === "advisor_run_completed" && event.verdictSubmitted) {
-				const completed = Object.freeze({ ...active, status: "completed" as const, updatedAt: safeNow(this.#clock) });
-				this.#inFlight = undefined;
-				this.#completed.push(completed);
-				this.#completed = this.#completed.slice(-MAX_COMPLETED_HISTORY);
-			} else {
-				const stalled = this.#stall(active);
-				this.#inFlight = undefined;
-				this.#queued.push(stalled);
-				sortQueue(this.#queued);
-			}
-			await this.#persist();
+			await this.#transaction(() => {
+				if (event.type === "advisor_run_completed" && event.verdictSubmitted) {
+					const completed = Object.freeze({
+						...active,
+						status: "completed" as const,
+						updatedAt: safeNow(this.#clock),
+					});
+					this.#inFlight = undefined;
+					this.#completed = [...this.#completed, completed].slice(-MAX_COMPLETED_HISTORY);
+				} else {
+					const stalled = this.#stall(active);
+					this.#inFlight = undefined;
+					this.#queued = [...this.#queued, stalled];
+					sortQueue(this.#queued);
+				}
+			});
 			this.#lifecycleWaiters.get(event.reviewId)?.();
+			return true;
 		});
+		if (transitioned) await this.pump();
 	}
 
 	snapshot(): ReviewSchedulerState {
@@ -413,31 +423,21 @@ export class ReviewScheduler {
 			const due = this.#queued.filter((item) => item.notBefore <= now).sort(queueOrder);
 			const queued = due[0];
 			if (!queued) return undefined;
-			const attempt = queued.attempt + 1;
-			if (!Number.isSafeInteger(attempt) || attempt > REVIEW_RETRY_MAX_ATTEMPT) {
-				throw new Error("review attempt capacity exceeded");
-			}
+			const attempt = queued.attempt === Number.MAX_SAFE_INTEGER ? Number.MAX_SAFE_INTEGER : queued.attempt + 1;
 			const index = this.#queued.findIndex((item) => item.dedupeKey === queued.dedupeKey);
 			if (index < 0) return undefined;
-			const previousQueue = this.#queued;
-			const previousInFlight = this.#inFlight;
-			this.#queued = this.#queued.filter((_, queuedIndex) => queuedIndex !== index);
-			const active: ReviewIntent = Object.freeze({
-				...queued,
-				attempt,
-				reviewId: reviewIdFor(queued.dedupeKey, attempt),
-				status: "in_flight",
-				updatedAt: now,
+			return this.#transaction(() => {
+				this.#queued = this.#queued.filter((_, queuedIndex) => queuedIndex !== index);
+				const active: ReviewIntent = Object.freeze({
+					...queued,
+					attempt,
+					reviewId: reviewIdFor(queued.dedupeKey, attempt),
+					status: "in_flight",
+					updatedAt: now,
+				});
+				this.#inFlight = active;
+				return active;
 			});
-			this.#inFlight = active;
-			try {
-				await this.#persist();
-			} catch (error) {
-				this.#queued = previousQueue;
-				this.#inFlight = previousInFlight;
-				throw error;
-			}
-			return active;
 		});
 		if (!candidate) return false;
 
@@ -460,11 +460,12 @@ export class ReviewScheduler {
 		await this.#serialize(async () => {
 			if (this.#inFlight?.reviewId !== candidate.reviewId) return;
 			if (receipt?.status === "accepted" && receipt.reviewId === candidate.reviewId) return;
-			const stalled = this.#stall(candidate);
-			this.#inFlight = undefined;
-			this.#queued.push(stalled);
-			sortQueue(this.#queued);
-			await this.#persist();
+			await this.#transaction(() => {
+				const stalled = this.#stall(candidate);
+				this.#inFlight = undefined;
+				this.#queued = [...this.#queued, stalled];
+				sortQueue(this.#queued);
+			});
 		});
 		return false;
 	}
@@ -561,7 +562,6 @@ export class ReviewScheduler {
 			!allowedStatuses.includes(candidate.status) ||
 			!Number.isSafeInteger(candidate.attempt) ||
 			candidate.attempt < 0 ||
-			candidate.attempt > REVIEW_RETRY_MAX_ATTEMPT ||
 			!Number.isSafeInteger(candidate.notBefore) ||
 			candidate.notBefore < 0 ||
 			!Number.isSafeInteger(candidate.createdAt) ||
@@ -602,6 +602,38 @@ export class ReviewScheduler {
 
 	async #persist(): Promise<void> {
 		await this.#store.save(frozenClone(this.#state()));
+	}
+
+	#mutableSnapshot(): MutableSchedulerSnapshot {
+		return {
+			queued: [...this.#queued],
+			inFlight: this.#inFlight,
+			completed: [...this.#completed],
+			dedupeLedger: new Set(this.#dedupeLedger),
+			nextSequence: this.#nextSequence,
+			lifecycleWaiters: new Map(this.#lifecycleWaiters),
+		};
+	}
+
+	#restoreMutableSnapshot(snapshot: MutableSchedulerSnapshot): void {
+		this.#queued = snapshot.queued;
+		this.#inFlight = snapshot.inFlight;
+		this.#completed = snapshot.completed;
+		this.#dedupeLedger = snapshot.dedupeLedger;
+		this.#nextSequence = snapshot.nextSequence;
+		this.#lifecycleWaiters = snapshot.lifecycleWaiters;
+	}
+
+	async #transaction<T>(operation: () => T | Promise<T>): Promise<T> {
+		const before = this.#mutableSnapshot();
+		try {
+			const result = await operation();
+			await this.#persist();
+			return result;
+		} catch (error) {
+			this.#restoreMutableSnapshot(before);
+			throw error;
+		}
 	}
 
 	#serialize<T>(operation: () => Promise<T>): Promise<T> {

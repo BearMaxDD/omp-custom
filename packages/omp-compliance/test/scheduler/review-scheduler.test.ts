@@ -11,8 +11,8 @@ import { buildReviewDedupeKey } from "../../src/scheduler/dedupe-key";
 import type { ReviewIntentInput } from "../../src/scheduler/review-intent";
 import {
 	JsonFileReviewSchedulerStore,
-	ReviewScheduler,
 	type ReviewDedupeArchive,
+	ReviewScheduler,
 	type ReviewSchedulerState,
 	type ReviewSchedulerStore,
 } from "../../src/scheduler/review-scheduler";
@@ -458,7 +458,7 @@ describe("ReviewScheduler", () => {
 		}
 	});
 
-	it("fails closed without losing work when retry time or attempt arithmetic overflows", async () => {
+	it("fails closed without losing work when retry time arithmetic overflows", async () => {
 		const nearLimit = new FakeClock();
 		nearLimit.nowMs = Number.MAX_SAFE_INTEGER;
 		const overflow = harness({
@@ -469,27 +469,6 @@ describe("ReviewScheduler", () => {
 		await overflow.scheduler.enqueue(intent());
 		await expect(overflow.scheduler.pump()).rejects.toThrow("retry time");
 		expect(overflow.scheduler.snapshot().inFlight).toBeDefined();
-
-		const store = new MemoryStore();
-		const seeded = harness({ store });
-		await seeded.scheduler.enqueue(intent());
-		const state = defined(store.state);
-		const queued = defined(state.queued[0]);
-		store.state = {
-			...state,
-			queued: [
-				{
-					...queued,
-					status: "stalled",
-					attempt: 1_000_000,
-					reviewId: `review:${queued.dedupeKey.slice("sha256:".length)}:1000000`,
-				},
-			],
-		};
-		const restored = harness({ store });
-		await restored.scheduler.restore();
-		await expect(restored.scheduler.pump()).rejects.toThrow("attempt capacity");
-		expect(restored.scheduler.snapshot().queued).toHaveLength(1);
 	});
 
 	it("releases a never-settling requester on lifecycle completion and dispatches the next item", async () => {
@@ -522,7 +501,7 @@ describe("ReviewScheduler", () => {
 		let resolveRequest: ((receipt: AdvisorReviewReceipt) => void) | undefined;
 		let expire: (() => void) | undefined;
 		const { scheduler } = harness({
-			requester: (request) =>
+			requester: (_request) =>
 				new Promise<AdvisorReviewReceipt>((resolve) => {
 					resolveRequest = resolve;
 				}),
@@ -634,5 +613,110 @@ describe("ReviewScheduler", () => {
 		expect(requests).toBe(0);
 		expect(scheduler.snapshot()).toMatchObject({ inFlight: undefined });
 		expect(scheduler.snapshot().queued).toHaveLength(1);
+	});
+
+	it("rolls an enqueue completely back when persistence fails and allows a clean retry", async () => {
+		let rejectNextSave = true;
+		const store = new MemoryStore();
+		const originalSave = store.save.bind(store);
+		store.save = async (state) => {
+			if (rejectNextSave) {
+				rejectNextSave = false;
+				throw new Error("disk down");
+			}
+			await originalSave(state);
+		};
+		const { scheduler } = harness({ store });
+		await expect(scheduler.enqueue(intent())).rejects.toThrow("disk down");
+		expect(scheduler.snapshot()).toEqual({
+			version: 2,
+			queued: [],
+			completed: [],
+			dedupeLedger: [],
+			nextSequence: 0,
+		});
+
+		const retried = await scheduler.enqueue(intent());
+		expect(retried).toMatchObject({ kind: "enqueued", intent: { sequence: 0 } });
+		expect(store.state).toEqual(scheduler.snapshot());
+	});
+
+	it("rolls lifecycle state and its waiter back when persistence fails, then restarts consistently", async () => {
+		let saves = 0;
+		let failLifecycleSave = true;
+		const store = new MemoryStore();
+		const originalSave = store.save.bind(store);
+		store.save = async (state) => {
+			saves++;
+			if (saves === 3 && failLifecycleSave) throw new Error("disk down");
+			await originalSave(state);
+		};
+		const { scheduler } = harness({
+			store,
+			requester: () => new Promise<AdvisorReviewReceipt>(() => undefined),
+			requestTimeout: () => new Promise<void>(() => undefined),
+		});
+		await scheduler.enqueue(intent({ trigger: "compliance_review", priority: 100 }));
+		const pumping = scheduler.pump();
+		while (!store.state?.inFlight) await Promise.resolve();
+		const reviewId = defined(scheduler.snapshot().inFlight).reviewId;
+		const persistedBeforeFailure = structuredClone(store.state);
+
+		await expect(scheduler.handleLifecycle(terminal(reviewId, "advisor_run_completed"))).rejects.toThrow("disk down");
+		expect(scheduler.snapshot()).toEqual(persistedBeforeFailure);
+		expect(store.state).toEqual(persistedBeforeFailure);
+
+		const restored = harness({ store });
+		await restored.scheduler.restore();
+		expect(restored.scheduler.snapshot()).toMatchObject({ inFlight: undefined });
+		expect(restored.scheduler.snapshot().queued).toHaveLength(1);
+		expect(restored.scheduler.snapshot().queued[0]?.status).toBe("stalled");
+
+		failLifecycleSave = false;
+		await scheduler.handleLifecycle(terminal(reviewId, "advisor_run_completed"));
+		await pumping;
+		expect(scheduler.snapshot().completed).toHaveLength(1);
+	});
+
+	it("automatically dispatches the next due review after a persisted lifecycle terminal", async () => {
+		const { requests, scheduler } = harness();
+		await scheduler.enqueue(intent({ trigger: "compliance_review", priority: 100, taskId: "first" }));
+		await scheduler.enqueue(intent({ trigger: "manual_review", priority: 80, taskId: "second" }));
+		await scheduler.pump();
+		expect(requests.map((request) => request.metadata?.taskId)).toEqual(["first"]);
+
+		await scheduler.handleLifecycle(terminal(defined(requests[0]).reviewId, "advisor_run_completed"));
+		expect(requests.map((request) => request.metadata?.taskId)).toEqual(["first", "second"]);
+	});
+
+	it("saturates the retry counter without ever stopping retries", async () => {
+		const store = new MemoryStore();
+		const seeded = harness({ store });
+		await seeded.scheduler.enqueue(intent());
+		const state = defined(store.state);
+		const queued = defined(state.queued[0]);
+		store.state = {
+			...state,
+			queued: [
+				{
+					...queued,
+					status: "stalled",
+					attempt: Number.MAX_SAFE_INTEGER,
+					reviewId: `review:${queued.dedupeKey.slice("sha256:".length)}:${Number.MAX_SAFE_INTEGER}`,
+				},
+			],
+		};
+		const { clock, scheduler } = harness({
+			store,
+			random: () => 0,
+			receipts: [{ reviewId: "ignored", status: "rejected" }],
+		});
+		await scheduler.restore();
+		await scheduler.pump();
+		expect(scheduler.snapshot().queued[0]).toMatchObject({
+			attempt: Number.MAX_SAFE_INTEGER,
+			status: "stalled",
+			notBefore: clock.now() + 300_000,
+		});
 	});
 });
