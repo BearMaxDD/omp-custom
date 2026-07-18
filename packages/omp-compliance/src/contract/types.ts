@@ -14,9 +14,11 @@ export type TaskContractSource = "tdd" | "lightweight";
 
 /** Immutable execution contract shared by formal TDD and low-risk tasks. */
 export interface TaskContract {
+	readonly schemaVersion: 1;
 	readonly source: TaskContractSource;
 	readonly taskId: string;
 	readonly projectId: string;
+	readonly documentPath?: string;
 	readonly gitHead: string;
 	readonly affectedFiles: readonly string[];
 	readonly scope: readonly string[];
@@ -24,7 +26,8 @@ export interface TaskContract {
 	readonly verificationCommands: readonly string[];
 	readonly delegationRequired: boolean;
 	readonly revision: SHA256Hash;
-	readonly contractHash?: SHA256Hash;
+	readonly contractHash: SHA256Hash;
+	readonly createdAt: string;
 	readonly tddPath?: string;
 }
 

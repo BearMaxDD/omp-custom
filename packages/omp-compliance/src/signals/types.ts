@@ -71,20 +71,47 @@ export interface CodebaseMemoryEvidence {
 }
 
 export interface CodebaseToolEvidence {
+	readonly toolCallId: string;
 	readonly serverName: "codebase-memory";
 	readonly qualifiedName: `codebase-memory-mcp.${string}`;
 	readonly toolName: string;
+	readonly argsFingerprint: `sha256:${string}`;
 	readonly access: "read" | "write";
 	readonly success: boolean;
+	readonly source: "official";
 	readonly params: Readonly<Record<string, unknown>>;
 	readonly resultRef: string;
+	readonly details?: Readonly<Record<string, unknown>>;
+	readonly detailsTruncated: boolean;
+	readonly detailsFailure: boolean;
+}
+
+export interface CodebaseSymbolEvidence {
+	readonly qualifiedName: string;
+	readonly file: string;
+	readonly line?: number;
+}
+
+export interface CodebaseTraceEvidence {
+	readonly source: string;
+	readonly target: string;
+	readonly direction: "inbound" | "outbound";
 }
 
 export interface CodebaseEvidencePack {
+	readonly schemaVersion: 1;
 	readonly projectId: string;
+	readonly codebaseProjectId: string;
 	readonly indexRevision: string;
+	readonly gitHead: string;
+	readonly diffHash: `sha256:${string}`;
+	readonly queriedAt: string;
 	readonly affectedFiles: readonly string[];
+	readonly allowedNewFileRoots: readonly string[];
+	readonly unresolvedClaims: readonly string[];
 	readonly tools: readonly CodebaseToolEvidence[];
+	readonly symbols: readonly CodebaseSymbolEvidence[];
+	readonly traces: readonly CodebaseTraceEvidence[];
 	readonly evidenceRevision: `sha256:${string}`;
 }
 

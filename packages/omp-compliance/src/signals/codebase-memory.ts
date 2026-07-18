@@ -23,7 +23,9 @@ import { canonicalArgsFingerprint, canonicalJson } from "../xdev/tool-identity";
 import type {
 	CodebaseEvidencePack,
 	CodebaseMemoryEvidence,
+	CodebaseSymbolEvidence,
 	CodebaseToolEvidence,
+	CodebaseTraceEvidence,
 	ToolCallRecord,
 	ToolResultRecord,
 } from "./types";
@@ -58,21 +60,21 @@ const PACK_TOOL_MAX_ITEMS = 256;
 
 export interface CodebaseEvidencePackInput {
 	readonly projectId: string;
+	readonly codebaseProjectId: string;
+	readonly gitHead: string;
+	readonly diffHash: string;
+	readonly queriedAt?: string;
 	readonly affectedFiles: readonly string[];
-	readonly tools: readonly {
-		readonly serverName: string;
-		readonly qualifiedName: string;
-		readonly toolName: string;
-		readonly success: boolean;
-		readonly params: Readonly<Record<string, unknown>>;
-		readonly resultRef: string;
-	}[];
+	readonly allowedNewFileRoots: readonly string[];
+	readonly unresolvedClaims: readonly string[];
+	readonly pairs: ReadonlyArray<{ readonly call: ToolCallRecord; readonly result?: ToolResultRecord }>;
 }
 
 export interface CodebasePackValidationOptions {
 	readonly requiresTrace?: boolean;
 	readonly taskSource?: "tdd" | "lightweight";
 	readonly crossModule?: boolean;
+	readonly newFiles?: readonly string[];
 }
 
 /**
@@ -186,13 +188,77 @@ export function normalizeCodebaseMemory(paired: PairedInput | SingleInput): {
 	};
 }
 
+const SHA256_RE = /^sha256:[a-f0-9]{64}$/;
+const PACK_INPUT_KEYS = new Set([
+	"projectId",
+	"codebaseProjectId",
+	"gitHead",
+	"diffHash",
+	"queriedAt",
+	"affectedFiles",
+	"allowedNewFileRoots",
+	"unresolvedClaims",
+	"pairs",
+]);
+const PACK_KEYS = new Set([
+	"schemaVersion",
+	"evidenceRevision",
+	"projectId",
+	"codebaseProjectId",
+	"indexRevision",
+	"gitHead",
+	"diffHash",
+	"queriedAt",
+	"tools",
+	"symbols",
+	"traces",
+	"affectedFiles",
+	"allowedNewFileRoots",
+	"unresolvedClaims",
+]);
+const OPTION_KEYS = new Set(["requiresTrace", "taskSource", "crossModule", "newFiles"]);
+const CALL_KEYS = new Set([
+	"toolName",
+	"toolCallId",
+	"serverName",
+	"qualifiedName",
+	"argsFingerprint",
+	"params",
+	"cwd",
+	"sessionId",
+	"timestamp",
+]);
+const RESULT_KEYS = new Set([
+	"toolCallId",
+	"success",
+	"resultRef",
+	"source",
+	"details",
+	"detailsTruncated",
+	"detailsFailure",
+	"timestamp",
+]);
+
 function boundedPackString(value: unknown, label: string, allowEmpty = false): string {
 	if (typeof value !== "string") throw new TypeError(`invalid_${label}`);
 	const normalized = value.normalize("NFC").trim();
-	if ((!allowEmpty && normalized.length === 0) || Buffer.byteLength(normalized, "utf8") > PACK_STRING_MAX_BYTES) {
+	if ((!allowEmpty && normalized.length === 0) || Buffer.byteLength(normalized, "utf8") > PACK_STRING_MAX_BYTES)
 		throw new TypeError(`invalid_${label}`);
-	}
 	return normalized;
+}
+
+function strictIso(value: unknown, label: string): string {
+	const text = boundedPackString(value, label);
+	const timestamp = Date.parse(text);
+	if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== text)
+		throw new TypeError(`invalid_${label}`);
+	return text;
+}
+
+function strictHash(value: unknown, label: string): `sha256:${string}` {
+	const text = boundedPackString(value, label);
+	if (!SHA256_RE.test(text)) throw new TypeError(`invalid_${label}`);
+	return text as `sha256:${string}`;
 }
 
 function plainCanonical<T>(value: unknown, label: string): T {
@@ -202,19 +268,27 @@ function plainCanonical<T>(value: unknown, label: string): T {
 	return JSON.parse(canonical) as T;
 }
 
-function normalizePackPaths(values: unknown, allowEmpty = false): string[] {
-	if (!Array.isArray(values) || values.length > PACK_PATH_MAX_ITEMS || (!allowEmpty && values.length === 0)) {
-		throw new TypeError("invalid_affected_files");
-	}
+function assertKeys(value: object, allowed: ReadonlySet<string>, label: string): void {
+	for (const key of Object.keys(value)) if (!allowed.has(key)) throw new TypeError(`unknown_${label}_field:${key}`);
+}
+
+function normalizePackPaths(values: unknown, allowEmpty = false, label = "affected_files"): string[] {
+	if (!Array.isArray(values) || values.length > PACK_PATH_MAX_ITEMS || (!allowEmpty && values.length === 0))
+		throw new TypeError(`invalid_${label}`);
 	const paths = new Map<string, string>();
 	for (const value of values) {
 		const path = normalizeRepositoryPath(value);
 		const folded = path.toLocaleLowerCase("en-US");
 		const existing = paths.get(folded);
-		if (existing && existing !== path) throw new TypeError("ambiguous_affected_files");
+		if (existing && existing !== path) throw new TypeError(`ambiguous_${label}`);
 		paths.set(folded, path);
 	}
 	return [...paths.values()].sort();
+}
+
+function normalizeClaims(values: unknown): string[] {
+	if (!Array.isArray(values) || values.length > PACK_PATH_MAX_ITEMS) throw new TypeError("invalid_unresolved_claims");
+	return [...new Set(values.map((value) => boundedPackString(value, "unresolved_claim")))].sort();
 }
 
 function toolAccess(toolName: string): "read" | "write" | null {
@@ -223,64 +297,191 @@ function toolAccess(toolName: string): "read" | "write" | null {
 	return null;
 }
 
-function normalizeToolEvidence(tool: CodebaseEvidencePackInput["tools"][number]): CodebaseToolEvidence | null {
-	const toolName = boundedPackString(tool.toolName, "tool_name");
+function normalizePair(pair: { call: ToolCallRecord; result?: ToolResultRecord }): CodebaseToolEvidence {
+	assertKeys(pair, new Set(["call", "result"]), "tool_pair");
+	if (!pair.result) throw new TypeError("missing_tool_result");
+	const { call, result } = pair;
+	assertKeys(call, CALL_KEYS, "tool_call");
+	assertKeys(result, RESULT_KEYS, "tool_result");
+	const toolName = boundedPackString(call.toolName, "tool_name");
 	const access = toolAccess(toolName);
 	if (
 		!access ||
-		tool.serverName !== EXPECTED_SERVER ||
-		tool.qualifiedName !== `${EXPECTED_QUALIFIED_PREFIX}${toolName}` ||
-		typeof tool.success !== "boolean"
-	) {
-		return null;
-	}
-	const paramsCanonical = canonicalJson(tool.params);
-	if (paramsCanonical === null) throw new TypeError("invalid_tool_params");
-	const params = JSON.parse(paramsCanonical) as Record<string, unknown>;
-	const resultRef = boundedPackString(tool.resultRef, "result_ref", true);
+		call.serverName !== EXPECTED_SERVER ||
+		call.qualifiedName !== `${EXPECTED_QUALIFIED_PREFIX}${toolName}`
+	)
+		throw new TypeError("invalid_tool_identity");
+	const toolCallId = boundedPackString(call.toolCallId, "tool_call_id");
+	if (result.toolCallId !== toolCallId) throw new TypeError("tool_result_id_mismatch");
+	const argsFingerprint = strictHash(call.argsFingerprint, "args_fingerprint");
+	if (result.source !== "official") throw new TypeError("untrusted_tool_result_source");
+	if (
+		typeof result.success !== "boolean" ||
+		typeof result.detailsTruncated !== "boolean" ||
+		typeof result.detailsFailure !== "boolean"
+	)
+		throw new TypeError("invalid_tool_result");
+	const params = plainCanonical<Record<string, unknown>>(call.params, "tool_params");
+	const paramsLossless = Object.values(params).every(
+		(value) =>
+			value === null ||
+			typeof value === "boolean" ||
+			typeof value === "number" ||
+			(typeof value === "string" && !/^(?:\[array:\d+\]|\{object:\d+\})$/.test(value) && !/…\[\+\d+\]$/.test(value)),
+	);
+	if (paramsLossless && canonicalArgsFingerprint(params) !== argsFingerprint)
+		throw new TypeError("args_fingerprint_mismatch");
+	strictIso(call.timestamp, "tool_call_timestamp");
+	strictIso(result.timestamp, "tool_result_timestamp");
+	const resultRef = boundedPackString(result.resultRef, "result_ref", true);
+	const details =
+		result.details === undefined ? undefined : plainCanonical<Record<string, unknown>>(result.details, "tool_details");
 	return {
+		toolCallId,
 		serverName: EXPECTED_SERVER,
 		qualifiedName: `${EXPECTED_QUALIFIED_PREFIX}${toolName}`,
 		toolName,
+		argsFingerprint,
 		access,
-		success: tool.success,
+		success: result.success,
+		source: "official",
 		params,
 		resultRef,
+		...(details ? { details } : {}),
+		detailsTruncated: result.detailsTruncated,
+		detailsFailure: result.detailsFailure,
 	};
 }
 
-function toolKey(tool: CodebaseToolEvidence): string {
-	const paramsFingerprint = canonicalArgsFingerprint(tool.params);
-	if (!paramsFingerprint) throw new TypeError("invalid_tool_params");
-	return `${tool.toolName}\0${tool.success ? "1" : "0"}\0${paramsFingerprint}\0${tool.resultRef}`;
-}
-
-function indexFields(tool: CodebaseToolEvidence): { status?: string; revision?: string } {
-	if (!tool.success || (tool.toolName !== "index_status" && tool.toolName !== "index_repository")) return {};
+function resultObject(tool: CodebaseToolEvidence): Record<string, unknown> {
+	if (tool.details) return tool.details as Record<string, unknown>;
 	try {
 		const parsed = JSON.parse(tool.resultRef) as unknown;
-		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || utilTypes.isProxy(parsed)) return {};
-		const status =
-			typeof (parsed as Record<string, unknown>).status === "string"
-				? boundedPackString((parsed as Record<string, unknown>).status, "index_status")
-				: undefined;
-		const rawRevision =
-			(parsed as Record<string, unknown>).revision ?? (parsed as Record<string, unknown>).indexRevision;
-		const revision = typeof rawRevision === "string" ? boundedPackString(rawRevision, "index_revision") : undefined;
-		return { status, revision };
+		return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
 	} catch {
 		return {};
 	}
 }
 
-function freezePack(pack: CodebaseEvidencePack): CodebaseEvidencePack {
+function indexFields(tool: CodebaseToolEvidence): { status?: string; revision?: string } {
+	if (!tool.success || tool.detailsTruncated || tool.detailsFailure || tool.toolName !== "index_status") return {};
+	const value = resultObject(tool);
+	return {
+		status: typeof value.status === "string" ? value.status : undefined,
+		revision:
+			typeof value.revision === "string"
+				? value.revision
+				: typeof value.indexRevision === "string"
+					? value.indexRevision
+					: undefined,
+	};
+}
+
+function collectObjects(value: unknown): Record<string, unknown>[] {
+	const result: Record<string, unknown>[] = [];
+	const pending: unknown[] = [value];
+	let visited = 0;
+	while (pending.length > 0 && visited++ < 4096) {
+		const current = pending.pop();
+		if (!current || typeof current !== "object") continue;
+		if (Array.isArray(current)) {
+			for (const item of current) pending.push(item);
+			continue;
+		}
+		const record = current as Record<string, unknown>;
+		result.push(record);
+		for (const child of Object.values(record)) if (typeof child === "object" && child !== null) pending.push(child);
+	}
+	return result;
+}
+
+function safeExtractPath(value: unknown): string | undefined {
+	try {
+		return normalizeRepositoryPath(value);
+	} catch {
+		return undefined;
+	}
+}
+
+function relatedFiles(tool: CodebaseToolEvidence): string[] {
+	const files = new Set(
+		extractReferences(tool.resultRef)
+			.map((file) => safeExtractPath(file))
+			.filter((file): file is string => Boolean(file)),
+	);
+	for (const object of collectObjects(tool.details)) {
+		const file = safeExtractPath(object.file_path ?? object.file);
+		if (file) files.add(file);
+	}
+	return [...files].sort();
+}
+
+function deriveSymbols(tools: readonly CodebaseToolEvidence[]): CodebaseSymbolEvidence[] {
+	const symbols = new Map<string, CodebaseSymbolEvidence>();
+	for (const tool of tools) {
+		if (
+			!tool.success ||
+			tool.detailsTruncated ||
+			tool.detailsFailure ||
+			!["search_graph", "get_code_snippet"].includes(tool.toolName)
+		)
+			continue;
+		const objects = collectObjects(tool.details);
+		if (tool.toolName === "get_code_snippet")
+			objects.push({ qualified_name: tool.params.qualified_name, file_path: relatedFiles(tool)[0] });
+		for (const object of objects) {
+			const qualifiedName =
+				typeof (object.qualified_name ?? object.qualifiedName) === "string"
+					? boundedPackString(object.qualified_name ?? object.qualifiedName, "qualified_name")
+					: undefined;
+			const file = safeExtractPath(object.file_path ?? object.file);
+			if (!qualifiedName || !file) continue;
+			const line =
+				typeof object.line === "number" && Number.isSafeInteger(object.line) && object.line > 0
+					? object.line
+					: undefined;
+			const symbol = { qualifiedName, file, ...(line ? { line } : {}) };
+			symbols.set(`${qualifiedName}\0${file}\0${line ?? ""}`, symbol);
+		}
+	}
+	return [...symbols.values()].sort((left, right) =>
+		`${left.qualifiedName}\0${left.file}`.localeCompare(`${right.qualifiedName}\0${right.file}`),
+	);
+}
+
+function deriveTraces(tools: readonly CodebaseToolEvidence[]): CodebaseTraceEvidence[] {
+	const traces = new Map<string, CodebaseTraceEvidence>();
+	for (const tool of tools) {
+		if (
+			!tool.success ||
+			tool.detailsTruncated ||
+			tool.detailsFailure ||
+			!["trace_path", "query_graph"].includes(tool.toolName)
+		)
+			continue;
+		const root = resultObject(tool);
+		const sourceValue = root.source ?? tool.params.function_name ?? tool.params.query;
+		const targetValue = root.target ?? relatedFiles(tool)[0];
+		if (typeof sourceValue !== "string" || typeof targetValue !== "string") continue;
+		const direction = tool.params.direction === "inbound" ? "inbound" : "outbound";
+		const trace = {
+			source: boundedPackString(sourceValue, "trace_source"),
+			target: boundedPackString(targetValue, "trace_target"),
+			direction,
+		} as const;
+		traces.set(`${trace.source}\0${trace.target}\0${direction}`, trace);
+	}
+	return [...traces.values()].sort((left, right) =>
+		`${left.source}\0${left.target}`.localeCompare(`${right.source}\0${right.target}`),
+	);
+}
+
+function deepFreezePack(pack: CodebaseEvidencePack): CodebaseEvidencePack {
 	const pending: object[] = [pack];
 	while (pending.length > 0) {
 		const current = pending.pop();
 		if (!current || Object.isFrozen(current)) continue;
-		for (const child of Object.values(current)) {
-			if (typeof child === "object" && child !== null) pending.push(child);
-		}
+		for (const child of Object.values(current)) if (typeof child === "object" && child !== null) pending.push(child);
 		Object.freeze(current);
 	}
 	return pack;
@@ -294,29 +495,48 @@ export function computeEvidenceRevision(pack: Omit<CodebaseEvidencePack, "eviden
 
 export function createCodebaseEvidencePack(input: CodebaseEvidencePackInput): CodebaseEvidencePack {
 	const safe = plainCanonical<CodebaseEvidencePackInput>(input, "evidence_pack_input");
-	if (!Array.isArray(safe.tools) || safe.tools.length > PACK_TOOL_MAX_ITEMS) throw new TypeError("invalid_tools");
-	const toolMap = new Map<string, CodebaseToolEvidence>();
-	for (const rawTool of safe.tools) {
-		const tool = normalizeToolEvidence(rawTool);
-		if (tool) toolMap.set(toolKey(tool), tool);
-	}
-	const tools = [...toolMap.values()].sort((left, right) => toolKey(left).localeCompare(toolKey(right)));
-	let indexRevision = "";
-	for (const tool of tools) {
-		const fields = indexFields(tool);
-		if (fields.revision && tool.toolName === "index_status" && fields.status === "ready") {
-			indexRevision = fields.revision;
-			break;
+	assertKeys(safe, PACK_INPUT_KEYS, "evidence_pack_input");
+	if (!Array.isArray(safe.pairs) || safe.pairs.length > PACK_TOOL_MAX_ITEMS) throw new TypeError("invalid_tool_pairs");
+	const tools: CodebaseToolEvidence[] = [];
+	const seen = new Map<string, string>();
+	for (const pair of safe.pairs) {
+		const tool = normalizePair(pair);
+		const canonical = canonicalJson(tool);
+		if (!canonical) throw new TypeError("invalid_tool_pair");
+		const previous = seen.get(tool.toolCallId);
+		if (previous && previous !== canonical) throw new TypeError("conflicting_tool_call_id");
+		if (!previous) {
+			seen.set(tool.toolCallId, canonical);
+			tools.push(tool);
 		}
-		if (!indexRevision && fields.revision) indexRevision = fields.revision;
 	}
+	const readyRevisions = new Set(
+		tools
+			.map(indexFields)
+			.filter((field) => field.status === "ready" && field.revision)
+			.map((field) => field.revision as string),
+	);
+	if (readyRevisions.size > 1) throw new TypeError("conflicting_index_revision");
 	const body = {
+		schemaVersion: 1 as const,
 		projectId: boundedPackString(safe.projectId, "project_id"),
-		indexRevision,
-		affectedFiles: normalizePackPaths(safe.affectedFiles),
+		codebaseProjectId: boundedPackString(safe.codebaseProjectId, "codebase_project_id"),
+		indexRevision: [...readyRevisions][0] ?? "",
+		gitHead: boundedPackString(safe.gitHead, "git_head"),
+		diffHash: strictHash(safe.diffHash, "diff_hash"),
+		queriedAt: strictIso(safe.queriedAt ?? new Date().toISOString(), "queried_at"),
 		tools,
+		symbols: deriveSymbols(tools),
+		traces: deriveTraces(tools),
+		affectedFiles: normalizePackPaths(safe.affectedFiles),
+		allowedNewFileRoots: normalizePackPaths(safe.allowedNewFileRoots, true, "allowed_new_file_roots"),
+		unresolvedClaims: normalizeClaims(safe.unresolvedClaims),
 	};
-	return freezePack({ ...body, evidenceRevision: computeEvidenceRevision(body) });
+	return deepFreezePack({ ...body, evidenceRevision: computeEvidenceRevision(body) });
+}
+
+function pathCovered(path: string, affected: ReadonlySet<string>, roots: readonly string[]): boolean {
+	return affected.has(path) || roots.some((root) => path === root || path.startsWith(`${root}/`));
 }
 
 export function validateCodebasePack(
@@ -325,32 +545,105 @@ export function validateCodebasePack(
 	options: CodebasePackValidationOptions = {},
 ): string[] {
 	const safePack = plainCanonical<CodebaseEvidencePack>(pack, "evidence_pack");
+	const safeChanged = plainCanonical<readonly string[]>(changedFiles, "changed_files");
 	const safeOptions = plainCanonical<CodebasePackValidationOptions>(options, "pack_validation_options");
-	const normalizedChangedFiles = normalizePackPaths(changedFiles, true);
+	assertKeys(safePack, PACK_KEYS, "evidence_pack");
+	assertKeys(safeOptions, OPTION_KEYS, "pack_validation_options");
+	boundedPackString(safePack.projectId, "project_id");
+	boundedPackString(safePack.codebaseProjectId, "codebase_project_id");
+	boundedPackString(safePack.gitHead, "git_head");
+	boundedPackString(safePack.indexRevision, "index_revision", true);
+	if (safePack.schemaVersion !== 1 || !SHA256_RE.test(safePack.diffHash) || !SHA256_RE.test(safePack.evidenceRevision))
+		throw new TypeError("invalid_evidence_pack_schema");
+	strictIso(safePack.queriedAt, "queried_at");
+	const changed = normalizePackPaths(safeChanged, true, "changed_files");
+	const newFiles = normalizePackPaths(safeOptions.newFiles ?? [], true, "new_files");
+	const affected = normalizePackPaths(safePack.affectedFiles);
+	const roots = normalizePackPaths(safePack.allowedNewFileRoots, true, "allowed_new_file_roots");
+	const claims = normalizeClaims(safePack.unresolvedClaims);
+	if (!Array.isArray(safePack.tools) || safePack.tools.length > PACK_TOOL_MAX_ITEMS)
+		throw new TypeError("invalid_tools");
+	const affectedSet = new Set(affected);
+	const newSet = new Set(newFiles);
 	const errors: string[] = [];
-	if (!safePack.indexRevision) errors.push("missing_index_revision");
-	const successfulTools = safePack.tools.filter((tool) => {
-		const normalized = normalizeToolEvidence(tool);
-		return normalized?.success === true && normalized.access === "read";
-	});
-	const successful = (toolName: string) => successfulTools.some((tool) => tool.toolName === toolName);
-	const readyIndexStatus = successfulTools.some(
-		(tool) => tool.toolName === "index_status" && indexFields(tool).status === "ready",
+	const trusted: CodebaseToolEvidence[] = [];
+	const ids = new Map<string, string>();
+	for (const raw of safePack.tools) {
+		try {
+			const tool = normalizePair({
+				call: {
+					toolName: raw.toolName,
+					toolCallId: raw.toolCallId,
+					serverName: raw.serverName,
+					qualifiedName: raw.qualifiedName,
+					argsFingerprint: raw.argsFingerprint,
+					params: raw.params,
+					timestamp: safePack.queriedAt,
+				},
+				result: {
+					toolCallId: raw.toolCallId,
+					success: raw.success,
+					source: raw.source,
+					resultRef: raw.resultRef,
+					details: raw.details,
+					detailsTruncated: raw.detailsTruncated,
+					detailsFailure: raw.detailsFailure,
+					timestamp: safePack.queriedAt,
+				},
+			});
+			const canonical = canonicalJson(tool) ?? "";
+			const previous = ids.get(tool.toolCallId);
+			if (previous && previous !== canonical) errors.push(`conflicting_tool_call_id:${tool.toolCallId}`);
+			else if (!previous) {
+				ids.set(tool.toolCallId, canonical);
+				trusted.push(tool);
+			}
+		} catch {
+			errors.push(`invalid_tool_evidence:${String(raw.toolCallId ?? "unknown")}`);
+		}
+	}
+	const projectValid = (tool: CodebaseToolEvidence) =>
+		tool.access !== "read" || tool.params.project === safePack.codebaseProjectId;
+	for (const tool of trusted) if (!projectValid(tool)) errors.push(`project_mismatch:${tool.toolName}`);
+	const successful = trusted.filter(
+		(tool) => tool.success && !tool.detailsFailure && !tool.detailsTruncated && projectValid(tool),
 	);
-	if (!readyIndexStatus) errors.push("missing_index_status");
-	if (!successful("get_code_snippet")) errors.push("missing_snippet");
-	const affectedFiles = normalizePackPaths(safePack.affectedFiles);
+	const statuses = successful
+		.filter((tool) => tool.toolName === "index_status")
+		.map(indexFields)
+		.filter((field) => field.status === "ready" && field.revision);
+	if (statuses.length === 0) errors.push("missing_index_status");
+	else if (statuses.some((field) => field.revision !== safePack.indexRevision)) errors.push("index_revision_mismatch");
+	if (!safePack.indexRevision) errors.push("missing_index_revision");
+	if (!successful.some((tool) => tool.toolName === "get_architecture" || tool.toolName === "search_graph"))
+		errors.push("missing_architecture_or_search");
+	const relevant = (tool: CodebaseToolEvidence) =>
+		relatedFiles(tool).some((file) => pathCovered(file, affectedSet, roots));
+	if (!successful.some((tool) => tool.toolName === "get_code_snippet" && relevant(tool)))
+		errors.push("missing_relevant_snippet");
 	const traceRequired =
 		safeOptions.requiresTrace === true ||
 		safeOptions.taskSource === "tdd" ||
 		safeOptions.crossModule === true ||
-		affectedFiles.length > 1;
-	if (traceRequired && !successful("trace_path")) errors.push("missing_trace");
-	const covered = new Set(affectedFiles);
-	for (const file of normalizedChangedFiles) if (!covered.has(file)) errors.push(`uncovered_file:${file}`);
+		affected.length > 1;
+	if (
+		traceRequired &&
+		!successful.some((tool) => (tool.toolName === "trace_path" || tool.toolName === "query_graph") && relevant(tool))
+	)
+		errors.push("missing_relevant_trace");
+	for (const file of changed)
+		if (!affectedSet.has(file) && !(newSet.has(file) && pathCovered(file, affectedSet, roots)))
+			errors.push(`uncovered_file:${file}`);
+	for (const file of newFiles)
+		if (!pathCovered(file, new Set(), roots)) errors.push(`new_file_outside_allowed_root:${file}`);
+	for (const claim of claims) errors.push(`unresolved_claim:${claim}`);
+	const derivedSymbols = deriveSymbols(trusted);
+	const derivedTraces = deriveTraces(trusted);
+	if (canonicalJson(derivedSymbols) !== canonicalJson(safePack.symbols)) errors.push("symbols_mismatch");
+	if (canonicalJson(derivedTraces) !== canonicalJson(safePack.traces)) errors.push("traces_mismatch");
 	const { evidenceRevision: _ignored, ...revisionBody } = safePack;
 	if (computeEvidenceRevision(revisionBody) !== safePack.evidenceRevision) errors.push("evidence_revision_mismatch");
-	return errors;
+	return [...new Set(errors)];
 }
 
 // ─── Helpers ────────────────────────────────────────────────────

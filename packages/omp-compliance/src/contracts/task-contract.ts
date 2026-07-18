@@ -8,13 +8,44 @@ import { canonicalArgsFingerprint, canonicalJson } from "../xdev/tool-identity";
 const STRING_MAX_BYTES = 4096;
 const PATH_MAX_BYTES = 1024;
 const COLLECTION_MAX_ITEMS = 512;
+const SHA256_RE = /^sha256:[a-f0-9]{64}$/;
+const CLASSIFICATION_KEYS = new Set([
+	"affectedFiles",
+	"risk",
+	"lowRisk",
+	"changesPublicBehavior",
+	"includesMigration",
+	"crossRepository",
+	"crossModule",
+	"releaseProcess",
+	"binaryArtifact",
+	"requiresParallelDelegation",
+]);
+const LIGHTWEIGHT_KEYS = new Set([
+	...CLASSIFICATION_KEYS,
+	"projectId",
+	"gitHead",
+	"taskId",
+	"scope",
+	"acceptanceCriteria",
+	"verificationCommands",
+	"createdAt",
+]);
+const FORMAL_KEYS = new Set(["projectId", "gitHead", "affectedFiles", "createdAt"]);
+
+export type TaskRisk = "low" | "medium" | "high";
 
 export interface TaskClassificationInput {
 	readonly affectedFiles: readonly string[];
-	readonly lowRisk: boolean;
+	readonly risk?: TaskRisk;
+	readonly lowRisk?: boolean;
 	readonly changesPublicBehavior?: boolean;
 	readonly includesMigration?: boolean;
 	readonly crossRepository?: boolean;
+	readonly crossModule?: boolean;
+	readonly releaseProcess?: boolean;
+	readonly binaryArtifact?: boolean;
+	readonly requiresParallelDelegation?: boolean;
 }
 
 export interface LightweightTaskContractInput extends TaskClassificationInput {
@@ -24,12 +55,14 @@ export interface LightweightTaskContractInput extends TaskClassificationInput {
 	readonly scope: readonly string[];
 	readonly acceptanceCriteria: readonly string[];
 	readonly verificationCommands: readonly string[];
+	readonly createdAt?: string;
 }
 
 export interface FormalTaskContractOptions {
 	readonly projectId: string;
 	readonly gitHead: string;
 	readonly affectedFiles: readonly string[];
+	readonly createdAt?: string;
 }
 
 function parsedPlainInput<T>(value: unknown, label: string): T {
@@ -39,13 +72,25 @@ function parsedPlainInput<T>(value: unknown, label: string): T {
 	return JSON.parse(canonical) as T;
 }
 
-function boundedString(value: unknown, label: string, allowEmpty = false): string {
+function assertExactKeys(value: object, allowed: ReadonlySet<string>, label: string): void {
+	for (const key of Object.keys(value)) if (!allowed.has(key)) throw new TypeError(`unknown_${label}_field:${key}`);
+}
+
+function boundedString(value: unknown, label: string): string {
 	if (typeof value !== "string") throw new TypeError(`invalid_${label}`);
 	const normalized = value.normalize("NFC").trim();
-	if ((!allowEmpty && normalized.length === 0) || Buffer.byteLength(normalized, "utf8") > STRING_MAX_BYTES) {
+	if (normalized.length === 0 || Buffer.byteLength(normalized, "utf8") > STRING_MAX_BYTES) {
 		throw new TypeError(`invalid_${label}`);
 	}
 	return normalized;
+}
+
+function strictIso(value: unknown, label: string): string {
+	const text = boundedString(value, label);
+	const timestamp = Date.parse(text);
+	if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== text)
+		throw new TypeError(`invalid_${label}`);
+	return text;
 }
 
 export function normalizeRepositoryPath(value: unknown): string {
@@ -57,9 +102,8 @@ export function normalizeRepositoryPath(value: unknown): string {
 		path.startsWith("/") ||
 		/^[a-zA-Z]:/.test(path) ||
 		path.includes("//")
-	) {
+	)
 		throw new TypeError("invalid_repository_path");
-	}
 	const segments = path.split("/");
 	if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
 		throw new TypeError("invalid_repository_path");
@@ -68,9 +112,8 @@ export function normalizeRepositoryPath(value: unknown): string {
 }
 
 function normalizePaths(values: unknown, label: string): string[] {
-	if (!Array.isArray(values) || values.length === 0 || values.length > COLLECTION_MAX_ITEMS) {
+	if (!Array.isArray(values) || values.length === 0 || values.length > COLLECTION_MAX_ITEMS)
 		throw new TypeError(`invalid_${label}`);
-	}
 	const byFolded = new Map<string, string>();
 	for (const value of values) {
 		const path = normalizeRepositoryPath(value);
@@ -83,52 +126,81 @@ function normalizePaths(values: unknown, label: string): string[] {
 }
 
 function normalizeStringSet(values: unknown, label: string, allowEmpty = false): string[] {
-	if (!Array.isArray(values) || values.length > COLLECTION_MAX_ITEMS || (!allowEmpty && values.length === 0)) {
+	if (!Array.isArray(values) || values.length > COLLECTION_MAX_ITEMS || (!allowEmpty && values.length === 0))
 		throw new TypeError(`invalid_${label}`);
-	}
 	return [...new Set(values.map((value) => boundedString(value, label)))].sort();
 }
 
+function normalizeOrderedStrings(values: unknown, label: string, allowEmpty = false): string[] {
+	if (!Array.isArray(values) || values.length > COLLECTION_MAX_ITEMS || (!allowEmpty && values.length === 0))
+		throw new TypeError(`invalid_${label}`);
+	const seen = new Set<string>();
+	const result: string[] = [];
+	for (const value of values) {
+		const normalized = boundedString(value, label);
+		if (!seen.has(normalized)) {
+			seen.add(normalized);
+			result.push(normalized);
+		}
+	}
+	return result;
+}
+
 function deepFreeze<T>(value: T): T {
-	const pending: object[] = [];
-	if (typeof value === "object" && value !== null) pending.push(value);
+	const pending: object[] = typeof value === "object" && value !== null ? [value] : [];
 	while (pending.length > 0) {
 		const current = pending.pop();
 		if (!current || Object.isFrozen(current)) continue;
-		for (const child of Object.values(current)) {
-			if (typeof child === "object" && child !== null) pending.push(child);
-		}
+		for (const child of Object.values(current)) if (typeof child === "object" && child !== null) pending.push(child);
 		Object.freeze(current);
 	}
 	return value;
 }
 
-function revisionOf(value: unknown): SHA256Hash {
-	const revision = canonicalArgsFingerprint(value);
-	if (!revision) throw new TypeError("task_contract_too_large");
-	return revision;
+function semanticHash(value: unknown): SHA256Hash {
+	const hash = canonicalArgsFingerprint(value);
+	if (!hash) throw new TypeError("task_contract_too_large");
+	return hash;
+}
+
+function resolveRisk(safe: TaskClassificationInput): TaskRisk {
+	if (safe.risk !== undefined && !["low", "medium", "high"].includes(safe.risk)) throw new TypeError("invalid_risk");
+	if (safe.lowRisk !== undefined && typeof safe.lowRisk !== "boolean") throw new TypeError("invalid_low_risk");
+	if (safe.risk === undefined && safe.lowRisk === undefined) throw new TypeError("missing_risk");
+	const fromLegacy: TaskRisk | undefined = safe.lowRisk === undefined ? undefined : safe.lowRisk ? "low" : "medium";
+	if (safe.risk && fromLegacy && safe.risk !== fromLegacy) throw new TypeError("conflicting_risk");
+	return safe.risk ?? fromLegacy ?? "high";
+}
+
+function classifySafe(safe: TaskClassificationInput): TaskContractSource {
+	const affectedFiles = normalizePaths(safe.affectedFiles, "affected_files");
+	const risk = resolveRisk(safe);
+	const flags = [
+		safe.changesPublicBehavior,
+		safe.includesMigration,
+		safe.crossRepository,
+		safe.crossModule,
+		safe.releaseProcess,
+		safe.binaryArtifact,
+		safe.requiresParallelDelegation,
+	];
+	for (const flag of flags)
+		if (flag !== undefined && typeof flag !== "boolean") throw new TypeError("invalid_task_classification_flag");
+	return affectedFiles.length === 1 && risk === "low" && flags.every((flag) => flag !== true) ? "lightweight" : "tdd";
 }
 
 export function classifyTaskContractSource(input: TaskClassificationInput): TaskContractSource {
 	const safe = parsedPlainInput<TaskClassificationInput>(input, "task_classification");
-	const affectedFiles = normalizePaths(safe.affectedFiles, "affected_files");
-	if (typeof safe.lowRisk !== "boolean") throw new TypeError("invalid_low_risk");
-	for (const flag of [safe.changesPublicBehavior, safe.includesMigration, safe.crossRepository]) {
-		if (flag !== undefined && typeof flag !== "boolean") throw new TypeError("invalid_task_classification_flag");
-	}
-	return affectedFiles.length === 1 &&
-		safe.lowRisk &&
-		!safe.changesPublicBehavior &&
-		!safe.includesMigration &&
-		!safe.crossRepository
-		? "lightweight"
-		: "tdd";
+	assertExactKeys(safe, CLASSIFICATION_KEYS, "task_classification");
+	return classifySafe(safe);
 }
 
 export function createLightweightTaskContract(input: LightweightTaskContractInput): TaskContract {
 	const safe = parsedPlainInput<LightweightTaskContractInput>(input, "lightweight_contract");
-	if (classifyTaskContractSource(safe) !== "lightweight") throw new TypeError("formal_tdd_required");
-	const body = {
+	assertExactKeys(safe, LIGHTWEIGHT_KEYS, "lightweight_contract");
+	if (classifySafe(safe) !== "lightweight") throw new TypeError("formal_tdd_required");
+	const semantic = {
+		schemaVersion: 1 as const,
 		source: "lightweight" as const,
 		taskId: safe.taskId ? boundedString(safe.taskId, "task_id") : "lightweight-task",
 		projectId: boundedString(safe.projectId, "project_id"),
@@ -136,10 +208,16 @@ export function createLightweightTaskContract(input: LightweightTaskContractInpu
 		affectedFiles: normalizePaths(safe.affectedFiles, "affected_files"),
 		scope: normalizeStringSet(safe.scope, "scope"),
 		acceptanceCriteria: normalizeStringSet(safe.acceptanceCriteria, "acceptance_criteria"),
-		verificationCommands: normalizeStringSet(safe.verificationCommands, "verification_commands"),
+		verificationCommands: normalizeOrderedStrings(safe.verificationCommands, "verification_commands"),
 		delegationRequired: false,
 	};
-	return deepFreeze({ ...body, revision: revisionOf(body) });
+	const revision = semanticHash(semantic);
+	return deepFreeze({
+		...semantic,
+		contractHash: revision,
+		revision,
+		createdAt: strictIso(safe.createdAt ?? new Date().toISOString(), "created_at"),
+	});
 }
 
 export function loadTaskContractFromTdd(
@@ -148,31 +226,49 @@ export function loadTaskContractFromTdd(
 	options: FormalTaskContractOptions,
 ): TaskContract {
 	const safe = parsedPlainInput<FormalTaskContractOptions>(options, "formal_contract_options");
+	assertExactKeys(safe, FORMAL_KEYS, "formal_contract_options");
 	const contract = loadComplianceContract(filePath, repoRoot);
-	const body = {
+	const documentPath = normalizeRepositoryPath(contract.tddPath);
+	const semantic = {
+		schemaVersion: 1 as const,
 		source: "tdd" as const,
 		taskId: contract.taskId,
 		projectId: boundedString(safe.projectId, "project_id"),
+		documentPath,
+		contractHash: contract.contractHash,
 		gitHead: boundedString(safe.gitHead, "git_head"),
 		affectedFiles: normalizePaths(safe.affectedFiles, "affected_files"),
 		scope: normalizeStringSet(contract.summary.scope, "scope", true),
 		acceptanceCriteria: normalizeStringSet(contract.summary.completionCriteria, "acceptance_criteria", true),
-		verificationCommands: normalizeStringSet(contract.summary.verification, "verification_commands", true),
+		verificationCommands: normalizeOrderedStrings(contract.summary.verification, "verification_commands", true),
 		delegationRequired: contract.policy.requiresSubagentDelegation,
-		tddPath: normalizeRepositoryPath(contract.tddPath),
-		contractHash: contract.contractHash,
+		tddPath: documentPath,
 	};
-	return deepFreeze({ ...body, revision: revisionOf(body) });
+	return deepFreeze({
+		...semantic,
+		revision: semanticHash(semantic),
+		createdAt: strictIso(safe.createdAt ?? new Date().toISOString(), "created_at"),
+	});
 }
 
 export function compareTaskContractRevision(
 	original: Pick<TaskContract, "revision">,
 	updated: Pick<TaskContract, "revision">,
-): { readonly oldRevision: SHA256Hash; readonly newRevision: SHA256Hash; readonly drifted: boolean } {
+): {
+	readonly oldRevision: SHA256Hash;
+	readonly newRevision: SHA256Hash;
+	readonly drifted: boolean;
+} {
+	const oldValue = parsedPlainInput<{ revision: string }>(original, "task_revision");
+	const newValue = parsedPlainInput<{ revision: string }>(updated, "task_revision");
+	assertExactKeys(oldValue, new Set(["revision"]), "task_revision");
+	assertExactKeys(newValue, new Set(["revision"]), "task_revision");
+	if (!SHA256_RE.test(oldValue.revision) || !SHA256_RE.test(newValue.revision))
+		throw new TypeError("invalid_task_revision");
 	return Object.freeze({
-		oldRevision: original.revision,
-		newRevision: updated.revision,
-		drifted: original.revision !== updated.revision,
+		oldRevision: oldValue.revision as SHA256Hash,
+		newRevision: newValue.revision as SHA256Hash,
+		drifted: oldValue.revision !== newValue.revision,
 	});
 }
 

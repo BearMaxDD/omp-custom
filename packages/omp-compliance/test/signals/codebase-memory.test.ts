@@ -8,6 +8,8 @@ import {
 	validateCodebasePack,
 } from "../../src/signals/codebase-memory";
 import { ToolEventCollector } from "../../src/signals/tool-event-collector";
+import type { ToolCallRecord, ToolResultRecord } from "../../src/signals/types";
+import { canonicalArgsFingerprint } from "../../src/xdev/tool-identity";
 
 function mcpCall(shortName: string, input: Record<string, unknown>, toolCallId: string) {
 	return {
@@ -220,190 +222,272 @@ describe("codebaseIndexReady matrix", () => {
 });
 
 describe("Codebase Evidence Pack", () => {
-	const successfulTools = [
-		{
-			serverName: "codebase-memory",
-			qualifiedName: "codebase-memory-mcp.index_status",
-			toolName: "index_status",
-			success: true,
-			params: {},
-			resultRef: '{"status":"ready","revision":"idx-1"}',
-		},
-		{
-			serverName: "codebase-memory",
-			qualifiedName: "codebase-memory-mcp.get_code_snippet",
-			toolName: "get_code_snippet",
-			success: true,
-			params: { qualified_name: "a" },
-			resultRef: "file:src/a.ts",
-		},
-		{
-			serverName: "codebase-memory",
-			qualifiedName: "codebase-memory-mcp.trace_path",
-			toolName: "trace_path",
-			success: true,
-			params: { function_name: "a" },
-			resultRef: "file:src/a.ts",
-		},
-	] as const;
+	const codebaseProjectId = "codebase-demo";
+	const queriedAt = "2026-07-18T08:00:00.000Z";
+	const diffHash = `sha256:${"d".repeat(64)}`;
 
-	it("生成稳定、不可变且包含结构化工具证据的 Pack", () => {
-		const pack = createCodebaseEvidencePack({
-			projectId: "demo",
-			affectedFiles: ["src/b.ts", "src/a.ts", "src/a.ts"],
-			tools: successfulTools,
+	function pair(
+		toolName: string,
+		id: string,
+		params: Record<string, unknown>,
+		resultRef: string,
+		details?: Record<string, unknown>,
+		success = true,
+	): { call: ToolCallRecord; result: ToolResultRecord } {
+		const argsFingerprint = canonicalArgsFingerprint(params);
+		if (!argsFingerprint) throw new Error("fixture args must be canonical");
+		return {
+			call: {
+				toolName,
+				toolCallId: id,
+				serverName: "codebase-memory",
+				qualifiedName: `codebase-memory-mcp.${toolName}`,
+				argsFingerprint,
+				params,
+				timestamp: queriedAt,
+			},
+			result: {
+				toolCallId: id,
+				success,
+				source: "official",
+				resultRef,
+				...(details ? { details } : {}),
+				detailsTruncated: false,
+				detailsFailure: !success,
+				timestamp: queriedAt,
+			},
+		};
+	}
+
+	function validPairs() {
+		return [
+			pair("index_status", "index", { project: codebaseProjectId }, '{"status":"ready","revision":"idx-1"}', {
+				status: "ready",
+				revision: "idx-1",
+			}),
+			pair("search_graph", "search", { project: codebaseProjectId, query: "demo.a" }, "file:src/a.ts", {
+				results: [{ qualified_name: "demo.a", file_path: "src/a.ts" }],
+			}),
+			pair("get_code_snippet", "snippet", { project: codebaseProjectId, qualified_name: "demo.a" }, "file:src/a.ts", {
+				qualified_name: "demo.a",
+				file_path: "src/a.ts",
+				line: 10,
+			}),
+			pair(
+				"trace_path",
+				"trace",
+				{ project: codebaseProjectId, function_name: "demo.a", direction: "outbound" },
+				"file:src/a.ts file:src/b.ts",
+				{ source: "demo.a", target: "demo.b", file_path: "src/a.ts" },
+			),
+		];
+	}
+
+	function metadata(pairs = validPairs()) {
+		return {
+			projectId: "project-uuid",
+			codebaseProjectId,
+			gitHead: "5e5560e",
+			diffHash,
+			queriedAt,
+			affectedFiles: ["src/a.ts"],
+			allowedNewFileRoots: ["src/new"],
+			unresolvedClaims: [] as string[],
+			pairs,
+		};
+	}
+
+	it("生成 TRD 9.3 完整、稳定、不可变 Pack", () => {
+		const pack = createCodebaseEvidencePack(metadata());
+		expect(pack).toMatchObject({
+			schemaVersion: 1,
+			projectId: "project-uuid",
+			codebaseProjectId,
+			indexRevision: "idx-1",
+			gitHead: "5e5560e",
+			diffHash,
+			queriedAt,
 		});
-
-		expect(pack.indexRevision).toBe("idx-1");
-		expect(pack.affectedFiles).toEqual(["src/a.ts", "src/b.ts"]);
-		expect(pack.tools.map((tool) => tool.toolName)).toEqual(["get_code_snippet", "index_status", "trace_path"]);
+		expect(pack.symbols).toContainEqual({ qualifiedName: "demo.a", file: "src/a.ts", line: 10 });
+		expect(pack.traces.length).toBeGreaterThan(0);
 		expect(pack.evidenceRevision).toMatch(/^sha256:[a-f0-9]{64}$/);
-		const { evidenceRevision: _ignored, ...revisionBody } = pack;
-		expect(computeEvidenceRevision(revisionBody)).toBe(pack.evidenceRevision);
+		const { evidenceRevision: _ignored, ...body } = pack;
+		expect(computeEvidenceRevision(body)).toBe(pack.evidenceRevision);
 		expect(Object.isFrozen(pack)).toBe(true);
-		expect(Object.isFrozen(pack.tools)).toBe(true);
 		expect(Object.isFrozen(pack.tools[0].params)).toBe(true);
 	});
 
-	it("字段顺序和集合顺序不影响 revision，内容变化会改变 revision", () => {
-		const first = createCodebaseEvidencePack({
-			projectId: "demo",
-			affectedFiles: ["src/b.ts", "src/a.ts"],
-			tools: successfulTools,
-		});
-		const second = createCodebaseEvidencePack({
-			projectId: "demo",
-			tools: [...successfulTools].reverse(),
-			affectedFiles: ["src/a.ts", "src/b.ts"],
-		});
-		const changed = createCodebaseEvidencePack({
-			projectId: "demo-2",
-			affectedFiles: ["src/a.ts", "src/b.ts"],
-			tools: successfulTools,
-		});
-		expect(first.evidenceRevision).toBe(second.evidenceRevision);
-		expect(first.evidenceRevision).not.toBe(changed.evidenceRevision);
+	it("伪造 indexRevision 后即使重算 revision 仍被真实性复核拒绝", () => {
+		const pack = createCodebaseEvidencePack(metadata());
+		const forgedBody = { ...pack, indexRevision: "idx-forged" };
+		const { evidenceRevision: _old, ...withoutRevision } = forgedBody;
+		const forged = { ...withoutRevision, evidenceRevision: computeEvidenceRevision(withoutRevision) };
+		expect(validateCodebasePack(forged, [])).toContain("index_revision_mismatch");
 	});
 
-	it("缺索引、index_status、snippet 或正式跨模块 trace 时 invalid", () => {
-		const pack = createCodebaseEvidencePack({ projectId: "demo", affectedFiles: ["src/a.ts"], tools: successfulTools });
-		expect(validateCodebasePack({ ...pack, indexRevision: "" }, [], { requiresTrace: true })).toContain(
-			"missing_index_revision",
+	it("拒绝无关项目、无关 snippet 和无关 trace", () => {
+		const wrongProject = validPairs().map((entry) =>
+			entry.call.toolName === "search_graph"
+				? pair("search_graph", "search", { project: "other", query: "demo.a" }, "file:src/a.ts")
+				: entry,
+		);
+		expect(validateCodebasePack(createCodebaseEvidencePack(metadata(wrongProject)), [])).toContain(
+			"project_mismatch:search_graph",
+		);
+
+		const unrelatedSnippet = validPairs().map((entry) =>
+			entry.call.toolName === "get_code_snippet"
+				? pair(
+						"get_code_snippet",
+						"snippet",
+						{ project: codebaseProjectId, qualified_name: "other.z" },
+						"file:other/z.ts",
+						{ qualified_name: "other.z", file_path: "other/z.ts" },
+					)
+				: entry,
+		);
+		expect(validateCodebasePack(createCodebaseEvidencePack(metadata(unrelatedSnippet)), [])).toContain(
+			"missing_relevant_snippet",
+		);
+
+		const unrelatedTrace = validPairs().map((entry) =>
+			entry.call.toolName === "trace_path"
+				? pair(
+						"trace_path",
+						"trace",
+						{ project: codebaseProjectId, function_name: "other.z", direction: "outbound" },
+						"file:other/z.ts",
+						{ source: "other.z", target: "other.y", file_path: "other/z.ts" },
+					)
+				: entry,
 		);
 		expect(
-			validateCodebasePack({ ...pack, tools: pack.tools.filter((tool) => tool.toolName !== "index_status") }, [], {
-				requiresTrace: true,
-			}),
-		).toContain("missing_index_status");
-		expect(
-			validateCodebasePack(
-				{
-					...pack,
-					tools: pack.tools.map((tool) =>
-						tool.toolName === "index_status"
-							? { ...tool, resultRef: '{"status":"indexing","revision":"idx-1"}' }
-							: tool,
-					),
-				},
-				[],
-				{ requiresTrace: true },
-			),
-		).toContain("missing_index_status");
-		expect(
-			validateCodebasePack({ ...pack, tools: pack.tools.filter((tool) => tool.toolName !== "get_code_snippet") }, [], {
-				requiresTrace: true,
-			}),
-		).toContain("missing_snippet");
-		expect(
-			validateCodebasePack({ ...pack, tools: pack.tools.filter((tool) => tool.toolName !== "trace_path") }, [], {
-				requiresTrace: true,
-			}),
-		).toContain("missing_trace");
+			validateCodebasePack(createCodebaseEvidencePack(metadata(unrelatedTrace)), [], { crossModule: true }),
+		).toContain("missing_relevant_trace");
 	});
 
-	it("修改文件必须由 affectedFiles 精确覆盖", () => {
-		const pack = createCodebaseEvidencePack({ projectId: "demo", affectedFiles: ["src/a.ts"], tools: successfulTools });
-		expect(validateCodebasePack(pack, ["src/a.ts", "src/b.ts"])).toContain("uncovered_file:src/b.ts");
-		expect(() => validateCodebasePack(pack, ["../src/a.ts"])).toThrow();
-		expect(() => validateCodebasePack(pack, ["/src/a.ts"])).toThrow();
-		expect(() => validateCodebasePack(pack, ["src\\a.ts"])).toThrow();
-		expect(() =>
-			createCodebaseEvidencePack({
-				projectId: "demo",
-				affectedFiles: ["src/A.ts", "src/a.ts"],
-				tools: successfulTools,
-			}),
-		).toThrow();
+	it("同 toolCallId 冲突结果失败关闭", () => {
+		const pairs = validPairs();
+		pairs.push(
+			pair("get_code_snippet", "snippet", { project: codebaseProjectId, qualified_name: "demo.a" }, "file:src/evil.ts"),
+		);
+		expect(() => createCodebaseEvidencePack(metadata(pairs))).toThrow("conflicting_tool_call_id");
 	});
 
-	it("正式任务或多文件范围即使未显式传 requiresTrace 也要求 trace", () => {
-		const noTrace = successfulTools.filter((tool) => tool.toolName !== "trace_path");
-		const single = createCodebaseEvidencePack({ projectId: "demo", affectedFiles: ["src/a.ts"], tools: noTrace });
-		const multiple = createCodebaseEvidencePack({
-			projectId: "demo",
-			affectedFiles: ["src/a.ts", "src/b.ts"],
-			tools: noTrace,
-		});
-		expect(validateCodebasePack(single, [], { taskSource: "tdd" })).toContain("missing_trace");
-		expect(validateCodebasePack(multiple, [])).toContain("missing_trace");
-	});
-
-	it("失败工具不算完整性，index_repository 不算只读 index_status", () => {
-		const pack = createCodebaseEvidencePack({
-			projectId: "demo",
-			affectedFiles: ["src/a.ts"],
-			tools: [
-				{ ...successfulTools[0], toolName: "index_repository", qualifiedName: "codebase-memory-mcp.index_repository" },
-				{ ...successfulTools[1], success: false },
-			],
-		});
-		const errors = validateCodebasePack(pack, []);
-		expect(errors).toContain("missing_index_status");
-		expect(errors).toContain("missing_snippet");
-	});
-
-	it("验证阶段重新校验可信 server 与 qualifiedName，不信任伪造 access", () => {
-		const pack = createCodebaseEvidencePack({ projectId: "demo", affectedFiles: ["src/a.ts"], tools: successfulTools });
-		const forged = {
-			...pack,
-			tools: pack.tools.map((tool) =>
-				tool.toolName === "get_code_snippet" ? { ...tool, serverName: "evil", access: "read" as const } : tool,
-			),
+	it("配对重新校验 ID、argsFingerprint、官方 source 与失败结果", () => {
+		const mismatchedFingerprint = validPairs();
+		mismatchedFingerprint[1] = {
+			...mismatchedFingerprint[1],
+			call: { ...mismatchedFingerprint[1].call, argsFingerprint: `sha256:${"a".repeat(64)}` },
 		};
-		expect(validateCodebasePack(forged as never, [])).toContain("missing_snippet");
+		expect(() => createCodebaseEvidencePack(metadata(mismatchedFingerprint))).toThrow("args_fingerprint_mismatch");
+
+		const mismatchedId = validPairs();
+		mismatchedId[1] = { ...mismatchedId[1], result: { ...mismatchedId[1].result, toolCallId: "other" } };
+		expect(() => createCodebaseEvidencePack(metadata(mismatchedId))).toThrow("tool_result_id_mismatch");
+
+		const legacy = validPairs();
+		legacy[1] = { ...legacy[1], result: { ...legacy[1].result, source: "legacy" } };
+		expect(() => createCodebaseEvidencePack(metadata(legacy))).toThrow("untrusted_tool_result_source");
+
+		const failedSnippet = validPairs().map((entry) =>
+			entry.call.toolName === "get_code_snippet"
+				? pair(
+						"get_code_snippet",
+						"snippet",
+						{ project: codebaseProjectId, qualified_name: "demo.a" },
+						"file:src/a.ts",
+						{},
+						false,
+					)
+				: entry,
+		);
+		expect(validateCodebasePack(createCodebaseEvidencePack(metadata(failedSnippet)), [])).toContain(
+			"missing_relevant_snippet",
+		);
+
+		const truncatedQuery = validPairs();
+		truncatedQuery[1] = {
+			...truncatedQuery[1],
+			call: { ...truncatedQuery[1].call, params: { project: codebaseProjectId, query: `${"q".repeat(80)}…[+20]` } },
+		};
+		expect(() => createCodebaseEvidencePack(metadata(truncatedQuery))).not.toThrow();
 	});
 
-	it("Proxy、accessor 和超限输入失败关闭且不执行用户代码", () => {
+	it("缺 architecture/search、snippet、index_status 均 invalid，index_repository 不替代", () => {
+		const pairs = validPairs();
+		const withoutDiscovery = pairs.filter((entry) => entry.call.toolName !== "search_graph");
+		expect(validateCodebasePack(createCodebaseEvidencePack(metadata(withoutDiscovery)), [])).toContain(
+			"missing_architecture_or_search",
+		);
+		const withoutSnippet = pairs.filter((entry) => entry.call.toolName !== "get_code_snippet");
+		expect(validateCodebasePack(createCodebaseEvidencePack(metadata(withoutSnippet)), [])).toContain(
+			"missing_relevant_snippet",
+		);
+		const repositoryOnly = pairs.filter((entry) => entry.call.toolName !== "index_status");
+		repositoryOnly.push(
+			pair(
+				"index_repository",
+				"index-write",
+				{ project: codebaseProjectId },
+				'{"status":"indexed","revision":"idx-1"}',
+			),
+		);
+		expect(validateCodebasePack(createCodebaseEvidencePack(metadata(repositoryOnly)), [])).toContain(
+			"missing_index_status",
+		);
+	});
+
+	it("query_graph 可替代跨模块 trace_path，但必须与 affectedFiles 相关", () => {
+		const pairs = validPairs().filter((entry) => entry.call.toolName !== "trace_path");
+		pairs.push(
+			pair(
+				"query_graph",
+				"query",
+				{ project: codebaseProjectId, query: "MATCH demo.a -> demo.b" },
+				"file:src/a.ts file:src/b.ts",
+				{ source: "demo.a", target: "demo.b", file_path: "src/a.ts" },
+			),
+		);
+		const pack = createCodebaseEvidencePack(metadata(pairs));
+		expect(validateCodebasePack(pack, [], { crossModule: true })).not.toContain("missing_relevant_trace");
+	});
+
+	it("新增文件只能位于 allowedNewFileRoots，unresolvedClaims 一律失败关闭", () => {
+		const pack = createCodebaseEvidencePack(metadata());
+		expect(validateCodebasePack(pack, ["src/new/item.ts"], { newFiles: ["src/new/item.ts"] })).not.toContain(
+			"new_file_outside_allowed_root:src/new/item.ts",
+		);
+		expect(validateCodebasePack(pack, ["other/item.ts"], { newFiles: ["other/item.ts"] })).toContain(
+			"new_file_outside_allowed_root:other/item.ts",
+		);
+		const unresolved = createCodebaseEvidencePack({ ...metadata(), unresolvedClaims: ["无法定位写入者"] });
+		expect(validateCodebasePack(unresolved, [])).toContain("unresolved_claim:无法定位写入者");
+	});
+
+	it("changedFiles/options Proxy 与 accessor trap=0，ISO/hash/path/大小严格", () => {
+		const pack = createCodebaseEvidencePack(metadata());
 		let reads = 0;
-		const accessor = Object.defineProperty({}, "projectId", {
+		const changed = new Proxy([], {
+			get: () => {
+				reads++;
+				throw new Error("trap");
+			},
+		});
+		expect(() => validateCodebasePack(pack, changed)).toThrow();
+		expect(reads).toBe(0);
+		const options = Object.defineProperty({}, "crossModule", {
 			enumerable: true,
 			get: () => {
 				reads++;
-				return "demo";
+				return true;
 			},
 		});
-		expect(() => createCodebaseEvidencePack(accessor as never)).toThrow();
+		expect(() => validateCodebasePack(pack, [], options)).toThrow();
 		expect(reads).toBe(0);
-		expect(() =>
-			createCodebaseEvidencePack(
-				new Proxy(
-					{},
-					{
-						get: () => {
-							reads++;
-							return "demo";
-						},
-					},
-				) as never,
-			),
-		).toThrow();
-		expect(reads).toBe(0);
-		expect(() =>
-			createCodebaseEvidencePack({
-				projectId: "x".repeat(70_000),
-				affectedFiles: ["src/a.ts"],
-				tools: successfulTools,
-			}),
-		).toThrow();
+		expect(() => createCodebaseEvidencePack({ ...metadata(), queriedAt: "2026-07-18" })).toThrow();
+		expect(() => createCodebaseEvidencePack({ ...metadata(), diffHash: "sha256:bad" })).toThrow();
+		expect(() => createCodebaseEvidencePack({ ...metadata(), affectedFiles: ["../escape.ts"] })).toThrow();
+		expect(() => createCodebaseEvidencePack({ ...metadata(), projectId: "x".repeat(70_000) })).toThrow();
 	});
 });
