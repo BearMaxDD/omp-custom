@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "@oh-my-pi/pi-coding-agent/advisor/index";
@@ -10,6 +10,7 @@ import { EvidenceStore } from "../../src/evidence/evidence-store";
 import { buildCompletionSnapshot } from "../../src/runtime/completion-gate";
 import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
+import { createStrictRuntimeDependencies } from "../support/strict-runtime-dependencies";
 
 // ─── Minimal Fake API for runtime tests ─────────────────────────────
 
@@ -42,6 +43,22 @@ let api: MinimalAPI;
 let store: EvidenceStore;
 let collector: CollectorRuntime;
 let runtime: ComplianceRuntime;
+let verificationSequence = 0;
+
+function recordTrustedVerification(
+	target: CollectorRuntime,
+	verification: { command: string; exitCode: number },
+): void {
+	const toolCallId = `trusted-verification-${++verificationSequence}`;
+	const timestamp = new Date().toISOString();
+	target.collector.recordCall({ toolName: "bash", toolCallId, params: { command: verification.command }, timestamp });
+	target.collector.recordResult({
+		toolCallId,
+		success: verification.exitCode === 0,
+		resultRef: JSON.stringify({ exitCode: verification.exitCode }),
+		timestamp,
+	});
+}
 
 function advisorVerdict(
 	runtime: ComplianceRuntime,
@@ -131,6 +148,11 @@ beforeEach(() => {
 		].join("\n"),
 		"utf-8",
 	);
+	Bun.spawnSync(["git", "init"], { cwd: tmpDir });
+	Bun.spawnSync(["git", "config", "user.email", "test@example.com"], { cwd: tmpDir });
+	Bun.spawnSync(["git", "config", "user.name", "Test"], { cwd: tmpDir });
+	Bun.spawnSync(["git", "add", "tdd.md"], { cwd: tmpDir });
+	Bun.spawnSync(["git", "commit", "-m", "init"], { cwd: tmpDir });
 
 	const evidenceDir = join(tmpDir, ".omp", "evidence");
 	api = new MinimalAPI();
@@ -146,8 +168,19 @@ beforeEach(() => {
 			return Promise.resolve(mockRequestReviewReturn);
 		},
 	};
-	runtime = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps);
-	runtime.recordVerification({ command: "bun test", exitCode: 0 });
+	runtime = new ComplianceRuntime(
+		() => store,
+		collector,
+		api,
+		tmpDir,
+		reviewDeps,
+		createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		}),
+	);
+	recordTrustedVerification(collector, { command: "bun test", exitCode: 0 });
 });
 
 // ─── Tests: Start ───────────────────────────────────────────────────
@@ -212,7 +245,7 @@ describe("ComplianceRuntime — resume", () => {
 describe("ComplianceRuntime — requestCompletion", () => {
 	it("完成请求只进入 advisor_reviewing，不会自行通过", async () => {
 		await runtime.start("tdd.md");
-		runtime.recordVerification({ command: "bun test", exitCode: 0 });
+		recordTrustedVerification(collector, { command: "bun test", exitCode: 0 });
 		const result = await runtime.requestCompletion({ summary: "已完成" });
 
 		expect(result.status).toBe("advisor_reviewing");
@@ -260,7 +293,7 @@ describe("ComplianceRuntime — requestCompletion advisor review path", () => {
 
 	it("应调用 requestAdvisorReview 并正确设置 trigger/metadata", async () => {
 		await runtime.start("tdd.md");
-		runtime.recordVerification({ command: "bun test", exitCode: 0 });
+		recordTrustedVerification(collector, { command: "bun test", exitCode: 0 });
 		const result = await runtime.requestCompletion({ summary: "Done" });
 
 		// One call to requestAdvisorReview
@@ -283,7 +316,7 @@ describe("ComplianceRuntime — requestCompletion advisor review path", () => {
 
 	it("registry envelope 应包含 Completion Evidence 和 compliance_verdict rules", async () => {
 		const { taskId } = await runtime.start("tdd.md");
-		runtime.recordVerification({ command: "bun test", exitCode: 0 });
+		recordTrustedVerification(collector, { command: "bun test", exitCode: 0 });
 		const result = await runtime.requestCompletion({ summary: "Done" });
 
 		const envelope = reviewDeps.registry.get(result.reviewId);
@@ -314,9 +347,30 @@ describe("ComplianceRuntime — requestCompletion advisor review path", () => {
 		expect(runtime.currentTaskState?.status).toBe("advisor_reviewing");
 	});
 
+	it("completion_requested 阶段拒绝提前 Verdict 且不写 completed Evidence", async () => {
+		let resolveReceipt: ((receipt: AdvisorReviewReceipt) => void) | undefined;
+		reviewDeps.requestAdvisorReview = (request) =>
+			new Promise((resolve) => {
+				resolveReceipt = (receipt) => resolve({ ...receipt, reviewId: request.reviewId });
+			});
+		const { taskId } = await runtime.start("tdd.md");
+		const pending = runtime.requestCompletion({ summary: "Done" });
+		await Bun.sleep(10);
+
+		const result = await runtime.acceptVerdict(advisorVerdict(runtime, { status: "pass" }));
+		const evidence = await store.readAll(taskId);
+
+		expect(result.accepted).toBe(false);
+		expect(runtime.currentTaskState?.status).toBe("completion_requested");
+		expect(evidence.some((record) => record.event === "completed")).toBe(false);
+
+		resolveReceipt?.({ status: "accepted", reviewId: "ignored" });
+		await pending;
+	});
+
 	it("rejected receipt 应写 advisor_unavailable Evidence 并进入 stalled", async () => {
 		await runtime.start("tdd.md");
-		runtime.recordVerification({ command: "bun test", exitCode: 0 });
+		recordTrustedVerification(collector, { command: "bun test", exitCode: 0 });
 
 		// Replace requestAdvisorReview to throw
 		const rejectSpy = () => Promise.reject(new Error("Advisor pool exhausted"));
@@ -378,17 +432,78 @@ describe("ComplianceRuntime — lifecycle 与严格 Verdict 绑定", () => {
 	});
 
 	it("pass 前 Git diff 漂移会被拒绝", async () => {
-		Bun.spawnSync(["git", "init"], { cwd: tmpDir });
-		Bun.spawnSync(["git", "config", "user.email", "test@example.com"], { cwd: tmpDir });
-		Bun.spawnSync(["git", "config", "user.name", "Test"], { cwd: tmpDir });
-		Bun.spawnSync(["git", "add", "tdd.md"], { cwd: tmpDir });
-		Bun.spawnSync(["git", "commit", "-m", "init"], { cwd: tmpDir });
 		await runtime.start("tdd.md");
 		await runtime.requestCompletion({ summary: "Done" });
 		writeFileSync(join(tmpDir, "changed.ts"), "export const changed = true;\n");
 		const result = await runtime.acceptVerdict(advisorVerdict(runtime, { status: "pass" }));
 		expect(result.accepted).toBe(false);
 		expect(runtime.currentTaskState?.status).toBe("advisor_reviewing");
+	});
+
+	it("Git 重算失败不消费 Verdict，恢复后同一 Verdict 可成功", async () => {
+		await runtime.start("tdd.md");
+		await runtime.requestCompletion({ summary: "Done" });
+		const verdict = advisorVerdict(runtime, { status: "pass" });
+		const changedPath = join(tmpDir, "changed.ts");
+		writeFileSync(changedPath, "export const changed = true;\n");
+
+		expect((await runtime.acceptVerdict(verdict)).accepted).toBe(false);
+		expect(runtime.currentTaskState?.status).toBe("advisor_reviewing");
+
+		unlinkSync(changedPath);
+		expect((await runtime.acceptVerdict(verdict)).accepted).toBe(true);
+		expect(runtime.currentTaskState?.status).toBe("completed");
+	});
+
+	it("Envelope 权威查询失败不消费 Verdict，恢复后同一 Verdict 可成功", async () => {
+		await runtime.start("tdd.md");
+		await runtime.requestCompletion({ summary: "Done" });
+		const verdict = advisorVerdict(runtime, { status: "pass" });
+		const original = store.readAll.bind(store);
+		let unavailable = true;
+		store.readAll = async (taskId) => (unavailable ? [] : original(taskId));
+
+		expect((await runtime.acceptVerdict(verdict)).accepted).toBe(false);
+		expect(runtime.currentTaskState?.status).toBe("advisor_reviewing");
+
+		unavailable = false;
+		expect((await runtime.acceptVerdict(verdict)).accepted).toBe(true);
+		expect(runtime.currentTaskState?.status).toBe("completed");
+	});
+
+	it("completed Evidence 写入失败时不得进入 completed", async () => {
+		await runtime.start("tdd.md");
+		await runtime.requestCompletion({ summary: "Done" });
+		const verdict = advisorVerdict(runtime, { status: "pass" });
+		const original = store.append.bind(store);
+		store.append = async (record) => {
+			if (record.event === "completed") throw new Error("evidence disk full");
+			await original(record);
+		};
+
+		await expect(runtime.acceptVerdict(verdict)).rejects.toThrow("evidence disk full");
+		expect(runtime.currentTaskState?.status).toBe("advisor_reviewing");
+		store.append = original;
+		expect((await runtime.acceptVerdict(verdict)).accepted).toBe(true);
+		expect(runtime.currentTaskState?.status).toBe("completed");
+	});
+
+	it("缺任一严格 Verdict 字段均拒绝", async () => {
+		const fields = ["review_id", "project_id", "evidence_revision", "git_head", "diff_hash", "trigger"] as const;
+		for (const field of fields) {
+			await runtime.start("tdd.md");
+			await runtime.requestCompletion({ summary: "Done" });
+			const verdict = advisorVerdict(runtime, { status: "pass" });
+			delete verdict[field];
+			expect((await runtime.acceptVerdict(verdict)).accepted).toBe(false);
+			await runtime.stop();
+		}
+	});
+
+	it("缺严格 provider 时拒绝 Completion Gate", async () => {
+		expect(() => new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps, {} as never)).toThrow(
+			/strict|authoritative/i,
+		);
 	});
 });
 

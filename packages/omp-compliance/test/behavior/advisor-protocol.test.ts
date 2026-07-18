@@ -29,6 +29,7 @@ import { EvidenceStore } from "../../src/evidence/evidence-store";
 import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
 import { FakeAdvisor } from "../support/fake-advisor";
+import { createStrictRuntimeDependencies } from "../support/strict-runtime-dependencies";
 
 // ─── Test Helper Types ──────────────────────────────────────────────
 
@@ -96,6 +97,11 @@ function setupRuntimeFixture(): ProtocolFixture {
 		].join("\n"),
 		"utf-8",
 	);
+	Bun.spawnSync(["git", "init"], { cwd: tmpDir });
+	Bun.spawnSync(["git", "config", "user.email", "test@example.com"], { cwd: tmpDir });
+	Bun.spawnSync(["git", "config", "user.name", "Test"], { cwd: tmpDir });
+	Bun.spawnSync(["git", "add", "tdd.md"], { cwd: tmpDir });
+	Bun.spawnSync(["git", "commit", "-m", "init"], { cwd: tmpDir });
 
 	const evidenceDir = join(tmpDir, ".omp", "evidence");
 	mkdirSync(evidenceDir, { recursive: true });
@@ -104,10 +110,36 @@ function setupRuntimeFixture(): ProtocolFixture {
 	const store = new EvidenceStore(evidenceDir);
 	const collector = new CollectorRuntime();
 	const registry = new ComplianceReviewRegistry();
-	const runtime = new ComplianceRuntime(() => store, collector, api, tmpDir, {
+	const reviewDeps = {
 		sessionId: () => "test-session",
 		registry,
 		requestAdvisorReview: (_req) => Promise.resolve({ status: "accepted" as const, reviewId: "test-review" }),
+	};
+	const runtime = new ComplianceRuntime(
+		() => store,
+		collector,
+		api,
+		tmpDir,
+		reviewDeps,
+		createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			requestAdvisorReview: reviewDeps.requestAdvisorReview,
+		}),
+	);
+	const verificationId = "protocol-verification";
+	const timestamp = new Date().toISOString();
+	collector.collector.recordCall({
+		toolName: "bash",
+		toolCallId: verificationId,
+		params: { command: "bun test" },
+		timestamp,
+	});
+	collector.collector.recordResult({
+		toolCallId: verificationId,
+		success: true,
+		resultRef: JSON.stringify({ exitCode: 0 }),
+		timestamp,
 	});
 	const advisor = new FakeAdvisor();
 	return { runtime, api, advisor };

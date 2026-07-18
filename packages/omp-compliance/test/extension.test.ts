@@ -10,6 +10,7 @@ import { bindCollectorEvents } from "../src/extension";
 import { ComplianceRuntime } from "../src/runtime/compliance-runtime";
 import { CollectorRuntime } from "../src/signals/collector-runtime";
 import { FakeExtensionAPI, createFakeExtensionContext } from "./support/fake-extension-api";
+import { createStrictRuntimeDependencies } from "./support/strict-runtime-dependencies";
 
 describe("extension v17 tool event wiring", () => {
 	it("preserves official input and correlates the result through the fake host", async () => {
@@ -184,6 +185,9 @@ describe("extension activate — no lazy file side-effects", () => {
 
 	beforeAll(() => {
 		tmpDir = mkdtempSync(join(tmpdir(), "ext-activate-"));
+		Bun.spawnSync(["git", "init"], { cwd: tmpDir });
+		Bun.spawnSync(["git", "config", "user.email", "test@example.com"], { cwd: tmpDir });
+		Bun.spawnSync(["git", "config", "user.name", "Test"], { cwd: tmpDir });
 		origCwd = process.cwd();
 		process.chdir(tmpDir);
 	});
@@ -247,17 +251,31 @@ describe("extension activate — no lazy file side-effects", () => {
 	it("start 后 .omp/compliance 目录和 task state 存在", async () => {
 		// Write fixture into temp dir
 		writeFileSync(join(tmpDir, "tdd.md"), TDD_FIXTURE, "utf-8");
+		Bun.spawnSync(["git", "add", "tdd.md"], { cwd: tmpDir });
+		Bun.spawnSync(["git", "commit", "-m", "init"], { cwd: tmpDir });
 
 		const store = new EvidenceStore(join(tmpDir, ".omp/compliance"));
 		const collector = new CollectorRuntime();
 		const api = new FakeExtensionAPI();
 		const registry = new ComplianceReviewRegistry();
-		const runtime = new ComplianceRuntime(() => store, collector, api.toAPI(), tmpDir, {
+		const reviewDeps = {
 			sessionId: () => "test-session",
 			registry,
 			requestAdvisorReview: (_req: AdvisorReviewRequest) =>
 				Promise.resolve<AdvisorReviewReceipt>({ status: "accepted" as const, reviewId: "test-review" }),
-		});
+		};
+		const runtime = new ComplianceRuntime(
+			() => store,
+			collector,
+			api.toAPI(),
+			tmpDir,
+			reviewDeps,
+			createStrictRuntimeDependencies({
+				repoRoot: tmpDir,
+				store,
+				requestAdvisorReview: reviewDeps.requestAdvisorReview,
+			}),
+		);
 
 		// start task — should create directory
 		const { taskId, status } = await runtime.start("tdd.md");

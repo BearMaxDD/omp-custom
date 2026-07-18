@@ -70,10 +70,10 @@ export type TaskEvent =
 	| { type: "activity"; worktreeFingerprint: string }
 	| {
 			type: "completion_requested";
-			reviewId?: string;
-			evidenceRevision?: string;
-			gitHead?: string;
-			diffHash?: string;
+			reviewId: string;
+			evidenceRevision: string;
+			gitHead: string;
+			diffHash: string;
 	  }
 	| { type: "advisor_accepted"; reviewId: string }
 	| { type: "review_failed"; reviewId: string; reason: string }

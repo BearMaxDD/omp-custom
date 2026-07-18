@@ -32,6 +32,7 @@ import { CollectorRuntime } from "../../src/signals/collector-runtime";
 import { FakeAdvisor } from "../support/fake-advisor";
 import { FakeCodebaseMemory } from "../support/fake-codebase-memory";
 import { FakeTaskTool } from "../support/fake-task-tool";
+import { createStrictRuntimeDependencies } from "../support/strict-runtime-dependencies";
 
 // ─── Minimal API for runtime tests ───────────────────────────────────
 
@@ -69,6 +70,28 @@ interface FixtureSetup {
 	fakeCbm: FakeCodebaseMemory;
 }
 
+let verificationSequence = 0;
+let collector: CollectorRuntime;
+function recordTrustedVerification(
+	collector: CollectorRuntime,
+	verification: { command: string; exitCode: number },
+): void {
+	const toolCallId = `trusted-verification-${++verificationSequence}`;
+	const timestamp = new Date().toISOString();
+	collector.collector.recordCall({
+		toolName: "bash",
+		toolCallId,
+		params: { command: verification.command },
+		timestamp,
+	});
+	collector.collector.recordResult({
+		toolCallId,
+		success: verification.exitCode === 0,
+		resultRef: JSON.stringify({ exitCode: verification.exitCode }),
+		timestamp,
+	});
+}
+
 const DEFAULT_TDD_MD = [
 	"# 目标: Build the feature",
 	"",
@@ -101,20 +124,37 @@ function setupFixture(tddContent: string = DEFAULT_TDD_MD): FixtureSetup {
 	mkdirSync(tmpDir, { recursive: true });
 
 	writeFileSync(join(tmpDir, "tdd.md"), tddContent, "utf-8");
+	Bun.spawnSync(["git", "init"], { cwd: tmpDir });
+	Bun.spawnSync(["git", "config", "user.email", "test@example.com"], { cwd: tmpDir });
+	Bun.spawnSync(["git", "config", "user.name", "Test"], { cwd: tmpDir });
+	Bun.spawnSync(["git", "add", "tdd.md"], { cwd: tmpDir });
+	Bun.spawnSync(["git", "commit", "-m", "init"], { cwd: tmpDir });
 
 	const evidenceDir = join(tmpDir, ".omp", "evidence");
 	mkdirSync(evidenceDir, { recursive: true });
 
 	const api = new TestAPI();
 	const store = new EvidenceStore(evidenceDir);
-	const collector = new CollectorRuntime();
+	collector = new CollectorRuntime();
 	const registry = new ComplianceReviewRegistry();
-	const runtime = new ComplianceRuntime(() => store, collector, api, tmpDir, {
+	const reviewDeps = {
 		sessionId: () => "test-session",
 		registry,
 		requestAdvisorReview: (_req: AdvisorReviewRequest) =>
 			Promise.resolve<AdvisorReviewReceipt>({ status: "accepted" as const, reviewId: "test-review" }),
-	});
+	};
+	const runtime = new ComplianceRuntime(
+		() => store,
+		collector,
+		api,
+		tmpDir,
+		reviewDeps,
+		createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			requestAdvisorReview: reviewDeps.requestAdvisorReview,
+		}),
+	);
 	const strictAccept = runtime.acceptVerdict.bind(runtime);
 	runtime.acceptVerdict = (verdict: Record<string, unknown>) => {
 		const state = runtime.currentTaskState;
@@ -183,7 +223,7 @@ describe("End-to-end compliance flow — remediate scenarios", () => {
 		});
 
 		// Record passing verification for non-test commands
-		runtime.recordVerification({ command: "biome check", exitCode: 0 });
+		recordTrustedVerification(collector, { command: "biome check", exitCode: 0 });
 
 		// Request completion
 		await runtime.requestCompletion({ summary: "Implemented registration" });
@@ -233,7 +273,7 @@ describe("End-to-end compliance flow — remediate scenarios", () => {
 		await runtime.start("tdd.md");
 
 		// Record a failing verification
-		runtime.recordVerification({ command: "bun test", exitCode: 1 });
+		recordTrustedVerification(collector, { command: "bun test", exitCode: 1 });
 
 		const result = await runtime.requestCompletion({ summary: "Done" });
 
@@ -275,7 +315,7 @@ describe("End-to-end compliance flow — remediate scenarios", () => {
 
 		await runtime.start("tdd.md");
 
-		runtime.recordVerification({ command: "bun test", exitCode: 0 });
+		recordTrustedVerification(collector, { command: "bun test", exitCode: 0 });
 
 		await runtime.requestCompletion({ summary: "Done" });
 
@@ -319,7 +359,7 @@ describe("End-to-end compliance flow — remediate scenarios", () => {
 		await runtime.start("tdd.md");
 
 		// No codebase-memory tools recorded
-		runtime.recordVerification({ command: "bun test", exitCode: 0 });
+		recordTrustedVerification(collector, { command: "bun test", exitCode: 0 });
 
 		const result = await runtime.requestCompletion({ summary: "Done" });
 
@@ -359,7 +399,7 @@ describe("End-to-end compliance flow — remediate scenarios", () => {
 
 		// Record codebase-memory but no task delegation
 		fakeCbm.recordFullSet(["registration handler"], ["src/routes/register.ts"], ["registerUser"]);
-		runtime.recordVerification({ command: "bun test", exitCode: 0 });
+		recordTrustedVerification(collector, { command: "bun test", exitCode: 0 });
 
 		const result = await runtime.requestCompletion({ summary: "Done" });
 
@@ -405,7 +445,7 @@ describe("End-to-end compliance flow — remediate scenarios", () => {
 			codebaseRefs: [], // <-- empty: no traceable references
 		});
 
-		runtime.recordVerification({ command: "bun test", exitCode: 0 });
+		recordTrustedVerification(collector, { command: "bun test", exitCode: 0 });
 
 		await runtime.requestCompletion({ summary: "Done" });
 
@@ -455,8 +495,8 @@ describe("End-to-end compliance flow — pass scenarios", () => {
 		});
 
 		// Full evidence: passing verification
-		runtime.recordVerification({ command: "bun test", exitCode: 0 });
-		runtime.recordVerification({ command: "biome check", exitCode: 0 });
+		recordTrustedVerification(collector, { command: "bun test", exitCode: 0 });
+		recordTrustedVerification(collector, { command: "biome check", exitCode: 0 });
 
 		await runtime.requestCompletion({ summary: "Completed registration feature" });
 
@@ -481,7 +521,7 @@ describe("End-to-end compliance flow — pass scenarios", () => {
 		await runtime.start("tdd.md");
 
 		// --- Round 1: remediate (missing tests) ---
-		runtime.recordVerification({ command: "bun test", exitCode: 1 });
+		recordTrustedVerification(collector, { command: "bun test", exitCode: 1 });
 		await runtime.requestCompletion({ summary: "Round 1" });
 
 		const ctx1 = FakeAdvisor.contextFromRuntime(runtime);
@@ -511,7 +551,7 @@ describe("End-to-end compliance flow — pass scenarios", () => {
 			exitCode: 0,
 			codebaseRefs: ["src/routes/register.ts"],
 		});
-		runtime.recordVerification({ command: "bun test", exitCode: 0 });
+		recordTrustedVerification(collector, { command: "bun test", exitCode: 0 });
 
 		await runtime.requestCompletion({ summary: "Round 2" });
 
@@ -542,8 +582,8 @@ describe("End-to-end compliance flow — pass scenarios", () => {
 			exitCode: 0,
 			codebaseRefs: ["src/routes/register.ts"],
 		});
-		runtime.recordVerification({ command: "bun test", exitCode: 0 });
-		runtime.recordVerification({ command: "biome check", exitCode: 0 });
+		recordTrustedVerification(collector, { command: "bun test", exitCode: 0 });
+		recordTrustedVerification(collector, { command: "biome check", exitCode: 0 });
 
 		await runtime.requestCompletion({ summary: "Round 3 — coverage met" });
 
@@ -566,7 +606,7 @@ describe("End-to-end compliance flow — stalled scenario", () => {
 		await runtime.start("tdd.md");
 
 		// Round 1: remediate
-		runtime.recordVerification({ command: "bun test", exitCode: 1 });
+		recordTrustedVerification(collector, { command: "bun test", exitCode: 1 });
 		await runtime.requestCompletion({ summary: "Round 1" });
 
 		const ctx = FakeAdvisor.contextFromRuntime(runtime);
@@ -585,7 +625,7 @@ describe("End-to-end compliance flow — stalled scenario", () => {
 		runtime.resumeAfterRemediation();
 
 		// Round 2: same remediation — still remediation_required
-		runtime.recordVerification({ command: "bun test", exitCode: 1 });
+		recordTrustedVerification(collector, { command: "bun test", exitCode: 1 });
 		await runtime.requestCompletion({ summary: "Round 2" });
 
 		const ctx2 = FakeAdvisor.contextFromRuntime(runtime);
@@ -606,7 +646,7 @@ describe("End-to-end compliance flow — stalled scenario", () => {
 		// Round 3: same remediation — still remediation_required because
 		// acceptVerdict issues "verdict" events (not "remediation" events),
 		// and processVerdict always resets consecutiveStalledFingerprints to 0.
-		runtime.recordVerification({ command: "bun test", exitCode: 1 });
+		recordTrustedVerification(collector, { command: "bun test", exitCode: 1 });
 		await runtime.requestCompletion({ summary: "Round 3" });
 
 		const ctx3 = FakeAdvisor.contextFromRuntime(runtime);

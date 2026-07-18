@@ -42,7 +42,13 @@ function minimalState(status: TaskState["status"], overrides: Partial<TaskState>
 }
 
 // Reusable event builders
-const completionRequested = (): TaskEvent => ({ type: "completion_requested" });
+const completionRequested = (): TaskEvent => ({
+	type: "completion_requested",
+	reviewId: "review:default",
+	evidenceRevision: "sha256:evidence",
+	gitHead: "a".repeat(40),
+	diffHash: "sha256:diff",
+});
 const advisorSilent = (): TaskEvent => ({ type: "advisor_silent" });
 const passVerdict = (opts?: { summary?: string }): TaskEvent => ({
 	type: "verdict",
@@ -60,6 +66,13 @@ const remediation = (fingerprint: string): TaskEvent => ({ type: "remediation", 
 const activity = (wf: string): TaskEvent => ({ type: "activity", worktreeFingerprint: wf });
 
 describe("TaskStateMachine — 只有有效 pass verdict 能完成任务", () => {
+	it("非法 completion_requested 事件不得进入 completion_requested", () => {
+		const invalid = { type: "completion_requested" } as TaskEvent;
+		const next = transition(activeTask(), invalid);
+		expect(next.status).toBe("active");
+		expect(next.error).toContain("invalid completion context");
+	});
+
 	it("completion_requested from active stays completion_requested until host accepts", () => {
 		const state = activeTask();
 		const requested = transition(state, {

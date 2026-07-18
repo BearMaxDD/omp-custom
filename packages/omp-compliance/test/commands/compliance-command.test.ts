@@ -10,6 +10,7 @@ import { registerComplianceCommand } from "../../src/commands/compliance-command
 import { EvidenceStore } from "../../src/evidence/evidence-store";
 import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
+import { createStrictRuntimeDependencies } from "../support/strict-runtime-dependencies";
 
 // ─── Fake ExtensionAPI for command testing ──────────────────────────
 
@@ -98,6 +99,11 @@ beforeEach(() => {
 		"",
 	].join("\n");
 	writeFileSync(join(tmpDir, "tdd.md"), tddContent, "utf-8");
+	Bun.spawnSync(["git", "init"], { cwd: tmpDir });
+	Bun.spawnSync(["git", "config", "user.email", "test@example.com"], { cwd: tmpDir });
+	Bun.spawnSync(["git", "config", "user.name", "Test"], { cwd: tmpDir });
+	Bun.spawnSync(["git", "add", "tdd.md"], { cwd: tmpDir });
+	Bun.spawnSync(["git", "commit", "-m", "init"], { cwd: tmpDir });
 
 	// Set up clean infra
 	const evidenceDir = join(tmpDir, ".omp", "evidence");
@@ -113,7 +119,18 @@ beforeEach(() => {
 		requestAdvisorReview: (_req: AdvisorReviewRequest) =>
 			Promise.resolve({ status: "accepted" as const, reviewId: "test-review" }),
 	};
-	runtime = new ComplianceRuntime(() => store, collector, api.toAPI(), tmpDir, reviewDeps);
+	runtime = new ComplianceRuntime(
+		() => store,
+		collector,
+		api.toAPI(),
+		tmpDir,
+		reviewDeps,
+		createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		}),
+	);
 
 	registerComplianceCommand(api.toAPI(), runtime);
 });

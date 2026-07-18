@@ -71,12 +71,24 @@ function transitionActive(state: TaskState, event: TaskEvent): TaskState {
 		case "activity":
 			return update(state, { worktreeFingerprint: event.worktreeFingerprint });
 		case "completion_requested":
+			if (
+				typeof event.reviewId !== "string" ||
+				event.reviewId.length === 0 ||
+				typeof event.evidenceRevision !== "string" ||
+				event.evidenceRevision.length === 0 ||
+				typeof event.gitHead !== "string" ||
+				event.gitHead.length === 0 ||
+				typeof event.diffHash !== "string" ||
+				event.diffHash.length === 0
+			) {
+				return withError(state, "invalid completion context");
+			}
 			return update(state, {
 				status: "completion_requested",
-				activeReviewId: event.reviewId ?? state.activeReviewId,
-				evidenceRevision: event.evidenceRevision ?? state.evidenceRevision,
-				gitHead: event.gitHead ?? state.gitHead,
-				diffHash: event.diffHash ?? state.diffHash,
+				activeReviewId: event.reviewId,
+				evidenceRevision: event.evidenceRevision,
+				gitHead: event.gitHead,
+				diffHash: event.diffHash,
 				error: undefined,
 			});
 		default:

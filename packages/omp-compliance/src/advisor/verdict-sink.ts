@@ -32,6 +32,10 @@ export type VerdictAcceptResult =
 			protocolError?: boolean;
 	  };
 
+export type PreparedVerdict =
+	| { status: "rejected"; reason: string; protocolError?: boolean }
+	| { status: "prepared"; verdict: ComplianceVerdict; commit(): VerdictAcceptResult };
+
 /** A persisted verdict record in the sink store. */
 export interface VerdictRecord {
 	reviewId: string;
@@ -95,6 +99,17 @@ export function acceptVerdict(
 	store: VerdictStore = defaultStore,
 	parsed?: ComplianceVerdict,
 ): VerdictAcceptResult {
+	const prepared = prepareVerdict(verdict, context, store, parsed);
+	return prepared.status === "prepared" ? prepared.commit() : prepared;
+}
+
+/** Validate and reserve a verdict without mutating the store until commit(). */
+export function prepareVerdict(
+	verdict: Record<string, unknown>,
+	context: VerdictContext,
+	store: VerdictStore = defaultStore,
+	parsed?: ComplianceVerdict,
+): PreparedVerdict {
 	// Step 1: Schema + context validation (skip if pre-parsed provided)
 	let resolved: ComplianceVerdict;
 	if (parsed) {
@@ -162,18 +177,22 @@ export function acceptVerdict(
 		acceptedAt: new Date().toISOString(),
 	};
 
-	store.records.push(record);
-	store.acceptedKeys.add(verdictKey);
-	if (!store.acceptedDigests) store.acceptedDigests = {};
-	store.acceptedDigests[verdictKey] = digest;
-
-	if (status === "pass") {
-		store.lastPass[passKey] = attempt;
-	}
-
+	let committed = false;
 	return {
-		status: "accepted",
+		status: "prepared",
 		verdict: resolved,
+		commit(): VerdictAcceptResult {
+			if (committed || store.acceptedKeys.has(verdictKey)) {
+				return { status: "rejected", reason: `Verdict for review ${review_id} already processed` };
+			}
+			store.records.push(record);
+			store.acceptedKeys.add(verdictKey);
+			if (!store.acceptedDigests) store.acceptedDigests = {};
+			store.acceptedDigests[verdictKey] = digest;
+			if (status === "pass") store.lastPass[passKey] = attempt;
+			committed = true;
+			return { status: "accepted", verdict: resolved };
+		},
 	};
 }
 

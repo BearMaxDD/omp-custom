@@ -47,6 +47,19 @@ export interface ScenarioContext {
 	attempt: number;
 }
 
+function strictFields(context: VerdictContext): Record<string, unknown> {
+	return context.reviewId === undefined
+		? {}
+		: {
+				review_id: context.reviewId,
+				project_id: context.projectId,
+				evidence_revision: context.evidenceRevision,
+				git_head: context.gitHead,
+				diff_hash: context.diffHash,
+				trigger: context.trigger,
+			};
+}
+
 export class FakeAdvisor {
 	/**
 	 * Create a "remediate" verdict.
@@ -57,6 +70,7 @@ export class FakeAdvisor {
 	remediateVerdict(context: VerdictContext, findings: FakeFinding[]): Record<string, unknown> {
 		return {
 			schema_version: 1,
+			...strictFields(context),
 			task_id: context.taskId,
 			contract_hash: context.contractHash,
 			attempt: context.attempt,
@@ -81,6 +95,7 @@ export class FakeAdvisor {
 	passVerdict(context: VerdictContext, summary?: string): Record<string, unknown> {
 		return {
 			schema_version: 1,
+			...strictFields(context),
 			task_id: context.taskId,
 			contract_hash: context.contractHash,
 			attempt: context.attempt,
@@ -105,7 +120,16 @@ export class FakeAdvisor {
 	 * Convenience helper for test code.
 	 */
 	static contextFromRuntime(runtime: {
-		currentTaskState: { taskId: string; contractHash: SHA256Hash; attempt: number } | null;
+		currentTaskState: {
+			taskId: string;
+			projectId: string;
+			contractHash: SHA256Hash;
+			evidenceRevision: string;
+			gitHead: string;
+			diffHash: string;
+			activeReviewId?: string;
+			attempt: number;
+		} | null;
 	}): VerdictContext {
 		const state = runtime.currentTaskState;
 		if (!state) {
@@ -113,7 +137,13 @@ export class FakeAdvisor {
 		}
 		return {
 			taskId: state.taskId,
+			reviewId: state.activeReviewId,
+			projectId: state.projectId,
 			contractHash: state.contractHash,
+			evidenceRevision: state.evidenceRevision,
+			gitHead: state.gitHead,
+			diffHash: state.diffHash,
+			trigger: "compliance_review",
 			attempt: state.attempt,
 		};
 	}

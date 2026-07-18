@@ -35,7 +35,8 @@ import { TopicStore } from "./brainstorm/topic-store";
 import { registerBrainstormCommand } from "./commands/brainstorm-command";
 import { registerComplianceCommand } from "./commands/compliance-command";
 import { EvidenceStore } from "./evidence/evidence-store";
-import { ComplianceRuntime } from "./runtime/compliance-runtime";
+import { ComplianceRuntime, readAuthoritativeGitContext } from "./runtime/compliance-runtime";
+import { JsonFileReviewSchedulerStore, ReviewScheduler } from "./scheduler/review-scheduler";
 import { CollectorRuntime } from "./signals/collector-runtime";
 import { registerComplianceCompleteTool } from "./tools/compliance-complete-tool";
 
@@ -153,9 +154,48 @@ export default function activate(api: ComplianceExtensionHost): void {
 		registry,
 		requestAdvisorReview,
 	};
+	const receipts = new Map<string, AdvisorReviewReceipt>();
+	const scheduler = new ReviewScheduler({
+		clock: { now: () => Date.now() },
+		random: () => Math.random(),
+		store: new JsonFileReviewSchedulerStore(join(repoRoot, DEFAULT_COMPLIANCE_DIR, "review-scheduler.json")),
+		requester: async (request) => {
+			try {
+				const hostReceipt = await requestAdvisorReview(request);
+				const receipt = { ...hostReceipt, reviewId: request.reviewId };
+				receipts.set(request.reviewId, receipt);
+				return receipt;
+			} catch (error) {
+				receipts.set(request.reviewId, {
+					status: "rejected",
+					reviewId: request.reviewId,
+					reason: error instanceof Error ? error.message : "Advisor request failed",
+				});
+				throw error;
+			}
+		},
+	});
 
 	// Compliance runtime — the main coordinator (gets factory, not store)
-	const runtime = new ComplianceRuntime(getEvidenceStore, collector, api, repoRoot, reviewDeps);
+	const runtime = new ComplianceRuntime(getEvidenceStore, collector, api, repoRoot, reviewDeps, {
+		scheduler,
+		strictEvidence: () => {
+			throw new Error("Strict Completion Evidence is not bound to the active task");
+		},
+		gitContext: () => readAuthoritativeGitContext(repoRoot),
+		readEnvelope: async (taskId, reviewId) => {
+			const records = (await getEvidenceStore().readAll(taskId)) as Array<{
+				event: string;
+				reviewEnvelope?: import("./contracts/review-envelope").ReviewEnvelope;
+			}>;
+			return records.findLast(
+				(record) =>
+					(record.event === "completion_requested" || record.event === "completion_retry") &&
+					record.reviewEnvelope?.reviewId === reviewId,
+			)?.reviewEnvelope;
+		},
+		receiptFor: (reviewId) => receipts.get(reviewId),
+	});
 
 	// ── Brainstorm advisor_hook sendMessage adapter ──
 	// The brainstorm hook sends flat customType/content/display/attribution/details objects;
