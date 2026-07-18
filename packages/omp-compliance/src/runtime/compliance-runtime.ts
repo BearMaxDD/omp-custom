@@ -300,7 +300,11 @@ export class ComplianceRuntime {
 	 * @returns the new status
 	 * @throws if no stalled task matches the given id
 	 */
-	async resume(taskId: string): Promise<{ status: string }> {
+	resume(taskId: string): Promise<{ status: string }> {
+		return this.serializeRuntimeOperation(() => this.resumeExclusive(taskId));
+	}
+
+	private async resumeExclusive(taskId: string): Promise<{ status: string }> {
 		if (!this.taskState || this.taskState.taskId !== taskId) {
 			throw new Error(`No stalled task found for id: ${taskId}`);
 		}

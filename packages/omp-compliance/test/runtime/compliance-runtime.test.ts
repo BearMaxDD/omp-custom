@@ -494,6 +494,47 @@ describe("ComplianceRuntime — lifecycle 与严格 Verdict 绑定", () => {
 		expect(runtime.currentTaskState?.status).toBe("advisor_reviewing");
 	});
 
+	it("resume 必须等待进行中的 retry 事务并拒绝分裂状态", async () => {
+		let now = Date.now();
+		let reject = true;
+		reviewDeps.requestAdvisorReview = async (request) => {
+			if (reject) throw new Error("temporary unavailable");
+			return { status: "accepted", reviewId: request.reviewId };
+		};
+		runtimeDependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			now: () => now,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		});
+		runtime = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps, runtimeDependencies);
+		const { taskId } = await runtime.start("tdd.md");
+		expect((await runtime.requestCompletion({ summary: "Done" })).status).toBe("stalled");
+
+		let releaseRetryEvidence: (() => void) | undefined;
+		const retryEvidenceGate = new Promise<void>((resolve) => {
+			releaseRetryEvidence = resolve;
+		});
+		const originalAppend = store.append.bind(store);
+		store.append = async (record) => {
+			if (record.event === "completion_retry") await retryEvidenceGate;
+			await originalAppend(record);
+		};
+		reject = false;
+		now += 5_000;
+		const retrying = runtime.retryDueReviews();
+		await Bun.sleep(10);
+		const resuming = runtime.resume(taskId);
+		await Bun.sleep(10);
+		expect(runtime.currentTaskState?.status).toBe("stalled");
+
+		releaseRetryEvidence?.();
+		await retrying;
+		await expect(resuming).rejects.toThrow("not stalled");
+		expect(runtime.currentTaskState?.status).toBe("advisor_reviewing");
+		expect(runtimeDependencies.scheduler.snapshot().inFlight?.reviewId).toBe(runtime.currentTaskState?.activeReviewId);
+	});
+
 	it("Verdict 与失败 lifecycle 并发时保持单一 completed 终态", async () => {
 		await runtime.start("tdd.md");
 		await runtime.requestCompletion({ summary: "Done" });
