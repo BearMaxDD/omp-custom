@@ -525,16 +525,21 @@ describe("PreToolPolicy canonical Codebase identities", () => {
 	});
 
 	it.each(["search_graph", "index_status"])(
-		"requires complete trusted evidence for active-task read tool %s",
+		"allows current-project read-only Pack bootstrap for active-task tool %s",
 		(toolName) => {
 			const activeContract = contract();
-			const decision = new PreToolPolicy(recorder().sink).evaluate(codebaseCall(toolName), {
+			const policy = new PreToolPolicy(recorder().sink);
+			const context = {
 				evidenceRevision: REVISION,
 				projectContext: PROJECT_CONTEXT,
 				contract: activeContract,
-			});
+			};
 
-			expect(decision).toEqual({ allow: false, reason: "missing_codebase_evidence" });
+			expect(policy.evaluate(codebaseCall(toolName), context)).toEqual({ allow: true });
+			expect(policy.evaluate({ ...codebaseCall(toolName), taskId: "other-task" }, context)).toEqual({
+				allow: false,
+				reason: "task_identity_mismatch",
+			});
 		},
 	);
 

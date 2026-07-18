@@ -53,6 +53,23 @@ function sha256(value: string): `sha256:${string}` {
 	return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
 
+const RECOVERABLE_TASK_STATUSES = new Set([
+	"active",
+	"completion_requested",
+	"advisor_reviewing",
+	"remediation_required",
+	"stalled",
+]);
+
+function validIso(value: unknown): value is string {
+	if (typeof value !== "string") return false;
+	try {
+		return new Date(value).toISOString() === value;
+	} catch {
+		return false;
+	}
+}
+
 export function readAuthoritativeGitContext(root: string): { gitHead: string; diffHash: `sha256:${string}` } {
 	try {
 		const gitHead = execFileSync("git", ["rev-parse", "HEAD"], {
@@ -121,6 +138,17 @@ export interface ComplianceRuntimeDependencies {
 	readonly gitContext: () => { gitHead: string; diffHash: `sha256:${string}` };
 	readonly readEnvelope: (taskId: string, reviewId: string) => Promise<ReviewEnvelope | undefined>;
 	readonly receiptFor: (reviewId: string) => AdvisorReviewReceipt | undefined;
+	readonly persistRuntimeState?: (
+		taskId: string,
+		snapshot: ComplianceRuntimePersistenceSnapshot,
+	) => void | Promise<void>;
+}
+
+export interface ComplianceRuntimePersistenceSnapshot {
+	readonly schemaVersion: 1;
+	readonly taskState: TaskState | null;
+	readonly activeEnvelope?: ReviewEnvelope;
+	readonly advisorEnvelope?: ComplianceReviewEnvelope;
 }
 
 /**
@@ -139,7 +167,9 @@ export class ComplianceRuntime {
 	private readonly authoritativeGit: () => { gitHead: string; diffHash: `sha256:${string}` };
 	private readonly authoritativeEnvelope: (taskId: string, reviewId: string) => Promise<ReviewEnvelope | undefined>;
 	private readonly receiptFor: (reviewId: string) => AdvisorReviewReceipt | undefined;
+	private readonly persistRuntimeState?: ComplianceRuntimeDependencies["persistRuntimeState"];
 	private activeEnvelope: ReviewEnvelope | undefined;
+	private activeAdvisorEnvelope: ComplianceReviewEnvelope | undefined;
 	private schedulerRestored = false;
 	private runtimeOperationTail: Promise<void> = Promise.resolve();
 
@@ -166,6 +196,83 @@ export class ComplianceRuntime {
 		this.authoritativeGit = dependencies.gitContext;
 		this.authoritativeEnvelope = dependencies.readEnvelope;
 		this.receiptFor = dependencies.receiptFor;
+		this.persistRuntimeState = dependencies.persistRuntimeState;
+	}
+
+	restorePersistedState(
+		taskContractInput: TaskContract,
+		snapshot: ComplianceRuntimePersistenceSnapshot,
+	): Promise<TaskState> {
+		return this.serializeRuntimeOperation(async () => {
+			if (snapshot.schemaVersion !== 1 || !snapshot.taskState) throw new Error("Persisted task state is inactive");
+			const taskContract = validateTaskContractIntegrity(taskContractInput);
+			const state = snapshot.taskState;
+			const contract = loadComplianceContract(join(this.repoRoot, taskContract.tddPath ?? ""), this.repoRoot);
+			const currentGit = this.authoritativeGit();
+			if (
+				!RECOVERABLE_TASK_STATUSES.has(state.status) ||
+				state.taskId !== taskContract.taskId ||
+				state.projectId !== taskContract.projectId ||
+				state.contractHash !== taskContract.contractHash ||
+				state.contractHash !== contract.contractHash ||
+				state.gitHead !== taskContract.gitHead ||
+				state.gitHead !== currentGit.gitHead ||
+				state.tddPath !== contract.tddPath ||
+				!Number.isSafeInteger(state.attempt) ||
+				state.attempt < 1 ||
+				!/^sha256:[0-9a-f]{64}$/.test(state.evidenceRevision) ||
+				!/^sha256:[0-9a-f]{64}$/.test(state.diffHash) ||
+				typeof state.worktreeFingerprint !== "string" ||
+				state.worktreeFingerprint.length === 0 ||
+				state.worktreeFingerprint.length > 2_048 ||
+				!validIso(state.createdAt) ||
+				!validIso(state.updatedAt)
+			) {
+				throw new Error("Persisted compliance task context mismatch");
+			}
+			if (state.activeReviewId) {
+				if (
+					state.diffHash !== currentGit.diffHash ||
+					!snapshot.activeEnvelope ||
+					!snapshot.advisorEnvelope ||
+					!this.persistedEnvelopeMatches(snapshot.activeEnvelope, snapshot.activeEnvelope) ||
+					snapshot.activeEnvelope.reviewId !== state.activeReviewId ||
+					snapshot.activeEnvelope.taskId !== state.taskId ||
+					snapshot.activeEnvelope.projectId !== state.projectId ||
+					snapshot.activeEnvelope.contractHash !== state.contractHash ||
+					snapshot.activeEnvelope.evidenceRevision !== state.evidenceRevision ||
+					snapshot.activeEnvelope.gitHead !== state.gitHead ||
+					snapshot.activeEnvelope.diffHash !== state.diffHash ||
+					snapshot.activeEnvelope.attempt !== state.attempt ||
+					snapshot.activeEnvelope.trigger !== "compliance_review" ||
+					snapshot.advisorEnvelope.reviewId !== state.activeReviewId ||
+					snapshot.advisorEnvelope.taskId !== state.taskId ||
+					snapshot.advisorEnvelope.projectId !== state.projectId ||
+					snapshot.advisorEnvelope.contractHash !== state.contractHash ||
+					snapshot.advisorEnvelope.evidenceRevision !== snapshot.activeEnvelope.evidenceRevision ||
+					snapshot.advisorEnvelope.gitHead !== snapshot.activeEnvelope.gitHead ||
+					snapshot.advisorEnvelope.diffHash !== snapshot.activeEnvelope.diffHash ||
+					snapshot.advisorEnvelope.trigger !== "compliance_review" ||
+					typeof snapshot.advisorEnvelope.sessionId !== "string" ||
+					snapshot.advisorEnvelope.sessionId.length === 0 ||
+					snapshot.advisorEnvelope.sessionId.length > 512 ||
+					typeof snapshot.advisorEnvelope.context !== "string" ||
+					snapshot.advisorEnvelope.context.length > 256 * 1024 ||
+					typeof snapshot.advisorEnvelope.rules !== "string" ||
+					snapshot.advisorEnvelope.rules.length > 64 * 1024
+				) {
+					throw new Error("Persisted compliance Review Envelope mismatch");
+				}
+			} else if (snapshot.activeEnvelope || snapshot.advisorEnvelope) {
+				throw new Error("Persisted compliance Review Envelope is unexpected");
+			}
+			this.taskState = structuredClone(state);
+			this.contract = contract;
+			this.activeEnvelope = snapshot.activeEnvelope;
+			this.activeAdvisorEnvelope = snapshot.advisorEnvelope;
+			if (this.activeAdvisorEnvelope) this.reviewDeps.registry.put(this.activeAdvisorEnvelope);
+			return this.taskState;
+		});
 	}
 
 	private async syncInitialSchedulerReceipt(reviewId: string): Promise<AdvisorReviewReceipt> {
@@ -241,6 +348,8 @@ export class ComplianceRuntime {
 			consecutiveStalledFingerprints: 0,
 		};
 
+		this.activeEnvelope = undefined;
+		this.activeAdvisorEnvelope = undefined;
 		this.taskState = state;
 		this.contract = contract;
 
@@ -290,6 +399,8 @@ export class ComplianceRuntime {
 
 		this.taskState = null;
 		this.contract = null;
+		this.activeEnvelope = undefined;
+		this.activeAdvisorEnvelope = undefined;
 
 		return { stopped: true };
 	}
@@ -447,6 +558,7 @@ export class ComplianceRuntime {
 			rules,
 			createdAt: strictEnvelope.createdAt,
 		});
+		this.activeAdvisorEnvelope = envelope;
 		this.reviewDeps.registry.put(envelope);
 
 		let receipt: AdvisorReviewReceipt;
@@ -897,7 +1009,23 @@ export class ComplianceRuntime {
 
 	// ─── Private helpers ───────────────────────────────────────────
 	private serializeRuntimeOperation<T>(operation: () => Promise<T>): Promise<T> {
-		const result = this.runtimeOperationTail.then(operation, operation);
+		const guarded = async (): Promise<T> => {
+			const previousTaskId = this.taskState?.taskId;
+			try {
+				return await operation();
+			} finally {
+				const taskId = this.taskState?.taskId ?? previousTaskId;
+				if (taskId && this.persistRuntimeState) {
+					await this.persistRuntimeState(taskId, {
+						schemaVersion: 1,
+						taskState: this.taskState ? structuredClone(this.taskState) : null,
+						...(this.activeEnvelope ? { activeEnvelope: this.activeEnvelope } : {}),
+						...(this.activeAdvisorEnvelope ? { advisorEnvelope: this.activeAdvisorEnvelope } : {}),
+					});
+				}
+			}
+		};
+		const result = this.runtimeOperationTail.then(guarded, guarded);
 		this.runtimeOperationTail = result.then(
 			() => undefined,
 			() => undefined,

@@ -553,14 +553,16 @@ export class PreToolPolicy {
 				if (context.projectContext?.projectId !== contract.projectId) {
 					return deny("project_identity_mismatch");
 				}
-				const contractOnlyIndex =
+				const contractOnlyBootstrap =
 					call.actor === "main" &&
-					call.identity.toolName === "index_repository" &&
 					!context.codebasePack &&
-					!context.trustedCodebaseContext;
-				if (contractOnlyIndex) {
+					!context.trustedCodebaseContext &&
+					(call.identity.access === "read" || call.identity.toolName === "index_repository");
+				if (contractOnlyBootstrap) {
 					if (call.taskId !== contract.taskId) return deny("task_identity_mismatch");
-					return { allow: true, invalidatesEvidence: true };
+					return call.identity.toolName === "index_repository"
+						? { allow: true, invalidatesEvidence: true }
+						: { allow: true };
 				}
 				if (!context.codebasePack || !context.trustedCodebaseContext) {
 					return deny("missing_codebase_evidence");

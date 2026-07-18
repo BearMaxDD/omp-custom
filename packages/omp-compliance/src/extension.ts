@@ -50,6 +50,7 @@ import type { ProjectBinding } from "./project/project-identity";
 import { ProjectIdentityStore } from "./project/project-identity";
 import {
 	ComplianceRuntime,
+	type ComplianceRuntimePersistenceSnapshot,
 	type StrictCompletionEvidence,
 	readAuthoritativeGitContext,
 } from "./runtime/compliance-runtime";
@@ -241,7 +242,9 @@ interface RuntimeBundle {
 	readonly retryBrainstormDueReviews: () => Promise<void>;
 	readonly ensureSchedulerReady: () => Promise<void>;
 	readonly initialize: () => Promise<void>;
-	readonly prepareTask: (tddPath: string) => void;
+	readonly prepareTask: (tddPath: string) => TaskContract;
+	readonly bindTaskContract: (contract: TaskContract | undefined, persist?: boolean) => void;
+	readonly currentTaskContract: () => TaskContract | undefined;
 	readonly evaluateToolCall: (
 		event: ToolCallEvent,
 		context: ExtensionContext,
@@ -367,18 +370,21 @@ function createRuntimeBundle(
 			delegations: [],
 		};
 	};
-	const prepareTask = (tddPath: string): void => {
+	const prepareTask = (tddPath: string): TaskContract => {
 		const absolutePath = tddPath.startsWith("/") ? tddPath : join(repoRoot, tddPath);
 		const complianceContract = loadComplianceContract(absolutePath, repoRoot);
 		const git = readAuthoritativeGitContext(repoRoot);
 		const declaredFiles = complianceContract.summary.files.map(tddFileEntry).filter(Boolean);
 		const affectedFiles = declaredFiles.length > 0 ? declaredFiles : [complianceContract.tddPath];
-		preparedTaskContract = loadTaskContractFromTdd(absolutePath, repoRoot, {
+		return loadTaskContractFromTdd(absolutePath, repoRoot, {
 			projectId: projectBinding.projectId,
 			gitHead: git.gitHead,
 			affectedFiles,
 		});
-		policyEvidence.task(preparedTaskContract.taskId).contract.write(preparedTaskContract);
+	};
+	const bindTaskContract = (contract: TaskContract | undefined, persist = true): void => {
+		preparedTaskContract = contract;
+		if (contract && persist) policyEvidence.task(contract.taskId).contract.write(contract);
 	};
 	const runtime = new ComplianceRuntime(getEvidenceStore, collector, api, repoRoot, reviewDeps, {
 		scheduler,
@@ -396,6 +402,7 @@ function createRuntimeBundle(
 			)?.reviewEnvelope;
 		},
 		receiptFor: (reviewId) => receipts.get(reviewId),
+		persistRuntimeState: (taskId, snapshot) => policyEvidence.task(taskId).state.write(snapshot),
 	});
 	let brainstormRuntime: BrainstormRuntime | undefined;
 	const getBrainstormRuntime = (): BrainstormRuntime => {
@@ -421,14 +428,19 @@ function createRuntimeBundle(
 		return brainstormRuntime;
 	};
 	const retryBrainstormDueReviews = async (): Promise<void> => {
-		if (brainstormRuntime) await brainstormRuntime.retryDueReviews();
+		await getBrainstormRuntime().retryDueReviews();
 	};
 	const policy = new PreToolPolicy({
 		append: (record) => {
 			const taskId = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(record.task) ? record.task : "unbound-task";
 			policyEvidence.task(taskId).events.append({
 				...record,
+				schemaVersion: 1,
 				type: record.event,
+				eventType: record.event,
+				projectId: projectBinding.projectId,
+				sessionId: activeSessionId,
+				taskId,
 				timestamp: new Date().toISOString(),
 				eventId: deterministicEvidenceEventId(`pre_tool_policy\0${JSON.stringify(record)}`),
 			});
@@ -474,8 +486,27 @@ function createRuntimeBundle(
 		await runtime.handleAdvisorLifecycle(event);
 	};
 	const initialize = async (): Promise<void> => {
-		policyEvidence.recover();
+		const recovery = policyEvidence.recover();
+		const recoverable = recovery.taskIds.flatMap((taskId) => {
+			const snapshot = policyEvidence.task(taskId).state.read<ComplianceRuntimePersistenceSnapshot>();
+			if (
+				!snapshot?.taskState ||
+				snapshot.taskState.status === "completed" ||
+				snapshot.taskState.status === "overridden"
+			) {
+				return [];
+			}
+			const contract = policyEvidence.task(taskId).contract.read<TaskContract>();
+			if (!contract) throw new Error(`Persisted TaskContract is missing for ${taskId}`);
+			return [{ contract, snapshot }];
+		});
+		if (recoverable.length > 1) throw new Error("Multiple recoverable compliance tasks found");
 		await ensureSchedulerReady();
+		const recovered = recoverable[0];
+		if (recovered) {
+			bindTaskContract(recovered.contract, false);
+			await runtime.restorePersistedState(recovered.contract, recovered.snapshot);
+		}
 		await runtime.retryDueReviews();
 		await retryBrainstormDueReviews();
 	};
@@ -492,6 +523,8 @@ function createRuntimeBundle(
 		ensureSchedulerReady,
 		initialize,
 		prepareTask,
+		bindTaskContract,
+		currentTaskContract: () => preparedTaskContract,
 		evaluateToolCall,
 		handleAdvisorLifecycle,
 	};
@@ -504,8 +537,18 @@ function runtimeProxy(getBundle: () => RuntimeBundle): ComplianceRuntime {
 			const runtime = bundle.runtime;
 			if (property === "start") {
 				return async (tddPath: string) => {
-					bundle.prepareTask(tddPath);
-					return runtime.start(tddPath);
+					if (runtime.currentTaskState) {
+						return runtime.start(tddPath);
+					}
+					const previous = bundle.currentTaskContract();
+					const candidate = bundle.prepareTask(tddPath);
+					bundle.bindTaskContract(candidate);
+					try {
+						return await runtime.start(tddPath);
+					} catch (error) {
+						bundle.bindTaskContract(previous);
+						throw error;
+					}
 				};
 			}
 			const value = Reflect.get(runtime, property, runtime) as unknown;
@@ -535,7 +578,11 @@ export default function activate(api: ComplianceExtensionHost): void {
 		if (!activeBundle) throw new Error("Compliance session is not initialized");
 		return activeBundle;
 	};
-	const bundleForSession = (sessionId: string): RuntimeBundle => bundlesBySession.get(sessionId) ?? getBundle();
+	const bundleForSession = (sessionId: string): RuntimeBundle => {
+		const bundle = bundlesBySession.get(sessionId);
+		if (!bundle) throw new Error(`Compliance session is not initialized: ${sessionId}`);
+		return bundle;
+	};
 	const deferredRuntime = runtimeProxy(getBundle);
 
 	api.on("session_start", (_event, context) => bindSession(context));

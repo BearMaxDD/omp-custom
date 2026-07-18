@@ -258,6 +258,24 @@ describe("extension activate — no lazy file side-effects", () => {
 		}
 	});
 
+	it("未知 primarySessionId 的 Advisor 事件失败关闭", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ext-unknown-session-"));
+		Bun.spawnSync(["git", "init"], { cwd: root });
+		const api = new FakeExtensionAPI(createFakeExtensionContext({ cwd: root, sessionId: "known-session" }));
+		const activate = (await import("../src/extension")).default;
+		activate(api.toAPI());
+		await api.fireSessionStart();
+
+		await expect(
+			api.fireAdvisorBeforeRun({
+				reviewId: "unknown-review",
+				trigger: "compliance_review",
+				primarySessionId: "unknown-session",
+			}),
+		).rejects.toThrow("Compliance session is not initialized");
+		rmSync(root, { recursive: true, force: true });
+	});
+
 	it("session_switch 后仍按 primarySessionId 路由旧会话的 Advisor 回合", async () => {
 		const firstRoot = mkdtempSync(join(tmpdir(), "ext-session-first-"));
 		const secondRoot = mkdtempSync(join(tmpdir(), "ext-session-second-"));
@@ -338,6 +356,11 @@ describe("extension activate — no lazy file side-effects", () => {
 		expect(decision.reasons).toContain("missing_contract");
 		const audit = readFileSync(join(tmpDir, ".omp/compliance/tasks/unbound-task/events.jsonl"), "utf8");
 		expect(audit).toContain('"event":"tool_call_blocked"');
+		expect(audit).toContain('"schemaVersion":1');
+		expect(audit).toContain('"eventType":"tool_call_blocked"');
+		expect(audit).toContain('"projectId":');
+		expect(audit).toContain('"sessionId":"test-session"');
+		expect(audit).toContain('"taskId":"unbound-task"');
 		expect(audit).toContain('"reason":"missing_contract"');
 	});
 
@@ -419,12 +442,21 @@ describe("extension activate — no lazy file side-effects", () => {
 		}
 
 		await api.fireCommand("compliance", "start tdd.md");
+		await expect(api.fireCommand("compliance", "start missing.md")).rejects.toThrow("already active");
 		const decision = await api.fireToolCall("edit", {
 			path: "src/index.ts",
 			oldText: "export const value = 1;",
 			newText: "export const value = 2;",
 		});
 		expect(decision).toEqual({ block: false, reasons: [] });
+		writeFileSync(join(sessionRoot, "src/index.ts"), "export const value = 2;\n");
+
+		const restarted = new FakeExtensionAPI(
+			createFakeExtensionContext({ cwd: sessionRoot, sessionId: "policy-session-restarted" }),
+		);
+		activate(restarted.toAPI());
+		await restarted.fireSessionStart();
+		await expect(restarted.fireCommand("compliance", "start tdd.md")).rejects.toThrow("already active");
 		rmSync(sessionRoot, { recursive: true, force: true });
 	});
 
