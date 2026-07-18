@@ -1,6 +1,7 @@
 import type { TSchema } from "@oh-my-pi/pi-ai";
 import type {
 	AdvisorBeforeRunEvent,
+	AdvisorReviewCapabilities,
 	AdvisorReviewReceipt,
 	AdvisorReviewRequest,
 	AdvisorRunAugmentation,
@@ -30,6 +31,13 @@ export class FakeExtensionAPI {
 	public requestAdvisorReview: (request: AdvisorReviewRequest) => Promise<AdvisorReviewReceipt> = async (
 		_request: AdvisorReviewRequest,
 	) => ({ status: "accepted", reviewId: _request.reviewId });
+	public advisorReviewCapabilities: AdvisorReviewCapabilities | undefined = {
+		protocolVersion: 1,
+		reviewRequest: true,
+		beforeRunAugmentation: true,
+		lifecycleEvents: true,
+		finalReceipt: true,
+	};
 
 	constructor(private readonly extensionContext: ExtensionContext = createFakeExtensionContext()) {}
 
@@ -144,6 +152,14 @@ export class FakeExtensionAPI {
 		for (const handler of handlers) await handler(fullEvent, context);
 	}
 
+	async fireSessionStart(): Promise<void> {
+		const handlers = this.eventHandlers.get("session_start") ?? [];
+		const context = this.createContext();
+		for (const handler of handlers) {
+			await handler({ type: "session_start" }, context);
+		}
+	}
+
 	/** Return which tool names would be blocked by handlers (for compliance assertions). */
 	async getBlockedToolCalls(): Promise<string[]> {
 		const blocked: string[] = [];
@@ -180,13 +196,14 @@ export class FakeExtensionAPI {
 			sendMessage: this.sendMessage.bind(this),
 			getAllTools: this.getAllTools.bind(this),
 			requestAdvisorReview: this.requestAdvisorReview.bind(this),
+			advisorReviewCapabilities: this.advisorReviewCapabilities,
 			logger: {
 				info: () => {},
 				warn: () => {},
 				error: () => {},
 				debug: () => {},
 			},
-		};
+		} as ComplianceExtensionHost;
 	}
 }
 

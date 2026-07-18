@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import type {
 	AdvisorBeforeRunEvent,
+	AdvisorReviewCapabilities,
 	AdvisorReviewLifecycleEvent,
 	AdvisorReviewReceipt,
 	AdvisorReviewRequest,
@@ -12,6 +13,7 @@ import type {
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
 	ExtensionAPI,
+	ExtensionContext,
 	ExtensionHandler,
 	RegisteredCommand,
 	SessionStartEvent,
@@ -23,9 +25,9 @@ import type {
 	TurnEndEvent,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { CustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { assertAdvisorProtocolV1 } from "./activation/capability-negotiation";
 import { createComplianceAdvisorHook } from "./advisor/compliance-advisor-hook";
-import { ComplianceReviewRegistry } from "./advisor/review-envelope";
-import type { ComplianceReviewDependencies } from "./advisor/review-envelope";
+import { type ComplianceReviewDependencies, ComplianceReviewRegistry } from "./advisor/review-envelope";
 import { createBrainstormAdvisorHook } from "./brainstorm/advisor-hook";
 import { BrainstormRuntime } from "./brainstorm/brainstorm-runtime";
 import { createDecisionTool } from "./brainstorm/decision-tool";
@@ -36,18 +38,45 @@ import { createTopicReadyTool } from "./brainstorm/topic-ready-tool";
 import { TopicStore } from "./brainstorm/topic-store";
 import { registerBrainstormCommand } from "./commands/brainstorm-command";
 import { registerComplianceCommand } from "./commands/compliance-command";
+import { deterministicEvidenceEventId } from "./evidence/event-log";
+import { EvidenceRepository } from "./evidence/evidence-repository";
 import { EvidenceStore } from "./evidence/evidence-store";
+import { ProjectIdentityStore } from "./project/project-identity";
 import { ComplianceRuntime, readAuthoritativeGitContext } from "./runtime/compliance-runtime";
+import { type CanonicalBuiltinToolIdentity, type CanonicalToolCall, PreToolPolicy } from "./runtime/pre-tool-policy";
 import { JsonFileReviewSchedulerStore, ReviewScheduler } from "./scheduler/review-scheduler";
 import { CollectorRuntime } from "./signals/collector-runtime";
 import { registerComplianceCompleteTool } from "./tools/compliance-complete-tool";
+import { unwrapToolCallEvent } from "./xdev/event-unwrapper";
+import { canonicalArgsFingerprint } from "./xdev/tool-identity";
 
-/** Default compliance store directory within the repo. */
 const DEFAULT_COMPLIANCE_DIR = ".omp/compliance";
+const UNBOUND_EVIDENCE_REVISION = `sha256:${createHash("sha256").update("unbound").digest("hex")}` as const;
+const GOVERNED_BUILTINS = new Map([
+	["edit", "edit"],
+	["write", "write"],
+	["bash", "bash"],
+	["executeBash", "bash"],
+	["task", "task"],
+	["hub", "hub"],
+]);
+const ADVISOR_LIFECYCLE_EVENTS = [
+	"advisor_review_queued",
+	"advisor_run_started",
+	"advisor_tool_call",
+	"advisor_tool_result",
+	"advisor_run_completed",
+	"advisor_run_failed",
+	"advisor_run_cancelled",
+] as const;
 
-/** Host capabilities consumed by this extension, expressed with official v17 contracts. */
+function evidenceRevision(value: string | undefined): `sha256:${string}` {
+	return value?.startsWith("sha256:") ? (value as `sha256:${string}`) : UNBOUND_EVIDENCE_REVISION;
+}
+
 export interface ComplianceExtensionHost {
 	logger: ExtensionAPI["logger"];
+	readonly advisorReviewCapabilities?: AdvisorReviewCapabilities;
 	registerTool: ExtensionAPI["registerTool"];
 	registerCommand(
 		name: string,
@@ -60,10 +89,10 @@ export interface ComplianceExtensionHost {
 	on(event: "session_start", handler: ExtensionHandler<SessionStartEvent>): void;
 	on(event: "session_switch", handler: ExtensionHandler<SessionSwitchEvent>): void;
 	on(event: "advisor_before_run", handler: ExtensionHandler<AdvisorBeforeRunEvent, AdvisorRunAugmentation>): void;
-	on(event: "advisor_run_started", handler: ExtensionHandler<AdvisorReviewLifecycleEvent>): void;
-	on(event: "advisor_run_completed", handler: ExtensionHandler<AdvisorReviewLifecycleEvent>): void;
-	on(event: "advisor_run_failed", handler: ExtensionHandler<AdvisorReviewLifecycleEvent>): void;
-	on(event: "advisor_run_cancelled", handler: ExtensionHandler<AdvisorReviewLifecycleEvent>): void;
+	on<TEvent extends AdvisorReviewLifecycleEvent["type"]>(
+		event: TEvent,
+		handler: ExtensionHandler<Extract<AdvisorReviewLifecycleEvent, { type: TEvent }>>,
+	): void;
 	on(event: "before_agent_start", handler: ExtensionHandler<BeforeAgentStartEvent, BeforeAgentStartEventResult>): void;
 	on(event: "tool_call", handler: ExtensionHandler<ToolCallEvent, ToolCallEventResult>): void;
 	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): void;
@@ -82,57 +111,76 @@ export function bindCollectorEvents(api: ComplianceExtensionHost, collector: Col
 	api.on("tool_result", (event, context) => collector.recordToolResult(event, context));
 }
 
-/**
- * Create a memoized EvidenceStore factory.
- * Only instantiates the store (and creates the directory) when first called.
- */
 function createLazyEvidenceStore(repoRoot: string): () => EvidenceStore {
 	let store: EvidenceStore | null = null;
 	return () => {
-		if (!store) {
-			store = new EvidenceStore(join(repoRoot, DEFAULT_COMPLIANCE_DIR));
-		}
+		store ??= new EvidenceStore(join(repoRoot, DEFAULT_COMPLIANCE_DIR));
 		return store;
 	};
 }
 
-/**
- * Create a memoized Brainstorm infrastructure factory.
- * Only instantiates TopicStore and TopicCoordinator when first called.
- * TopicStore constructor creates directories, so activation must stay
- * zero-side-effect until the first brainstorm operation.
- */
 function createLazyBrainstormInfra(repoRoot: string): () => { coordinator: TopicCoordinator; store: TopicStore } {
 	let infra: { coordinator: TopicCoordinator; store: TopicStore } | null = null;
 	return () => {
 		if (!infra) {
-			const store = new TopicStore(join(repoRoot, ".omp/compliance/brainstorm"));
+			const store = new TopicStore(join(repoRoot, DEFAULT_COMPLIANCE_DIR, "brainstorm"));
 			infra = { coordinator: new TopicCoordinator(store), store };
 		}
 		return infra;
 	};
 }
 
-/**
- * Activate the OMP Compliance extension.
- *
- * Wires both compliance and brainstorm runtimes, registers commands
- * and tools, and sets up passive event handlers. Both subsystems use
- * lazy initialization to avoid creating directories on activation.
- *
- * Does NOT create the evidence store or topic store directories on
- * activation — they are created lazily on first operation.
- */
-export default function activate(api: ComplianceExtensionHost): void {
-	// Repo root: conventions assume cwd is repo root at activation
-	const repoRoot = process.cwd();
+interface RuntimeBundle {
+	readonly collector: CollectorRuntime;
+	readonly runtime: ComplianceRuntime;
+	readonly registry: ComplianceReviewRegistry;
+	readonly brainstormRegistry: BrainstormReviewRegistry;
+	readonly getBrainstormInfra: () => { coordinator: TopicCoordinator; store: TopicStore };
+	readonly getBrainstormRuntime: () => BrainstormRuntime;
+	readonly retryBrainstormDueReviews: () => Promise<void>;
+	readonly ensureSchedulerReady: () => Promise<void>;
+	readonly evaluateToolCall: (event: ToolCallEvent, context: ExtensionContext) => ToolCallEventResult | undefined;
+	readonly handleAdvisorLifecycle: (event: AdvisorReviewLifecycleEvent) => Promise<void>;
+}
 
-	// ── Core infrastructure (all lazy — no FS side-effects yet) ──
+function canonicalPreToolCall(event: ToolCallEvent, runtime: ComplianceRuntime): CanonicalToolCall | undefined {
+	const state = runtime.currentTaskState;
+	const codebase = unwrapToolCallEvent(event);
+	if (codebase) {
+		return {
+			actor: "main",
+			taskId: state?.taskId ?? "unbound-task",
+			callId: codebase.toolCallId,
+			identity: codebase.identity,
+			evidenceRevision: evidenceRevision(state?.evidenceRevision),
+		};
+	}
+	const toolName = GOVERNED_BUILTINS.get(event.toolName);
+	if (!toolName) return undefined;
+	const argsFingerprint = canonicalArgsFingerprint(event.input);
+	if (!argsFingerprint) return undefined;
+	const identity: CanonicalBuiltinToolIdentity = {
+		transport: "builtin",
+		serverId: "omp",
+		toolName,
+		qualifiedName: `omp.${toolName}`,
+		args: { ...event.input } as Record<string, unknown>,
+		argsFingerprint,
+		access: "write",
+	};
+	return {
+		actor: "main",
+		taskId: state?.taskId ?? "unbound-task",
+		callId: event.toolCallId,
+		identity,
+		evidenceRevision: evidenceRevision(state?.evidenceRevision),
+	};
+}
+
+function createRuntimeBundle(api: ComplianceExtensionHost, repoRoot: string, sessionId: () => string): RuntimeBundle {
 	const collector = new CollectorRuntime();
 	const getEvidenceStore = createLazyEvidenceStore(repoRoot);
 	const getBrainstormInfra = createLazyBrainstormInfra(repoRoot);
-
-	// ── Review registries (pure in-memory — no side effects) ──
 	const registry = new ComplianceReviewRegistry();
 	const brainstormRegistry = new BrainstormReviewRegistry();
 	const requestAdvisorReview = async (request: AdvisorReviewRequest): Promise<AdvisorReviewReceipt> => {
@@ -141,25 +189,7 @@ export default function activate(api: ComplianceExtensionHost): void {
 		}
 		return api.requestAdvisorReview(request);
 	};
-
-	// ── Session tracking ──
-	let sessionId: string | null = null;
-	api.on("session_start", (_event, context) => {
-		sessionId = context.sessionManager.getSessionId();
-	});
-	api.on("session_switch", (_event, context) => {
-		sessionId = context.sessionManager.getSessionId();
-	});
-
-	// ── Compliance deps ──
-	const reviewDeps: ComplianceReviewDependencies = {
-		sessionId: () => {
-			if (!sessionId) throw new Error("Compliance: no session binding — session_start not yet received");
-			return sessionId;
-		},
-		registry,
-		requestAdvisorReview,
-	};
+	const reviewDeps: ComplianceReviewDependencies = { sessionId, registry, requestAdvisorReview };
 	const receipts = new Map<string, AdvisorReviewReceipt>();
 	const scheduler = new ReviewScheduler({
 		clock: { now: () => Date.now() },
@@ -186,8 +216,6 @@ export default function activate(api: ComplianceExtensionHost): void {
 		schedulerReady ??= scheduler.restore();
 		return schedulerReady;
 	};
-
-	// Compliance runtime — the main coordinator (gets factory, not store)
 	const runtime = new ComplianceRuntime(getEvidenceStore, collector, api, repoRoot, reviewDeps, {
 		scheduler,
 		strictEvidence: () => {
@@ -207,62 +235,12 @@ export default function activate(api: ComplianceExtensionHost): void {
 		},
 		receiptFor: (reviewId) => receipts.get(reviewId),
 	});
-
-	// ── Brainstorm advisor_hook sendMessage adapter ──
-	// The brainstorm hook sends flat customType/content/display/attribution/details objects;
-	// pass them directly to api.sendMessage (OMP v16.4+ expects these as top-level fields).
-	const brainstormSendMessage = (
-		msg: { customType: string; content: string; display: boolean; attribution: string; details?: unknown },
-		options?: { deliverAs?: string; triggerTurn?: boolean },
-	): void => {
-		api.sendMessage(
-			{
-				customType: msg.customType,
-				content: msg.content,
-				display: msg.display,
-				attribution: msg.attribution as "agent" | "user",
-				details: msg.details,
-			},
-			{
-				deliverAs: options?.deliverAs as "steer" | "followUp" | "nextTurn" | undefined,
-				triggerTurn: options?.triggerTurn,
-			},
-		);
-	};
-
-	// ── Single advisor_before_run handler (compliance first, then brainstorm) ──
-	api.on("advisor_before_run", async (e) => {
-		// Compliance hook first (no lazy init needed)
-		const complianceResult = createComplianceAdvisorHook(registry, runtime)(e);
-		if (complianceResult) return complianceResult;
-		// Brainstorm hook — only init when compliance didn't match
-		if (e.trigger === "brainstorm_review") {
-			await getBrainstormRuntime().restoreAdvisorEnvelope(e.reviewId);
-			return createBrainstormAdvisorHook(
-				brainstormRegistry,
-				getBrainstormInfra().coordinator,
-				brainstormSendMessage,
-				(envelope, review) => getBrainstormRuntime().acceptReview(envelope, review),
-			)(e);
-		}
-		return undefined;
-	});
-
-	api.on("before_agent_start", (event) => appendBrainstormGuidance(event));
-
-	// ── Register compliance command and tool ──
-	registerComplianceCommand(api, runtime);
-	registerComplianceCompleteTool(api, runtime);
-
-	// ── Register brainstorm command and tools (lazy — no FS side effects) ──
-	// TopicStore + TopicCoordinator only created on first actual use via getBrainstormInfra()
-	const getCoordinator = () => getBrainstormInfra().coordinator;
 	let brainstormRuntime: BrainstormRuntime | undefined;
 	const getBrainstormRuntime = (): BrainstormRuntime => {
 		brainstormRuntime ??= new BrainstormRuntime({
 			api: { requestAdvisorReview },
 			collector,
-			coordinator: getCoordinator(),
+			coordinator: getBrainstormInfra().coordinator,
 			registry: brainstormRegistry,
 			requestAdvisorReview,
 			scheduler,
@@ -276,35 +254,38 @@ export default function activate(api: ComplianceExtensionHost): void {
 				};
 			},
 			getAllTools: () => api.getAllTools() as readonly string[],
-			sessionId: () => sessionId ?? "unknown",
+			sessionId,
 		});
 		return brainstormRuntime;
 	};
-	registerBrainstormCommand(api, getCoordinator);
-
-	// Tool registrations — use factory createTopicReadyTool for consistent
-	// validation and schema. BrainstormRuntime and coordinator are created
-	// lazily at first invocation (no FS side effects at registration time).
-	// The factory's handler accesses deps only when called.
-	api.registerTool(
-		createTopicReadyTool({
-			// Runtime is created lazily — wrapped in a getter so the factory
-			// only accesses it when the handler is invoked.
-			get runtime(): BrainstormRuntime {
-				return getBrainstormRuntime();
-			},
-			sessionId: () => sessionId ?? "unknown",
-		}),
-	);
-
-	api.registerTool(
-		createDecisionTool({
-			get coordinator(): TopicCoordinator {
-				return getCoordinator();
-			},
-		}),
-	);
-
+	const retryBrainstormDueReviews = async (): Promise<void> => {
+		if (brainstormRuntime) await brainstormRuntime.retryDueReviews();
+	};
+	const policyEvidence = new EvidenceRepository(join(repoRoot, DEFAULT_COMPLIANCE_DIR), repoRoot);
+	const policy = new PreToolPolicy({
+		append: (record) => {
+			const taskId = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(record.task) ? record.task : "unbound-task";
+			policyEvidence.task(taskId).events.append({
+				...record,
+				type: record.event,
+				timestamp: new Date().toISOString(),
+				eventId: deterministicEvidenceEventId(`pre_tool_policy\0${JSON.stringify(record)}`),
+			});
+		},
+	});
+	const evaluateToolCall = (event: ToolCallEvent, context: ExtensionContext): ToolCallEventResult | undefined => {
+		const call = canonicalPreToolCall(event, runtime);
+		let result: ToolCallEventResult | undefined;
+		if (call) {
+			const state = runtime.currentTaskState;
+			const decision = policy.evaluate(call, {
+				evidenceRevision: evidenceRevision(state?.evidenceRevision),
+			});
+			if (!decision.allow) result = { block: true, reason: decision.reason };
+		}
+		collector.recordToolCall(event, context);
+		return result;
+	};
 	const handleAdvisorLifecycle = async (event: AdvisorReviewLifecycleEvent): Promise<void> => {
 		if (event.trigger === "brainstorm_review") {
 			await getBrainstormRuntime().handleAdvisorLifecycle(event);
@@ -312,17 +293,114 @@ export default function activate(api: ComplianceExtensionHost): void {
 		}
 		await runtime.handleAdvisorLifecycle(event);
 	};
-	api.on("advisor_run_started", handleAdvisorLifecycle);
-	api.on("advisor_run_completed", handleAdvisorLifecycle);
-	api.on("advisor_run_failed", handleAdvisorLifecycle);
-	api.on("advisor_run_cancelled", handleAdvisorLifecycle);
+	return {
+		collector,
+		runtime,
+		registry,
+		brainstormRegistry,
+		getBrainstormInfra,
+		getBrainstormRuntime,
+		retryBrainstormDueReviews,
+		ensureSchedulerReady,
+		evaluateToolCall,
+		handleAdvisorLifecycle,
+	};
+}
 
-	// ── Passive event handlers ──
-	bindCollectorEvents(api, collector);
-	api.on("turn_end", async (event) => {
-		collector.recordTurnEnd({ ...event });
-		await runtime.retryDueReviews();
-		if (brainstormRuntime) await brainstormRuntime.retryDueReviews();
+function runtimeProxy(getRuntime: () => ComplianceRuntime): ComplianceRuntime {
+	return new Proxy({} as ComplianceRuntime, {
+		get: (_target, property) => {
+			const runtime = getRuntime();
+			const value = Reflect.get(runtime, property, runtime) as unknown;
+			return typeof value === "function" ? value.bind(runtime) : value;
+		},
 	});
-	api.on("agent_end", () => collector.refreshPresentation());
+}
+
+export default function activate(api: ComplianceExtensionHost): void {
+	assertAdvisorProtocolV1(api as Pick<ExtensionAPI, "advisorReviewCapabilities" | "requestAdvisorReview">);
+	let root: string | undefined;
+	let activeSessionId: string | undefined;
+	let bundle: RuntimeBundle | undefined;
+	const bindSession = async (context: ExtensionContext): Promise<void> => {
+		const identity = ProjectIdentityStore.open(context.cwd);
+		if (identity.status !== "bound") throw new Error(`OMP project binding requires ${identity.status}`);
+		const nextRoot = identity.observedRoot;
+		if (root !== nextRoot) {
+			root = nextRoot;
+			bundle = undefined;
+		}
+		activeSessionId = context.sessionManager.getSessionId();
+		await getBundle().ensureSchedulerReady();
+	};
+	const getBundle = (): RuntimeBundle => {
+		if (!root || !activeSessionId) throw new Error("Compliance session is not initialized");
+		bundle ??= createRuntimeBundle(api, root, () => {
+			if (!activeSessionId) throw new Error("Compliance session is not initialized");
+			return activeSessionId;
+		});
+		return bundle;
+	};
+	const deferredRuntime = runtimeProxy(() => getBundle().runtime);
+
+	api.on("session_start", (_event, context) => bindSession(context));
+	api.on("session_switch", (_event, context) => bindSession(context));
+	api.on("before_agent_start", (event) => appendBrainstormGuidance(event));
+	api.on("tool_call", (event, context) => getBundle().evaluateToolCall(event, context));
+	api.on("tool_result", (event, context) => getBundle().collector.recordToolResult(event, context));
+	api.on("advisor_before_run", async (event) => {
+		const current = getBundle();
+		const complianceResult = createComplianceAdvisorHook(current.registry, current.runtime)(event);
+		if (complianceResult) return complianceResult;
+		if (event.trigger !== "brainstorm_review") return undefined;
+		await current.getBrainstormRuntime().restoreAdvisorEnvelope(event.reviewId);
+		return createBrainstormAdvisorHook(
+			current.brainstormRegistry,
+			current.getBrainstormInfra().coordinator,
+			(message, options) =>
+				api.sendMessage(
+					{
+						customType: message.customType,
+						content: message.content,
+						display: message.display,
+						attribution: message.attribution as "agent" | "user",
+						details: message.details,
+					},
+					{
+						deliverAs: options?.deliverAs as "steer" | "followUp" | "nextTurn" | undefined,
+						triggerTurn: options?.triggerTurn,
+					},
+				),
+			(envelope, review) => current.getBrainstormRuntime().acceptReview(envelope, review),
+		)(event);
+	});
+	for (const eventName of ADVISOR_LIFECYCLE_EVENTS) {
+		api.on(eventName, (event) => getBundle().handleAdvisorLifecycle(event));
+	}
+	api.on("turn_end", async (event) => {
+		if (!bundle) return;
+		bundle.collector.recordTurnEnd({ ...event });
+		await bundle.runtime.retryDueReviews();
+		await bundle.retryBrainstormDueReviews();
+	});
+	api.on("agent_end", () => bundle?.collector.refreshPresentation());
+
+	registerComplianceCommand(api, deferredRuntime);
+	registerComplianceCompleteTool(api, deferredRuntime);
+	registerBrainstormCommand(api, () => getBundle().getBrainstormInfra().coordinator);
+	api.registerTool(
+		createTopicReadyTool({
+			get runtime(): BrainstormRuntime {
+				return getBundle().getBrainstormRuntime();
+			},
+			sessionId: () => activeSessionId ?? "unknown",
+		}),
+	);
+	api.registerTool(
+		createDecisionTool({
+			get coordinator(): TopicCoordinator {
+				return getBundle().getBrainstormInfra().coordinator;
+			},
+		}),
+	);
 }

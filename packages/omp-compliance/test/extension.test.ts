@@ -231,6 +231,71 @@ describe("extension activate — no lazy file side-effects", () => {
 		expect(api.getBoundEvents()).toContain("advisor_before_run");
 	});
 
+	it("协议能力不匹配时拒绝注册控制工具", async () => {
+		const api = new FakeExtensionAPI();
+		api.advisorReviewCapabilities = undefined;
+		const activate = (await import("../src/extension")).default;
+
+		expect(() => activate(api.toAPI())).toThrow("OMP Advisor Review Protocol v1 is required");
+		expect(api.getRegisteredTools()).toEqual([]);
+	});
+
+	it("注册全部七类 Advisor lifecycle 事件", async () => {
+		const api = new FakeExtensionAPI();
+		const activate = (await import("../src/extension")).default;
+		activate(api.toAPI());
+
+		for (const event of [
+			"advisor_review_queued",
+			"advisor_run_started",
+			"advisor_tool_call",
+			"advisor_tool_result",
+			"advisor_run_completed",
+			"advisor_run_failed",
+			"advisor_run_cancelled",
+		]) {
+			expect(api.getBoundEvents()).toContain(event);
+		}
+	});
+
+	it("session_start 使用 context.cwd 初始化项目，而不是激活进程 cwd", async () => {
+		const sessionRoot = mkdtempSync(join(tmpdir(), "ext-session-root-"));
+		Bun.spawnSync(["git", "init"], { cwd: sessionRoot });
+		const api = new FakeExtensionAPI(createFakeExtensionContext({ cwd: sessionRoot }));
+		const activate = (await import("../src/extension")).default;
+
+		activate(api.toAPI());
+		await api.fireSessionStart();
+
+		expect(existsSync(join(sessionRoot, ".omp/compliance/project.json"))).toBe(true);
+		expect(existsSync(join(tmpDir, ".omp/compliance/project.json"))).toBe(false);
+		rmSync(sessionRoot, { recursive: true, force: true });
+	});
+
+	it("tool_call 先执行写前门再由同一处理器采集", async () => {
+		const api = new FakeExtensionAPI();
+		const activate = (await import("../src/extension")).default;
+		activate(api.toAPI());
+		await api.fireSessionStart();
+
+		expect(api.eventHandlers.get("tool_call")).toHaveLength(1);
+		const decision = await api.fireToolCall("edit", { path: "src/unsafe.ts", oldText: "a", newText: "b" });
+		expect(decision.block).toBe(true);
+		expect(decision.reasons).toContain("missing_contract");
+		const audit = readFileSync(join(tmpDir, ".omp/compliance/tasks/unbound-task/events.jsonl"), "utf8");
+		expect(audit).toContain('"event":"tool_call_blocked"');
+		expect(audit).toContain('"reason":"missing_contract"');
+	});
+
+	it("主代理工具列表不暴露临时裁决工具", async () => {
+		const api = new FakeExtensionAPI();
+		const activate = (await import("../src/extension")).default;
+		activate(api.toAPI());
+
+		expect(api.getAllTools()).not.toContain("compliance_verdict");
+		expect(api.getAllTools()).not.toContain("brainstorm_review");
+	});
+
 	it("activate 后 before_agent_start 会注入专题自动评审提示", async () => {
 		const api = new FakeExtensionAPI();
 		const activate = (await import("../src/extension")).default;

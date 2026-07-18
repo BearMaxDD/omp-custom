@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FakeExtensionAPI } from "../support/fake-extension-api";
+import { FakeExtensionAPI, createFakeExtensionContext } from "../support/fake-extension-api";
 
 describe("brainstorm + compliance isolation — activate", () => {
 	let tmpDir: string;
@@ -57,6 +57,7 @@ describe("brainstorm + compliance isolation — activate", () => {
 		const api = new FakeExtensionAPI();
 		const activate = (await import("../../src/extension")).default;
 		activate(api.toAPI());
+		await api.fireSessionStart();
 
 		const result = await api.fireAdvisorBeforeRun({
 			trigger: "compliance_review",
@@ -71,6 +72,7 @@ describe("brainstorm + compliance isolation — activate", () => {
 		const api = new FakeExtensionAPI();
 		const activate = (await import("../../src/extension")).default;
 		activate(api.toAPI());
+		await api.fireSessionStart();
 
 		const result = await api.fireAdvisorBeforeRun({
 			trigger: "brainstorm_review",
@@ -87,9 +89,7 @@ describe("brainstorm + compliance isolation — activate", () => {
 		activate(api.toAPI());
 
 		// Simulate session_start — should not throw
-		const sessionContext = {
-			sessionManager: { getSessionId: () => "session-42" },
-		};
+		const sessionContext = createFakeExtensionContext({ cwd: tmpDir, sessionId: "session-42" });
 		const startHandlers = api.eventHandlers.get("session_start");
 		expect(startHandlers).toBeDefined();
 		for (const h of startHandlers ?? []) {
