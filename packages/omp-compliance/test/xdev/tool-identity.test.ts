@@ -195,6 +195,47 @@ describe("canonicalizeToolIdentity", () => {
 		expect(reads).toBe(0);
 	});
 
+	it("Symbol own property 不得被忽略为相同的空对象", () => {
+		const alpha = { [Symbol("alpha")]: 1 };
+		const beta = { [Symbol("beta")]: 1 };
+
+		expect(canonicalJson(alpha)).toBeNull();
+		expect(canonicalJson(beta)).toBeNull();
+		expect(canonicalArgsFingerprint(alpha)).toBeNull();
+		expect(canonicalArgsFingerprint(beta)).toBeNull();
+	});
+
+	it.each(["object", "array"] as const)("%s 不可枚举 own property 必须 fail closed", (kind) => {
+		const value: Record<string, unknown> | unknown[] = kind === "array" ? [1] : { visible: 1 };
+		Object.defineProperty(value, "hidden", { configurable: true, value: 2 });
+
+		expect(canonicalJson(value)).toBeNull();
+		expect(canonicalArgsFingerprint(value)).toBeNull();
+	});
+
+	it.each(["object", "array"] as const)("%s Proxy 在任何反射 trap 执行前必须 fail closed", (kind) => {
+		const traps = { getPrototypeOf: 0, ownKeys: 0, getOwnPropertyDescriptor: 0 };
+		const target: Record<string, unknown> | unknown[] = kind === "array" ? [1] : { value: 1 };
+		const value = new Proxy(target, {
+			getPrototypeOf: () => {
+				traps.getPrototypeOf++;
+				return Reflect.getPrototypeOf(target);
+			},
+			ownKeys: () => {
+				traps.ownKeys++;
+				return Reflect.ownKeys(target);
+			},
+			getOwnPropertyDescriptor: (_target, key) => {
+				traps.getOwnPropertyDescriptor++;
+				return Reflect.getOwnPropertyDescriptor(target, key);
+			},
+		});
+
+		expect(canonicalJson(value)).toBeNull();
+		expect(canonicalArgsFingerprint(value)).toBeNull();
+		expect(traps).toEqual({ getPrototypeOf: 0, ownKeys: 0, getOwnPropertyDescriptor: 0 });
+	});
+
 	it("规范化 xd 外层 write", () => {
 		expectIdentity(
 			canonicalizeToolIdentity({

@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
+import { types as utilTypes } from "node:util";
 import {
 	CANONICAL_CODEBASE_SERVER_ID,
 	type CodebaseToolAccess,
@@ -134,7 +135,7 @@ export function canonicalJson(value: unknown): string | null {
 				if (!Number.isFinite(current) || !append(String(current))) return null;
 				continue;
 			}
-			if (typeof current !== "object" || active.has(current)) return null;
+			if (typeof current !== "object" || active.has(current) || utilTypes.isProxy(current)) return null;
 
 			const remainingBytes = CANONICAL_ARGS_MAX_BYTES - usedBytes;
 			if (Array.isArray(current)) {
@@ -150,7 +151,31 @@ export function canonicalJson(value: unknown): string | null {
 					if (!Object.hasOwn(current, key) || key !== String(enumerableIndex)) return null;
 					enumerableIndex++;
 				}
-				if (enumerableIndex !== current.length || !append("[")) return null;
+				if (enumerableIndex !== current.length) return null;
+				const ownKeys = Reflect.ownKeys(current);
+				if (ownKeys.length !== current.length + 1) return null;
+				for (const key of ownKeys) {
+					if (typeof key !== "string") return null;
+					if (key === "length") {
+						const descriptor = Object.getOwnPropertyDescriptor(current, key);
+						if (
+							!descriptor ||
+							descriptor.enumerable ||
+							!("value" in descriptor) ||
+							descriptor.value !== current.length
+						) {
+							return null;
+						}
+						continue;
+					}
+					const index = Number(key);
+					if (!Number.isSafeInteger(index) || index < 0 || index >= current.length || key !== String(index))
+						return null;
+					const descriptor = Object.getOwnPropertyDescriptor(current, key);
+					if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) return null;
+					if (!Object.is(descriptor.value, values[index])) return null;
+				}
+				if (!append("[")) return null;
 				active.add(current);
 				stack.push({ kind: "close", value: current, token: "]" });
 				for (let index = values.length - 1; index >= 0; index--) {
@@ -174,6 +199,16 @@ export function canonicalJson(value: unknown): string | null {
 				const descriptor = Object.getOwnPropertyDescriptor(current, key);
 				if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) return null;
 				entries.push({ key, value: descriptor.value });
+			}
+			const ownKeys = Reflect.ownKeys(current);
+			if (ownKeys.length !== entries.length) return null;
+			const entriesByKey = new Map(entries.map((entry) => [entry.key, entry]));
+			for (const key of ownKeys) {
+				if (typeof key !== "string") return null;
+				const entry = entriesByKey.get(key);
+				const descriptor = Object.getOwnPropertyDescriptor(current, key);
+				if (!entry || !descriptor || !descriptor.enumerable || !("value" in descriptor)) return null;
+				if (!Object.is(descriptor.value, entry.value)) return null;
 			}
 			entries.sort((left, right) => (left.key < right.key ? -1 : left.key > right.key ? 1 : 0));
 			if (!append("{")) return null;
