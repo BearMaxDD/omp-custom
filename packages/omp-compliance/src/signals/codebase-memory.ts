@@ -512,17 +512,22 @@ function deriveTraces(tools: readonly CodebaseToolEvidence[]): CodebaseTraceEvid
 			!["trace_path", "query_graph"].includes(tool.toolName)
 		)
 			continue;
-		const root = resultObject(tool);
-		const sourceValue = root.source ?? tool.params.function_name ?? tool.params.query;
-		const targetValue = root.target ?? relatedFiles(tool)[0];
-		if (typeof sourceValue !== "string" || typeof targetValue !== "string") continue;
-		const direction = tool.params.direction === "inbound" ? "inbound" : "outbound";
-		const trace = {
-			source: boundedPackString(sourceValue, "trace_source"),
-			target: boundedPackString(targetValue, "trace_target"),
-			direction,
-		} as const;
-		traces.set(`${trace.source}\0${trace.target}\0${direction}`, trace);
+		for (const object of collectObjects(resultObject(tool))) {
+			if (typeof object.source !== "string" || typeof object.target !== "string") continue;
+			const direction =
+				object.direction === "inbound" || object.direction === "outbound"
+					? object.direction
+					: tool.params.direction === "inbound"
+						? "inbound"
+						: "outbound";
+			const trace = {
+				source: boundedPackString(object.source, "trace_source"),
+				target: boundedPackString(object.target, "trace_target"),
+				direction,
+			} as const;
+			traces.set(`${trace.source}\0${trace.target}\0${direction}`, trace);
+			if (traces.size > PACK_TOOL_MAX_ITEMS) throw new TypeError("invalid_traces");
+		}
 	}
 	return [...traces.values()].sort((left, right) =>
 		`${left.source}\0${left.target}`.localeCompare(`${right.source}\0${right.target}`),
@@ -840,13 +845,7 @@ export function validateCodebasePack(pack: CodebaseEvidencePack, context: Truste
 	const traceRequired = task.source === "tdd" || task.affectedFiles.length > 1;
 	const relevantTrace = (tool: CodebaseToolEvidence) => {
 		if (!(tool.toolName === "trace_path" || tool.toolName === "query_graph") || !relevant(tool)) return false;
-		const root = resultObject(tool);
-		const source = root.source ?? tool.params.function_name ?? tool.params.query;
-		const target = root.target;
-		return (
-			(typeof source === "string" && symbolTargets.has(source)) ||
-			(typeof target === "string" && symbolTargets.has(target))
-		);
+		return deriveTraces([tool]).some((trace) => symbolTargets.has(trace.source) || symbolTargets.has(trace.target));
 	};
 	if (traceRequired && !successful.some(relevantTrace)) errors.push("missing_relevant_trace");
 	for (const file of changed)

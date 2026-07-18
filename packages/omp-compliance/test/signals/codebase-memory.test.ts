@@ -611,6 +611,39 @@ describe("Codebase Evidence Pack", () => {
 		);
 	});
 
+	it("trace_path 只有 affected file 而没有真实 edge 时不能通过 formal trace 硬门", () => {
+		const fileOnlyTrace = validFixtures().map((item) =>
+			item.toolName === "trace_path"
+				? fixture(
+						"trace_path",
+						"trace",
+						{ project: codebaseProjectId, function_name: "demo.a", direction: "outbound" },
+						"file:src/a.ts",
+						{ file_path: "src/a.ts" },
+					)
+				: item,
+		);
+		const trusted = context(fileOnlyTrace);
+		const pack = createCodebaseEvidencePack(trusted);
+
+		expect(pack.traces).toEqual([]);
+		expect(validateCodebasePack(pack, trusted)).toContain("missing_relevant_trace");
+	});
+
+	it("query_graph 只有 symbol/file 查询结果而没有关系 edge 时不能替代 trace_path", () => {
+		const symbolOnlyQuery = validFixtures().filter((item) => item.toolName !== "trace_path");
+		symbolOnlyQuery.push(
+			fixture("query_graph", "query", { project: codebaseProjectId, query: "MATCH demo.a" }, "file:src/a.ts", {
+				results: [{ qualified_name: "demo.a", file_path: "src/a.ts" }],
+			}),
+		);
+		const trusted = context(symbolOnlyQuery);
+		const pack = createCodebaseEvidencePack(trusted);
+
+		expect(pack.traces).toEqual([]);
+		expect(validateCodebasePack(pack, trusted)).toContain("missing_relevant_trace");
+	});
+
 	it("new roots 与 unresolved claims 由上下文绑定并失败关闭", () => {
 		const validNew = context(validFixtures(), {
 			changedFiles: ["src/a.ts", "src/new/item.ts"],
