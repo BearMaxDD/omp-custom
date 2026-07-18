@@ -11,6 +11,7 @@ import {
 	validateCodebasePack,
 } from "../../src/signals/codebase-memory";
 import type { TrustedCodebaseValidationContextInput } from "../../src/signals/codebase-memory";
+import { CollectorRuntime, createControlledCollectorRuntime } from "../../src/signals/collector-runtime";
 import { ToolEventCollector } from "../../src/signals/tool-event-collector";
 import { canonicalArgsFingerprint } from "../../src/xdev/tool-identity";
 
@@ -326,12 +327,36 @@ describe("Codebase Evidence Pack", () => {
 		return instance;
 	}
 
+	function controlledReader(fixtures: readonly ToolFixture[]) {
+		const controlled = createControlledCollectorRuntime();
+		for (const item of fixtures) {
+			const toolName = `mcp__codebase_memory_mcp__${item.toolName}`;
+			controlled.runtime.recordToolCall(
+				{ type: "tool_call", toolName, toolCallId: item.id, input: item.params },
+				undefined as never,
+			);
+			controlled.runtime.recordToolResult(
+				{
+					type: "tool_result",
+					toolName,
+					toolCallId: item.id,
+					input: item.params,
+					content: [{ type: "text", text: item.resultRef }],
+					isError: item.success === false,
+					details: item.details,
+				},
+				undefined as never,
+			);
+		}
+		return controlled.reader;
+	}
+
 	function context(
 		fixtures: readonly ToolFixture[] = validFixtures(),
 		overrides: Partial<TrustedCodebaseValidationContextInput> = {},
 	) {
 		const contract = overrides.taskContract ?? taskContract();
-		return createTrustedCodebaseValidationContext(collector(fixtures), {
+		return createTrustedCodebaseValidationContext(controlledReader(fixtures), {
 			taskContract: contract,
 			codebaseProjectId,
 			indexRevision: "idx-1",
@@ -344,6 +369,64 @@ describe("Codebase Evidence Pack", () => {
 			...overrides,
 		});
 	}
+
+	it("公开 new ToolEventCollector 不能签发 attacker.fake 可信上下文", () => {
+		const attackerFixtures = validFixtures().map((item) => {
+			if (item.toolName === "search_graph")
+				return fixture(
+					"search_graph",
+					"search",
+					{ project: codebaseProjectId, query: "attacker.fake" },
+					"file:src/a.ts",
+					{
+						results: [{ qualified_name: "attacker.fake", file_path: "src/a.ts" }],
+					},
+				);
+			if (item.toolName === "get_code_snippet")
+				return fixture(
+					"get_code_snippet",
+					"snippet",
+					{ project: codebaseProjectId, qualified_name: "attacker.fake" },
+					"file:src/a.ts",
+					{ qualified_name: "attacker.fake", file_path: "src/a.ts" },
+				);
+			if (item.toolName === "trace_path")
+				return fixture(
+					"trace_path",
+					"trace",
+					{ project: codebaseProjectId, function_name: "attacker.fake", direction: "outbound" },
+					"file:src/a.ts",
+					{ source: "attacker.fake", target: "attacker.sink", file_path: "src/a.ts" },
+				);
+			return item;
+		});
+		expect(() =>
+			createTrustedCodebaseValidationContext(collector(attackerFixtures) as never, {
+				taskContract: taskContract(),
+				codebaseProjectId,
+				indexRevision: "idx-1",
+				queriedAt,
+				changedFiles: ["src/a.ts"],
+				newFiles: [],
+				allowedNewFileRoots: ["src/new"],
+				unresolvedClaims: [],
+				requiredSymbols: ["attacker.fake"],
+			}),
+		).toThrow("invalid_trusted_reader");
+		expect(() =>
+			createTrustedCodebaseValidationContext(new CollectorRuntime() as never, {
+				taskContract: taskContract(),
+				codebaseProjectId,
+				indexRevision: "idx-1",
+				queriedAt,
+				changedFiles: ["src/a.ts"],
+				newFiles: [],
+				allowedNewFileRoots: ["src/new"],
+				unresolvedClaims: [],
+				requiredSymbols: ["attacker.fake"],
+			}),
+		).toThrow("invalid_trusted_reader");
+	});
 
 	it("生成 TRD 9.3 完整、稳定、不可变 Pack", () => {
 		const trusted = context();
@@ -405,7 +488,7 @@ describe("Codebase Evidence Pack", () => {
 			},
 		});
 		expect(() => createTrustedCodebaseValidationContext({} as never, accessorInput as never)).toThrow(
-			"invalid_evidence_collector",
+			"invalid_trusted_reader",
 		);
 		expect(reads).toBe(0);
 	});

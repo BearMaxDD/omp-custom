@@ -20,7 +20,7 @@ import { types as utilTypes } from "node:util";
 import { normalizeRepositoryPath, validateTaskContractIntegrity } from "../contracts/task-contract";
 import { READONLY_CODEBASE_TOOLS, WRITE_CODEBASE_TOOLS } from "../xdev/codebase-tool-policy";
 import { canonicalArgsFingerprint, canonicalJson } from "../xdev/tool-identity";
-import { ToolEventCollector } from "./tool-event-collector";
+import { type TrustedCodebaseEvidenceReader, snapshotTrustedCodebaseEvidence } from "./collector-runtime";
 import type {
 	CodebaseEvidencePack,
 	CodebaseMemoryEvidence,
@@ -556,17 +556,9 @@ function authenticateContext(context: TrustedCodebaseValidationContext): Trusted
 }
 
 function captureCollectorPairs(
-	collector: ToolEventCollector,
+	reader: TrustedCodebaseEvidenceReader,
 ): Array<{ call: ToolCallRecord; result: ToolResultRecord }> {
-	if (
-		typeof collector !== "object" ||
-		collector === null ||
-		utilTypes.isProxy(collector) ||
-		Object.getPrototypeOf(collector) !== ToolEventCollector.prototype
-	) {
-		throw new TypeError("invalid_evidence_collector");
-	}
-	const snapshot = ToolEventCollector.prototype.snapshot.call(collector);
+	const snapshot = snapshotTrustedCodebaseEvidence(reader);
 	const results = new Map(snapshot.results.map((result) => [result.toolCallId, result]));
 	const pairs = snapshot.calls.flatMap((call) => {
 		const result = results.get(call.toolCallId);
@@ -614,10 +606,10 @@ function computeDiffHash(
 }
 
 export function createTrustedCodebaseValidationContext(
-	collector: ToolEventCollector,
+	reader: TrustedCodebaseEvidenceReader,
 	input: TrustedCodebaseValidationContextInput,
 ): TrustedCodebaseValidationContext {
-	const pairs = captureCollectorPairs(collector);
+	const pairs = captureCollectorPairs(reader);
 	const safe = plainCanonical<TrustedCodebaseValidationContextInput>(input, "trusted_context_input");
 	assertKeys(safe, CONTEXT_INPUT_KEYS, "trusted_context_input");
 	const taskContract = validateTaskContractIntegrity(safe.taskContract);
