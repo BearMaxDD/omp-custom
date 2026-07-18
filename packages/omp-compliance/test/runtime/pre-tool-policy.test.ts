@@ -287,6 +287,17 @@ describe("PreToolPolicy decision matrix", () => {
 		expect(decision).toEqual({ allow: true });
 	});
 
+	it.each(["rg --hostname-bin=/tmp/helper --hyperlink-format=file pattern src", "rg pattern src"])(
+		"does not treat ripgrep as intrinsically read-only: %s",
+		(command) => {
+			const decision = new PreToolPolicy(recorder().sink).evaluate(builtinCall("bash", { command }), {
+				evidenceRevision: REVISION,
+			});
+
+			expect(decision).toEqual({ allow: false, reason: "missing_contract" });
+		},
+	);
+
 	it.each(["git diff --check", "git show HEAD", "git log -1"])(
 		"does not prove a Git command read-only from its subcommand name: %s",
 		(command) => {

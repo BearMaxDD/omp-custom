@@ -27,7 +27,6 @@ const READ_ONLY_COMMANDS = new Set([
 	"head",
 	"ls",
 	"pwd",
-	"rg",
 	"stat",
 	"tail",
 	"wc",
