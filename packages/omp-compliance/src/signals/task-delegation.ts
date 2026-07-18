@@ -6,6 +6,7 @@ import type { JobSnapshot } from "@oh-my-pi/pi-coding-agent/tools/hub/types";
 import {
 	applyDelegationEvent,
 	type DelegationRecord,
+	getTrustedDelegationActualFiles,
 	isTrustedDelegationContext,
 	type TrustedDelegationContext,
 } from "../delegation/delegation-supervisor";
@@ -48,13 +49,17 @@ export function createTrustedDelegationNormalizationContext(
 		const actualFiles = binding.actualFiles === undefined
 			? undefined
 			: boundedStringArray(binding.actualFiles, "binding_actual_files", 1024);
+		const attestedActualFiles = getTrustedDelegationActualFiles(delegation, String(binding.delegationId));
+		if (actualFiles !== undefined && !sameStrings(actualFiles, attestedActualFiles)) {
+			throw new TypeError("untrusted_delegation_actual_files");
+		}
 		return {
 			delegationId: boundedString(binding.delegationId, "binding_delegation_id", MAX_ID_BYTES),
 			transport,
 			originalToolCallId: boundedString(binding.originalToolCallId, "binding_tool_call_id", MAX_ID_BYTES),
 			...(binding.jobId === undefined ? {} : { jobId: boundedString(binding.jobId, "binding_job_id", MAX_ID_BYTES) }),
 			...(binding.agentId === undefined ? {} : { agentId: boundedString(binding.agentId, "binding_agent_id", MAX_ID_BYTES) }),
-			...(actualFiles === undefined ? {} : { actualFiles }),
+			...(attestedActualFiles === undefined ? {} : { actualFiles: attestedActualFiles }),
 		};
 	});
 	const context = deepFreeze({ delegation, bindings: normalized });
@@ -563,6 +568,10 @@ function isToolResultRecord(value: unknown): value is ToolResultRecord {
 function boundedStringArray(values: unknown, label: string, maxBytes: number): string[] {
 	if (!Array.isArray(values) || values.length > MAX_ITEMS) throw new TypeError(`invalid_${label}`);
 	return [...new Set(values.map((value) => boundedString(value, label, maxBytes)))];
+}
+
+function sameStrings(left: readonly string[], right: readonly string[] | undefined): boolean {
+	return right !== undefined && left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function boundedString(value: unknown, label: string, maxBytes: number): string {

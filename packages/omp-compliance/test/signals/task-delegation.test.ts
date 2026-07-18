@@ -442,6 +442,10 @@ function trustedHubContext(binding: Parameters<typeof createTrustedDelegationNor
 		taskId: taskContract.taskId,
 		contractHash: taskContract.contractHash,
 		evidenceRevision: revision,
+		delegations: binding.actualFiles === undefined ? [] : [{
+			delegationId: binding.delegationId,
+			actualFiles: binding.actualFiles,
+		}],
 	}));
 	return createTrustedDelegationNormalizationContext(
 		createTrustedDelegationContext({ taskContract, evidenceRevision }, verifier),
@@ -599,6 +603,10 @@ describe("task/hub 官方事件到 Completion Gate 的可信闭环", () => {
 		taskId: taskContract.taskId,
 		contractHash: taskContract.contractHash,
 		evidenceRevision: revision,
+		delegations: [
+			{ delegationId: "delegation-14", actualFiles: ["src/owned.ts"] },
+			{ delegationId: "delegation-unknown", actualFiles: ["src/owned.ts"] },
+		],
 	}));
 	const trusted = createTrustedDelegationContext({ taskContract, evidenceRevision }, verifier);
 
@@ -728,6 +736,16 @@ describe("task/hub 官方事件到 Completion Gate 的可信闭环", () => {
 			context: trusted,
 		});
 		expect(delegationSatisfiesGate(applyNormalizedDelegationEvents(record, events))).toBe(false);
+	});
+
+	it("拒绝把未被 Evidence attestation 认证的 actualFiles 注入可信绑定", () => {
+		expect(() => createTrustedDelegationNormalizationContext(trusted, [{
+			delegationId: "delegation-14",
+			transport: "task",
+			originalToolCallId: "task-call-14",
+			agentId: "agent-real",
+			actualFiles: ["src/outside.ts"],
+		}])).toThrow("untrusted_delegation_actual_files");
 	});
 
 	it("Proxy、getter、非普通原型和超大数组不向外抛并失败关闭", () => {

@@ -23,11 +23,18 @@ export interface TrustedDelegationContext {
 const trustedContexts = new WeakSet<object>();
 const trustedEvidenceVerifiers = new WeakSet<object>();
 const trustedRecords = new WeakSet<object>();
+const trustedActualFiles = new WeakMap<object, ReadonlyMap<string, readonly string[]>>();
+
+export interface DelegationFileEvidence {
+	readonly delegationId: string;
+	readonly actualFiles: readonly string[];
+}
 
 export interface DelegationEvidenceReference {
 	readonly taskId: string;
 	readonly contractHash: `sha256:${string}`;
 	readonly evidenceRevision: `sha256:${string}`;
+	readonly delegations?: readonly DelegationFileEvidence[];
 }
 
 export interface DelegationEvidenceVerifier {
@@ -45,6 +52,14 @@ export function createDelegationEvidenceVerifier(
 
 export function isTrustedDelegationContext(value: unknown): value is TrustedDelegationContext {
 	return typeof value === "object" && value !== null && trustedContexts.has(value);
+}
+
+export function getTrustedDelegationActualFiles(
+	context: TrustedDelegationContext,
+	delegationId: string,
+): readonly string[] | undefined {
+	if (!isTrustedDelegationContext(context)) return undefined;
+	return trustedActualFiles.get(context)?.get(delegationId);
 }
 
 export function createTrustedDelegationContext(input: {
@@ -65,8 +80,18 @@ export function createTrustedDelegationContext(input: {
 		reference.contractHash !== taskContract.contractHash ||
 		reference.evidenceRevision !== evidenceRevision
 	) throw new TypeError("delegation_evidence_mismatch");
+	const delegations = reference.delegations ?? [];
+	if (!Array.isArray(delegations) || delegations.length > MAX_ITEMS) throw new TypeError("invalid_delegation_file_evidence");
+	const fileEvidence = new Map<string, readonly string[]>();
+	for (const entry of delegations) {
+		if (!isPlainObject(entry)) throw new TypeError("invalid_delegation_file_evidence");
+		const delegationId = boundedString(entry.delegationId, "delegation_file_evidence_id", MAX_ID_BYTES);
+		if (fileEvidence.has(delegationId)) throw new TypeError("duplicate_delegation_file_evidence");
+		fileEvidence.set(delegationId, deepFreeze(normalizePaths(entry.actualFiles, "delegation_actual_files")));
+	}
 	const context = deepFreeze({ taskContract, evidenceRevision }) as TrustedDelegationContext;
 	trustedContexts.add(context);
+	trustedActualFiles.set(context, fileEvidence);
 	return context;
 }
 
