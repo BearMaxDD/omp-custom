@@ -19,6 +19,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, normalize, sep } from "node:path";
+import { SnapshotStore } from "../evidence/snapshot-store";
 
 export const PROJECT_IDENTITY_INVALID_ERROR = "OMP project identity is invalid; compliance activation refused";
 
@@ -134,6 +135,30 @@ type PublishOwnerState = "current" | "stale" | "unknown";
 
 // biome-ignore lint/complexity/noStaticOnlyClass: The plan specifies a named ProjectIdentityStore.open boundary.
 export class ProjectIdentityStore {
+	static inspect(cwd: string, options: ProjectIdentityOpenOptions = {}): ProjectIdentityResult | undefined {
+		try {
+			const codebaseProjectId = readCodebaseProjectId(options);
+			const canonicalCwd = canonicalPath(cwd);
+			const gitRoot = findGitRoot(canonicalCwd);
+			const observedRoot = gitRoot ?? canonicalCwd;
+			const observedRemote = gitRoot === undefined ? undefined : readGitRemoteIdentity(gitRoot);
+			assertStoragePathSafe(observedRoot);
+			const binding = readPublishedBindingIfPresent(join(observedRoot, ".omp", "compliance", "project.json"));
+			if (!binding) return undefined;
+			const result = Object.freeze({
+				status: compareBinding(binding, observedRoot, observedRemote, codebaseProjectId),
+				binding,
+				observedRoot,
+				...(observedRemote === undefined ? {} : { observedRemote }),
+			});
+			PROJECT_IDENTITY_RESULTS.add(result);
+			return result;
+		} catch (error) {
+			if (isProjectIdentityError(error)) throw error;
+			throw new Error(PROJECT_IDENTITY_INVALID_ERROR, { cause: error });
+		}
+	}
+
 	static open(cwd: string, options: ProjectIdentityOpenOptions = {}): ProjectIdentityResult {
 		try {
 			const codebaseProjectId = readCodebaseProjectId(options);
@@ -149,6 +174,43 @@ export class ProjectIdentityStore {
 			const result = Object.freeze({
 				status: compareBinding(binding, observedRoot, observedRemote, codebaseProjectId),
 				binding,
+				observedRoot,
+				...(observedRemote === undefined ? {} : { observedRemote }),
+			});
+			PROJECT_IDENTITY_RESULTS.add(result);
+			return result;
+		} catch (error) {
+			if (isProjectIdentityError(error)) throw error;
+			throw new Error(PROJECT_IDENTITY_INVALID_ERROR, { cause: error });
+		}
+	}
+
+	static rebind(cwd: string, options: ProjectIdentityOpenOptions = {}): ProjectIdentityResult {
+		try {
+			const codebaseProjectId = readCodebaseProjectId(options);
+			const canonicalCwd = canonicalPath(cwd);
+			const gitRoot = findGitRoot(canonicalCwd);
+			const observedRoot = gitRoot ?? canonicalCwd;
+			const observedRemote = gitRoot === undefined ? undefined : readGitRemoteIdentity(gitRoot);
+			const filePath = join(observedRoot, ".omp", "compliance", "project.json");
+			assertStoragePathSafe(observedRoot);
+			const existing = readPublishedBindingIfPresent(filePath);
+			if (!existing) throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
+			const binding = freezeBinding({
+				...existing,
+				canonicalRoot: observedRoot,
+				...(observedRemote === undefined ? { gitRemoteIdentity: undefined } : { gitRemoteIdentity: observedRemote }),
+				...(codebaseProjectId === undefined ? { codebaseProjectId: undefined } : { codebaseProjectId }),
+				reboundAt: new Date().toISOString(),
+			});
+			new SnapshotStore(filePath).write(binding);
+			const persisted = readPublishedBindingIfPresent(filePath);
+			if (!persisted || compareBinding(persisted, observedRoot, observedRemote, codebaseProjectId) !== "bound") {
+				throw new Error(PROJECT_IDENTITY_INVALID_ERROR);
+			}
+			const result = Object.freeze({
+				status: "bound" as const,
+				binding: persisted,
 				observedRoot,
 				...(observedRemote === undefined ? {} : { observedRemote }),
 			});

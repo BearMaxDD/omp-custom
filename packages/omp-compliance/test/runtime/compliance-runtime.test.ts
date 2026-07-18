@@ -151,6 +151,11 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 2_000): Promise<v
 	}
 }
 
+function defined<T>(value: T | undefined): T {
+	if (value === undefined) throw new Error("expected value to be defined");
+	return value;
+}
+
 beforeEach(() => {
 	tmpDir = join(tmpdir(), `omp-runtime-test-${Date.now()}`);
 	mkdirSync(tmpDir, { recursive: true });
@@ -911,16 +916,178 @@ describe("ComplianceRuntime — lifecycle 与严格 Verdict 绑定", () => {
 
 		const accepting = runtime.acceptVerdict(verdict);
 		await Bun.sleep(10);
-		const overriding = runtime.overrideCompletion("manual exception");
+		const overriding = runtime.overrideCompletion({
+			actor: "user",
+			operator: "user",
+			reason: "manual exception",
+		});
 		await Bun.sleep(10);
 		expect(runtime.currentTaskState?.status).toBe("advisor_reviewing");
 		releaseEnvelope?.();
 
 		expect((await accepting).accepted).toBe(true);
-		expect((await overriding).status).toBe("completed");
+		await expect(overriding).rejects.toThrow("already terminal");
 		expect(runtime.currentTaskState?.status).toBe("completed");
 		const evidence = await store.readAll(taskId);
 		expect(evidence.filter((record) => record.event === "completed")).toHaveLength(1);
+		expect(await store.readOverrides(taskId)).toHaveLength(0);
+	});
+
+	it("人工 override 取消当前合规审查并清理临时 Advisor 信封", async () => {
+		await runtime.start("tdd.md");
+		await runtime.requestCompletion({ summary: "Done" });
+		const reviewId = String(runtime.currentTaskState?.activeReviewId);
+		expect(runtimeDependencies.scheduler.snapshot().inFlight?.reviewId).toBe(reviewId);
+		expect(reviewDeps.registry.get(reviewId)).toBeDefined();
+
+		const state = await runtime.overrideCompletion({
+			actor: "user",
+			operator: "user",
+			reason: "documented emergency exception",
+		});
+
+		expect(state.status).toBe("overridden");
+		expect(state.activeReviewId).toBeUndefined();
+		expect(runtimeDependencies.scheduler.snapshot().inFlight).toBeUndefined();
+		expect(runtimeDependencies.scheduler.snapshot().queued).toHaveLength(0);
+		expect(reviewDeps.registry.get(reviewId)).toBeUndefined();
+	});
+
+	it("override 状态落盘失败时保留旧运行态，并由永久审计在重启后完成恢复", async () => {
+		const schedulerStore = new ControllableSchedulerStore();
+		let durable: ComplianceRuntimePersistenceSnapshot | undefined;
+		let failOverrideState = true;
+		const dependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			schedulerStore,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		});
+		const first = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps, {
+			...dependencies,
+			persistRuntimeState: (_taskId, snapshot) => {
+				if (snapshot.taskState?.status === "overridden" && failOverrideState) {
+					failOverrideState = false;
+					throw new Error("state disk unavailable");
+				}
+				durable = structuredClone(snapshot);
+			},
+		});
+		await first.start("tdd.md");
+		await first.requestCompletion({ summary: "Done" });
+
+		await expect(
+			first.overrideCompletion({ actor: "user", operator: "user", reason: "audited exception" }),
+		).rejects.toThrow("state disk unavailable");
+		expect(first.currentTaskState?.status).toBe("advisor_reviewing");
+		expect(durable?.taskState?.status).toBe("advisor_reviewing");
+		expect(await store.readOverrides(first.currentTaskState?.taskId)).toHaveLength(1);
+
+		const restoredDependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			schedulerStore,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		});
+		await restoredDependencies.scheduler.restore();
+		const restored = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps, {
+			...restoredDependencies,
+			persistRuntimeState: (_taskId, snapshot) => {
+				durable = structuredClone(snapshot);
+			},
+		});
+		const state = await restored.restorePersistedState(
+			restoredDependencies.strictEvidence().taskContract,
+			defined(durable),
+		);
+		expect(state.status).toBe("overridden");
+		expect(restoredDependencies.scheduler.snapshot().inFlight).toBeUndefined();
+	});
+
+	it("Scheduler 取消落盘失败时保持 durable overridden，并在重启后清理遗留 Review", async () => {
+		const schedulerStore = new ControllableSchedulerStore();
+		let durable: ComplianceRuntimePersistenceSnapshot | undefined;
+		const dependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			schedulerStore,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		});
+		const first = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps, {
+			...dependencies,
+			persistRuntimeState: (_taskId, snapshot) => {
+				durable = structuredClone(snapshot);
+			},
+		});
+		await first.start("tdd.md");
+		await first.requestCompletion({ summary: "Done" });
+		schedulerStore.failWhen = (state) => state.inFlight === undefined;
+
+		await expect(
+			first.overrideCompletion({ actor: "user", operator: "user", reason: "audited exception" }),
+		).rejects.toThrow("scheduler disk down");
+		expect(first.currentTaskState?.status).toBe("overridden");
+		expect(durable?.taskState?.status).toBe("overridden");
+		expect(schedulerStore.state?.inFlight).toBeDefined();
+
+		schedulerStore.failWhen = undefined;
+		const restoredDependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			schedulerStore,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		});
+		await restoredDependencies.scheduler.restore();
+		const restored = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps, {
+			...restoredDependencies,
+			persistRuntimeState: (_taskId, snapshot) => {
+				durable = structuredClone(snapshot);
+			},
+		});
+		const state = await restored.restorePersistedState(
+			restoredDependencies.strictEvidence().taskContract,
+			defined(durable),
+		);
+		expect(state.status).toBe("overridden");
+		expect(restoredDependencies.scheduler.snapshot().inFlight).toBeUndefined();
+	});
+
+	it("同一 TDD 的新任务运行不得在重启后继承旧人工越权", async () => {
+		const schedulerStore = new ControllableSchedulerStore();
+		let durable: ComplianceRuntimePersistenceSnapshot | undefined;
+		const dependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			schedulerStore,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		});
+		const first = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps, {
+			...dependencies,
+			persistRuntimeState: (_taskId, snapshot) => {
+				durable = structuredClone(snapshot);
+			},
+		});
+		await first.start("tdd.md");
+		await first.overrideCompletion({ actor: "user", operator: "user", reason: "old run exception" });
+		const oldRunId = (first.currentTaskState as { taskRunId?: string } | null)?.taskRunId;
+		await first.stop();
+		await first.start("tdd.md");
+		const newRunId = (first.currentTaskState as { taskRunId?: string } | null)?.taskRunId;
+		expect(newRunId).not.toBe(oldRunId);
+
+		const restoredDependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			schedulerStore,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		});
+		await restoredDependencies.scheduler.restore();
+		const restored = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps, restoredDependencies);
+		const state = await restored.restorePersistedState(
+			restoredDependencies.strictEvidence().taskContract,
+			defined(durable),
+		);
+		expect(state.status).toBe("active");
 	});
 
 	it("Completion 等待 Host receipt 时 stop 必须排队到事务结束", async () => {

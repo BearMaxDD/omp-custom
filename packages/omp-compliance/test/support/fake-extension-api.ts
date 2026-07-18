@@ -29,6 +29,7 @@ export class FakeExtensionAPI {
 		new Map();
 	public readonly sentMessages: CustomMessagePayload[] = [];
 	public readonly appendedEntries: Array<{ type: string; data?: unknown }> = [];
+	public readonly logs: string[] = [];
 	public requestAdvisorReview: (request: AdvisorReviewRequest) => Promise<AdvisorReviewReceipt> = async (
 		_request: AdvisorReviewRequest,
 	) => ({ status: "accepted", reviewId: _request.reviewId });
@@ -211,7 +212,7 @@ export class FakeExtensionAPI {
 			requestAdvisorReview: this.requestAdvisorReview.bind(this),
 			advisorReviewCapabilities: this.advisorReviewCapabilities,
 			logger: {
-				info: () => {},
+				info: (message: string) => this.logs.push(message),
 				warn: () => {},
 				error: () => {},
 				debug: () => {},

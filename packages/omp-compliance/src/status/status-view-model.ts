@@ -29,6 +29,7 @@ export interface StatusViewModel {
 	requiredFixes: string[];
 	verificationSummary?: string;
 	evidence: EvidenceGaps;
+	outcome?: "pass" | "manual_override";
 }
 
 // ─── Projection ────────────────────────────────────────────────────
@@ -43,7 +44,7 @@ export interface StatusViewModel {
 export function toStatusViewModel(state: TaskState, snapshot?: EvidenceSnapshot): StatusViewModel {
 	const hashShort = state.contractHash.length >= 8 ? state.contractHash.slice(0, 8) : state.contractHash;
 
-	const advisorAvailable = state.status !== "completed";
+	const advisorAvailable = state.status !== "completed" && state.status !== "overridden";
 
 	const requiredFixes = state.lastVerdict?.requiredFixes ?? [];
 
@@ -57,6 +58,11 @@ export function toStatusViewModel(state: TaskState, snapshot?: EvidenceSnapshot)
 		requiredFixes,
 		verificationSummary: buildVerificationSummary(snapshot),
 		evidence: classifyEvidenceGaps(snapshot),
+		...(state.status === "overridden"
+			? { outcome: "manual_override" as const }
+			: state.status === "completed" && state.lastVerdict?.status === "pass"
+				? { outcome: "pass" as const }
+				: {}),
 	};
 }
 

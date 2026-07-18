@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { EvidencePersistenceError } from "../../src/evidence/event-log";
-import { type EvidenceRecord, EvidenceStore } from "../../src/evidence/evidence-store";
+import { type ComplianceOverride, type EvidenceRecord, EvidenceStore } from "../../src/evidence/evidence-store";
 import { setSecureFsTestHook } from "../../src/evidence/secure-fs";
 
 const roots: string[] = [];
@@ -24,6 +24,26 @@ function makeRecord(overrides: Partial<EvidenceRecord> = {}): EvidenceRecord {
 		attempt: 1,
 		event: "completion_requested",
 		signalDigest: "digest123",
+		...overrides,
+	};
+}
+
+function makeOverride(overrides: Partial<ComplianceOverride> = {}): ComplianceOverride {
+	return {
+		overrideId: "override:123e4567-e89b-42d3-a456-426614174000",
+		taskId: "task-1",
+		taskRunId: "123e4567-e89b-42d3-a456-426614174001",
+		projectId: "project-1",
+		operator: "user",
+		reason: "emergency release",
+		gitHead: "a".repeat(40),
+		diffHash: `sha256:${"b".repeat(64)}`,
+		contractHash: `sha256:${"c".repeat(64)}`,
+		evidenceRevision: `sha256:${"d".repeat(64)}`,
+		missingChecks: ["verification"],
+		stalledReason: "provider unavailable",
+		attempt: 2,
+		createdAt: "2026-07-18T00:00:00.000Z",
 		...overrides,
 	};
 }
@@ -105,6 +125,22 @@ describe("EvidenceStore — 写入与重新读取", () => {
 	it("returns empty array for unknown task", async () => {
 		const records = await store.readAll("nonexistent");
 		expect(records).toEqual([]);
+	});
+
+	it("永久保存并严格读取人工越权审计记录", async () => {
+		const record = makeOverride();
+		await store.appendOverride(record);
+
+		expect(await store.readOverrides("task-1")).toEqual([record]);
+	});
+
+	it("拒绝内容被篡改但 eventId 未同步的人工越权记录", async () => {
+		await store.appendOverride(makeOverride());
+		const path = join(storeRoot, "overrides.jsonl");
+		const stored = readFileSync(path, "utf8");
+		writeFileSync(path, stored.replace("emergency release", "forged release"), "utf8");
+
+		expect(store.readOverrides("task-1")).rejects.toThrow("override audit integrity");
 	});
 });
 

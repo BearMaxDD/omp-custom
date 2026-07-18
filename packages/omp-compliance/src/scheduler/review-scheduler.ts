@@ -13,6 +13,7 @@ import {
 	REVIEW_INTENT_MAX_STRING_LENGTH,
 	type ReviewIntent,
 	type ReviewIntentInput,
+	type ReviewTrigger,
 	normalizeReviewIntentInput,
 	sameReviewScope,
 } from "./review-intent";
@@ -449,6 +450,25 @@ export class ReviewScheduler {
 		});
 	}
 
+	cancelTask(taskId: string, trigger?: ReviewTrigger): Promise<number> {
+		return this.#serialize(async () => {
+			const matches = (intent: ReviewIntent): boolean =>
+				intent.taskId === taskId && (trigger === undefined || intent.trigger === trigger);
+			const cancelled = [...this.#queued, ...(this.#inFlight ? [this.#inFlight] : [])].filter(matches);
+			if (cancelled.length === 0) return 0;
+			await this.#transaction(() => {
+				this.#queued = this.#queued.filter((intent) => !matches(intent));
+				if (this.#inFlight && matches(this.#inFlight)) this.#inFlight = undefined;
+				for (const intent of cancelled) {
+					this.#dedupeLedger.delete(intent.dedupeKey);
+					this.#lifecycleWaiters.get(intent.reviewId)?.();
+					this.#lifecycleWaiters.delete(intent.reviewId);
+				}
+			});
+			return cancelled.length;
+		});
+	}
+
 	completeReview(reviewId: string): Promise<boolean> {
 		return this.#serialize(async () => {
 			if (this.#completed.some((intent) => intent.reviewId === reviewId)) return true;
@@ -622,7 +642,7 @@ export class ReviewScheduler {
 			if (!ledger.has(key)) throw new Error("persisted intent is missing from dedupe ledger");
 		}
 		const maximumSequence = all.reduce((maximum, item) => Math.max(maximum, item.sequence), -1);
-		if (raw.nextSequence !== maximumSequence + 1) throw new Error("persisted nextSequence is inconsistent");
+		if (raw.nextSequence <= maximumSequence) throw new Error("persisted nextSequence is inconsistent");
 		return { queued, inFlight, completed, dedupeLedger: ledger, nextSequence: raw.nextSequence };
 	}
 

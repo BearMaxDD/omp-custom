@@ -531,7 +531,7 @@ describe("ReviewScheduler", () => {
 		expect(scheduler.snapshot().queued[0]?.status).toBe("stalled");
 	});
 
-	it("rejects duplicate persisted sequences and requires nextSequence to be exact", async () => {
+	it("rejects duplicate sequences, allows cancellation gaps, and requires nextSequence above every live sequence", async () => {
 		const store = new MemoryStore();
 		const seeded = harness({ store });
 		await seeded.scheduler.enqueue(intent({ taskId: "one" }));
@@ -541,6 +541,8 @@ describe("ReviewScheduler", () => {
 		store.state = { ...state, queued: [defined(one), { ...defined(two), sequence: defined(one).sequence }] };
 		await expect(harness({ store }).scheduler.restore()).rejects.toThrow("sequence");
 		store.state = { ...state, nextSequence: state.nextSequence + 1 };
+		await expect(harness({ store }).scheduler.restore()).resolves.toBeUndefined();
+		store.state = { ...state, nextSequence: defined(two).sequence };
 		await expect(harness({ store }).scheduler.restore()).rejects.toThrow("nextSequence");
 	});
 
@@ -722,6 +724,39 @@ describe("ReviewScheduler", () => {
 		expect(await scheduler.abandonReview(reviewId)).toBe(true);
 		expect(scheduler.snapshot().inFlight).toBeUndefined();
 		expect((await scheduler.enqueue(input)).kind).toBe("enqueued");
+	});
+
+	it("restores a scheduler snapshot after an in-flight review is abandoned", async () => {
+		const store = new MemoryStore();
+		const seeded = harness({ store });
+		await seeded.scheduler.enqueue(intent({ trigger: "compliance_review", priority: 100 }));
+		await seeded.scheduler.pump();
+		const reviewId = defined(seeded.scheduler.snapshot().inFlight).reviewId;
+
+		await seeded.scheduler.abandonReview(reviewId);
+		const restored = harness({ store });
+		await expect(restored.scheduler.restore()).resolves.toBeUndefined();
+		expect(restored.scheduler.snapshot().inFlight).toBeUndefined();
+	});
+
+	it("cancels every queued or in-flight compliance review for one task while preserving completed history", async () => {
+		const { scheduler } = harness();
+		await scheduler.enqueue(intent({ trigger: "compliance_review", priority: 100, taskId: "target", taskAttempt: 1 }));
+		await scheduler.pump();
+		await scheduler.enqueue(
+			intent({
+				trigger: "compliance_review",
+				priority: 100,
+				taskId: "target",
+				taskAttempt: 2,
+				evidenceRevision: "evidence-8",
+			}),
+		);
+		await scheduler.enqueue(intent({ trigger: "manual_review", priority: 80, taskId: "other" }));
+
+		expect(await scheduler.cancelTask("target", "compliance_review")).toBe(2);
+		expect(scheduler.snapshot().inFlight).toBeUndefined();
+		expect(scheduler.snapshot().queued.map((item) => item.taskId)).toEqual(["other"]);
 	});
 
 	it("saturates the retry counter without ever stopping retries", async () => {

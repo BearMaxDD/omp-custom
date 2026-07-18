@@ -43,6 +43,7 @@ export interface ComplianceVerdict {
  */
 export interface TaskState {
 	taskId: string;
+	taskRunId: string;
 	projectId: string;
 	status: TaskStatus;
 	attempt: number;

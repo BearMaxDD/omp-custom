@@ -2,9 +2,9 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent/extensibility/exten
 
 export const PROTOCOL_V1_REQUIRED_ERROR = "OMP Advisor Review Protocol v1 is required; compliance activation refused";
 
-export function assertAdvisorProtocolV1(
+export function supportsAdvisorProtocolV1(
 	api: Pick<ExtensionAPI, "advisorReviewCapabilities" | "requestAdvisorReview">,
-): void {
+): boolean {
 	try {
 		const capabilities = api.advisorReviewCapabilities;
 		if (
@@ -15,11 +15,16 @@ export function assertAdvisorProtocolV1(
 			capabilities.finalReceipt === true &&
 			typeof api.requestAdvisorReview === "function"
 		) {
-			return;
+			return true;
 		}
 	} catch {
 		// Host objects are untrusted activation input; expose one stable refusal.
 	}
+	return false;
+}
 
-	throw new Error(PROTOCOL_V1_REQUIRED_ERROR);
+export function assertAdvisorProtocolV1(
+	api: Pick<ExtensionAPI, "advisorReviewCapabilities" | "requestAdvisorReview">,
+): void {
+	if (!supportsAdvisorProtocolV1(api)) throw new Error(PROTOCOL_V1_REQUIRED_ERROR);
 }

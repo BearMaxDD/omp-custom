@@ -9,9 +9,10 @@ import { execFileSync } from "node:child_process";
  *  - acceptVerdict → completed | remediation_required (+ injection)
  *  - resumeAfterRemediation
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { types as utilTypes } from "node:util";
 import type {
 	AdvisorReviewLifecycleEvent,
 	AdvisorReviewReceipt,
@@ -32,7 +33,8 @@ import type { ReviewEnvelope } from "../contracts/review-envelope";
 import { validateTaskContractIntegrity } from "../contracts/task-contract";
 import { delegationSatisfiesGate } from "../delegation/delegation-supervisor";
 import type { DelegationRecord } from "../delegation/delegation-supervisor";
-import type { EvidenceRecord, EvidenceStore } from "../evidence/evidence-store";
+import type { ComplianceOverride, EvidenceRecord, EvidenceStore } from "../evidence/evidence-store";
+import { redact } from "../evidence/redaction";
 import { injectRemediation } from "../remediation/inject-required-fix";
 import type { RemediationFinding } from "../remediation/inject-required-fix";
 import { ReviewScheduler } from "../scheduler/review-scheduler";
@@ -59,7 +61,9 @@ const RECOVERABLE_TASK_STATUSES = new Set([
 	"advisor_reviewing",
 	"remediation_required",
 	"stalled",
+	"overridden",
 ]);
+const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 function validIso(value: unknown): value is string {
 	if (typeof value !== "string") return false;
@@ -68,6 +72,61 @@ function validIso(value: unknown): value is string {
 	} catch {
 		return false;
 	}
+}
+
+function normalizeOverrideRequest(value: unknown): ComplianceOverrideRequest {
+	if (
+		value === null ||
+		typeof value !== "object" ||
+		Array.isArray(value) ||
+		utilTypes.isProxy(value) ||
+		Object.getPrototypeOf(value) !== Object.prototype
+	) {
+		throw new Error("Invalid compliance override request");
+	}
+	const descriptors = Object.getOwnPropertyDescriptors(value);
+	if (
+		Reflect.ownKeys(descriptors).some(
+			(key) =>
+				typeof key !== "string" ||
+				!new Set(["actor", "operator", "reason"]).has(key) ||
+				!("value" in (descriptors[key] ?? {})),
+		)
+	) {
+		throw new Error("Invalid compliance override request");
+	}
+	const actor = descriptors.actor?.value;
+	const operator = descriptors.operator?.value;
+	const reason = descriptors.reason?.value;
+	if (actor !== "user" && actor !== "main" && actor !== "advisor") {
+		throw new Error("Invalid compliance override actor");
+	}
+	if (operator !== "user") throw new Error("Invalid compliance override operator");
+	if (typeof reason !== "string" || reason.trim().length === 0 || reason.length > 2048) {
+		throw new Error("Override reason must be bounded and non-empty");
+	}
+	return Object.freeze({ actor, operator, reason: reason.trim() });
+}
+
+function missingOverrideChecks(snapshot: EvidenceSnapshot): string[] {
+	const missing: string[] = [];
+	if (
+		!snapshot.codebaseMemory.indexReady ||
+		snapshot.codebaseMemory.queries.length === 0 ||
+		snapshot.codebaseMemory.references.length === 0
+	) {
+		missing.push("codebase-memory");
+	}
+	if (
+		snapshot.subagentDelegations.length === 0 ||
+		snapshot.subagentDelegations.some((delegation) => delegation.status !== "completed")
+	) {
+		missing.push("task-delegation");
+	}
+	if (snapshot.verifications.length === 0 || snapshot.verifications.some((verification) => !verification.passed)) {
+		missing.push("verification");
+	}
+	return missing;
 }
 
 export function readAuthoritativeGitContext(root: string): { gitHead: string; diffHash: `sha256:${string}` } {
@@ -152,6 +211,12 @@ export interface ComplianceRuntimePersistenceSnapshot {
 	readonly activeEnvelope?: ReviewEnvelope;
 }
 
+export interface ComplianceOverrideRequest {
+	readonly actor: "user" | "main" | "advisor";
+	readonly operator: "user";
+	readonly reason: string;
+}
+
 /**
  * Runtime coordinator for a single managed compliance task.
  *
@@ -220,6 +285,7 @@ export class ComplianceRuntime {
 			if (
 				!RECOVERABLE_TASK_STATUSES.has(state.status) ||
 				state.taskId !== taskContract.taskId ||
+				!UUID_V4_RE.test(state.taskRunId) ||
 				state.projectId !== taskContract.projectId ||
 				state.contractHash !== taskContract.contractHash ||
 				state.contractHash !== contract.contractHash ||
@@ -238,7 +304,35 @@ export class ComplianceRuntime {
 			) {
 				throw new Error("Persisted compliance task context mismatch");
 			}
-			const recoveredCommit = await this.recoverInterruptedVerdictCommit(taskContract, contract, currentGit);
+			const override = (await this.evidenceStore.readOverrides(state.taskId)).findLast(
+				(record) =>
+					record.taskRunId === state.taskRunId &&
+					record.projectId === state.projectId &&
+					record.contractHash === state.contractHash &&
+					record.taskId === state.taskId &&
+					record.gitHead === state.gitHead &&
+					record.diffHash === state.diffHash &&
+					record.evidenceRevision === state.evidenceRevision &&
+					record.attempt === state.attempt,
+			);
+			if (override) {
+				const previousReviewId = state.activeReviewId;
+				await this.scheduler.cancelTask(state.taskId, "compliance_review");
+				if (previousReviewId) this.reviewDeps.registry.consume(previousReviewId);
+				state = transition(state, { type: "override", actor: "user", reason: override.reason });
+				this.taskState = state;
+				this.contract = contract;
+				this.activeEnvelope = undefined;
+				this.activeAdvisorEnvelope = undefined;
+				return state;
+			}
+			if (state.status === "overridden") throw new Error("Persisted override audit record is missing");
+			const recoveredCommit = await this.recoverInterruptedVerdictCommit(
+				taskContract,
+				contract,
+				currentGit,
+				state.taskRunId,
+			);
 			if (recoveredCommit) {
 				this.taskState = recoveredCommit;
 				this.contract = contract;
@@ -415,6 +509,7 @@ export class ComplianceRuntime {
 		const seedFingerprint = `initial-${Date.now()}`;
 		const state: TaskState = {
 			taskId,
+			taskRunId: randomUUID(),
 			projectId: strictContract.projectId,
 			status: "active",
 			attempt: 1,
@@ -1048,16 +1143,61 @@ export class ComplianceRuntime {
 		this.taskState = transition(this.taskState, { type: "advisor_accepted", reviewId: retryEnvelope.reviewId });
 	}
 
-	overrideCompletion(reason: string): Promise<TaskState> {
-		return this.serializeRuntimeOperation(() => this.overrideCompletionExclusive(reason));
+	overrideCompletion(request: ComplianceOverrideRequest): Promise<TaskState> {
+		return this.serializeRuntimeOperation(() => this.overrideCompletionExclusive(request));
 	}
 
-	private async overrideCompletionExclusive(reason: string): Promise<TaskState> {
-		if (!this.taskState) throw new Error("No active compliance task");
-		if (typeof reason !== "string" || reason.trim().length === 0 || reason.length > 2048) {
-			throw new Error("Override reason must be bounded and non-empty");
+	private async overrideCompletionExclusive(request: ComplianceOverrideRequest): Promise<TaskState> {
+		const normalized = normalizeOverrideRequest(request);
+		if (normalized.actor !== "user" || normalized.operator !== "user") {
+			throw new Error("Only an explicit user command may override compliance");
 		}
-		this.taskState = transition(this.taskState, { type: "override", actor: "user", reason: reason.trim() });
+		if (!this.taskState) throw new Error("No active compliance task");
+		if (this.taskState.status === "completed" || this.taskState.status === "overridden") {
+			throw new Error("Compliance task is already terminal");
+		}
+		const currentGit = this.authoritativeGit();
+		const snapshot = this.collector.collector.snapshot();
+		const auditReason = redact(normalized.reason);
+		const record: ComplianceOverride = Object.freeze({
+			overrideId: `override:${randomUUID()}`,
+			taskId: this.taskState.taskId,
+			taskRunId: this.taskState.taskRunId,
+			projectId: this.taskState.projectId,
+			operator: "user",
+			reason: auditReason,
+			gitHead: currentGit.gitHead,
+			diffHash: currentGit.diffHash,
+			contractHash: this.taskState.contractHash,
+			evidenceRevision: this.taskState.evidenceRevision,
+			missingChecks: missingOverrideChecks(snapshot),
+			stalledReason: this.taskState.error ?? "",
+			attempt: this.taskState.attempt,
+			createdAt: new Date().toISOString(),
+		});
+		await this.evidenceStore.appendOverride(record);
+		const previousState = this.taskState;
+		const previousEnvelope = this.activeEnvelope;
+		const previousAdvisorEnvelope = this.activeAdvisorEnvelope;
+		const previousReviewId = previousState.activeReviewId;
+		this.taskState = transition(previousState, {
+			type: "override",
+			actor: "user",
+			reason: auditReason,
+		});
+		this.activeEnvelope = undefined;
+		this.activeAdvisorEnvelope = undefined;
+		try {
+			await this.persistCurrentRuntimeState(previousState.taskId);
+		} catch (error) {
+			this.taskState = previousState;
+			this.activeEnvelope = previousEnvelope;
+			this.activeAdvisorEnvelope = previousAdvisorEnvelope;
+			throw error;
+		}
+		await this.scheduler.cancelTask(previousState.taskId, "compliance_review");
+		if (previousReviewId) this.reviewDeps.registry.consume(previousReviewId);
+		this.skipNextFinalPersistence = true;
 		return this.taskState;
 	}
 
@@ -1226,6 +1366,7 @@ export class ComplianceRuntime {
 		taskContract: TaskContract,
 		contract: ComplianceContract,
 		currentGit: { gitHead: string; diffHash: `sha256:${string}` },
+		taskRunId?: string,
 	): Promise<TaskState | undefined> {
 		const taskId = taskContract.taskId;
 		const records = (await this.evidenceStore.readAll(taskId)) as VerdictCommitEvidenceRecord[];
@@ -1294,6 +1435,7 @@ export class ComplianceRuntime {
 		const now = new Date().toISOString();
 		return {
 			taskId,
+			taskRunId: taskRunId ?? randomUUID(),
 			projectId: recovery.reviewEnvelope.projectId,
 			status: recovery.status === "pass" ? "completed" : "remediation_required",
 			attempt: recovery.reviewEnvelope.attempt,

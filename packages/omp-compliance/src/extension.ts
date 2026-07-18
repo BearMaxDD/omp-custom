@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { realpathSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { realpathSync, unlinkSync } from "node:fs";
 import { join, normalize, sep } from "node:path";
 import type {
 	AdvisorBeforeRunEvent,
@@ -27,7 +27,7 @@ import type {
 	TurnEndEvent,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { CustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
-import { assertAdvisorProtocolV1 } from "./activation/capability-negotiation";
+import { supportsAdvisorProtocolV1 } from "./activation/capability-negotiation";
 import { createComplianceAdvisorHook } from "./advisor/compliance-advisor-hook";
 import { type ComplianceReviewDependencies, ComplianceReviewRegistry } from "./advisor/review-envelope";
 import { createBrainstormAdvisorHook } from "./brainstorm/advisor-hook";
@@ -39,13 +39,18 @@ import { TopicCoordinator } from "./brainstorm/topic-coordinator";
 import { createTopicReadyTool } from "./brainstorm/topic-ready-tool";
 import { TopicStore } from "./brainstorm/topic-store";
 import { registerBrainstormCommand } from "./commands/brainstorm-command";
-import { registerComplianceCommand } from "./commands/compliance-command";
+import {
+	type ComplianceCommandServices,
+	type ComplianceDoctorReport,
+	registerComplianceCommand,
+} from "./commands/compliance-command";
 import { loadComplianceContract } from "./contract/load-contract";
 import type { TaskContract } from "./contract/types";
 import { loadTaskContractFromTdd } from "./contracts/task-contract";
 import { deterministicEvidenceEventId } from "./evidence/event-log";
 import { EvidenceRepository } from "./evidence/evidence-repository";
 import { EvidenceStore } from "./evidence/evidence-store";
+import { SnapshotStore } from "./evidence/snapshot-store";
 import type { ProjectBinding } from "./project/project-identity";
 import { ProjectIdentityStore } from "./project/project-identity";
 import {
@@ -63,6 +68,7 @@ import {
 } from "./signals/codebase-memory";
 import { type CollectorRuntime, createControlledCollectorRuntime } from "./signals/collector-runtime";
 import { registerComplianceCompleteTool } from "./tools/compliance-complete-tool";
+import { READONLY_CODEBASE_TOOLS } from "./xdev/codebase-tool-policy";
 import { unwrapToolCallEvent } from "./xdev/event-unwrapper";
 import { canonicalArgsFingerprint } from "./xdev/tool-identity";
 
@@ -502,11 +508,7 @@ function createRuntimeBundle(
 		const recovery = policyEvidence.recover();
 		const recoverable = recovery.taskIds.flatMap((taskId) => {
 			const snapshot = policyEvidence.task(taskId).state.read<ComplianceRuntimePersistenceSnapshot>();
-			if (
-				!snapshot?.taskState ||
-				snapshot.taskState.status === "completed" ||
-				snapshot.taskState.status === "overridden"
-			) {
+			if (!snapshot?.taskState || snapshot.taskState.status === "completed") {
 				return [];
 			}
 			const contract = policyEvidence.task(taskId).contract.read<TaskContract>();
@@ -571,7 +573,9 @@ function runtimeProxy(getBundle: () => RuntimeBundle): ComplianceRuntime {
 }
 
 export default function activate(api: ComplianceExtensionHost): void {
-	assertAdvisorProtocolV1(api as Pick<ExtensionAPI, "advisorReviewCapabilities" | "requestAdvisorReview">);
+	const protocolReady = supportsAdvisorProtocolV1(
+		api as Pick<ExtensionAPI, "advisorReviewCapabilities" | "requestAdvisorReview">,
+	);
 	const bundlesBySession = new Map<string, RuntimeBundle>();
 	let activeBundle: RuntimeBundle | undefined;
 	const bindSession = async (context: ExtensionContext): Promise<void> => {
@@ -597,6 +601,88 @@ export default function activate(api: ComplianceExtensionHost): void {
 		return bundle;
 	};
 	const deferredRuntime = runtimeProxy(getBundle);
+	const commandServices: ComplianceCommandServices = {
+		doctor: async (context) => {
+			const root = repositoryRoot(context.cwd);
+			let identity: ReturnType<typeof ProjectIdentityStore.inspect>;
+			let identityError: string | undefined;
+			try {
+				identity = ProjectIdentityStore.inspect(context.cwd, { codebaseProjectId: codebaseProjectForRoot(root) });
+			} catch (error) {
+				identityError = error instanceof Error ? error.message : "project identity unavailable";
+			}
+			let storage: ComplianceDoctorReport["storage"] = {
+				status: "missing",
+				detail: "compliance storage is not initialized",
+			};
+			const probePath = join(root, DEFAULT_COMPLIANCE_DIR, `.doctor-${randomUUID()}.json`);
+			if (identity) {
+				try {
+					const probe = new SnapshotStore(probePath);
+					const nonce = randomUUID();
+					probe.write({ nonce });
+					if (probe.read<{ nonce: string }>()?.nonce !== nonce) throw new Error("storage probe read-back mismatch");
+					storage = { status: "ready", detail: "atomic compliance storage probe passed" };
+				} catch (error) {
+					storage = {
+						status: "error",
+						detail: error instanceof Error ? error.message : "compliance storage unavailable",
+					};
+				} finally {
+					try {
+						unlinkSync(probePath);
+					} catch {
+						// The probe may fail before publication.
+					}
+				}
+			}
+			const allTools = api.getAllTools();
+			const codebaseAvailable = allTools.some((name) => {
+				const simpleName = name.includes("__") ? name.slice(name.lastIndexOf("__") + 2) : name;
+				return READONLY_CODEBASE_TOOLS.has(simpleName);
+			});
+			return {
+				protocol: protocolReady
+					? { status: "ready", detail: "Advisor Review Protocol v1" }
+					: { status: "missing", detail: "Advisor Review Protocol v1 unavailable" },
+				advisor:
+					typeof api.requestAdvisorReview === "function"
+						? { status: "ready", detail: "requestAdvisorReview available" }
+						: { status: "missing", detail: "requestAdvisorReview unavailable" },
+				xd: allTools.includes("write")
+					? { status: "ready", detail: "xd:// write dispatcher available" }
+					: { status: "missing", detail: "xd:// write dispatcher not discovered" },
+				codebase:
+					identity?.binding.codebaseProjectId && codebaseAvailable
+						? { status: "ready", detail: identity.binding.codebaseProjectId }
+						: { status: "missing", detail: "Codebase project binding or read tool unavailable" },
+				project: identity
+					? {
+							status: identity.status === "bound" ? "ready" : identity.status,
+							detail: `${identity.status}: ${identity.binding.projectId}`,
+						}
+					: { status: "error", detail: identityError ?? "project identity unavailable" },
+				storage,
+			};
+		},
+		rebind: async (context) => {
+			const sessionId = context.sessionManager.getSessionId();
+			const current = bundlesBySession.get(sessionId);
+			if (current?.runtime.currentTaskState) {
+				throw new Error("Cannot rebind a project while a compliance task is active");
+			}
+			const root = repositoryRoot(context.cwd);
+			const identity = ProjectIdentityStore.rebind(context.cwd, {
+				codebaseProjectId: codebaseProjectForRoot(root),
+			});
+			bundlesBySession.delete(sessionId);
+			if (activeBundle?.sessionId === sessionId) activeBundle = undefined;
+			await bindSession(context);
+			return { status: "bound", projectId: identity.binding.projectId };
+		},
+	};
+	registerComplianceCommand(api, protocolReady ? deferredRuntime : undefined, commandServices);
+	if (!protocolReady) return;
 
 	api.on("session_start", (_event, context) => bindSession(context));
 	api.on("session_switch", (_event, context) => bindSession(context));
@@ -647,7 +733,6 @@ export default function activate(api: ComplianceExtensionHost): void {
 		if (activeBundle) bundleForSession(context.sessionManager.getSessionId()).collector.refreshPresentation();
 	});
 
-	registerComplianceCommand(api, deferredRuntime);
 	registerComplianceCompleteTool(api, deferredRuntime);
 	registerBrainstormCommand(api, () => getBundle().getBrainstormInfra().coordinator);
 	api.registerTool(

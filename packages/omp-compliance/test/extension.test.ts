@@ -231,13 +231,17 @@ describe("extension activate — no lazy file side-effects", () => {
 		expect(api.getBoundEvents()).toContain("advisor_before_run");
 	});
 
-	it("协议能力不匹配时拒绝注册控制工具", async () => {
+	it("协议能力不匹配时仅注册可诊断命令且不注册控制工具", async () => {
 		const api = new FakeExtensionAPI();
 		api.advisorReviewCapabilities = undefined;
 		const activate = (await import("../src/extension")).default;
 
-		expect(() => activate(api.toAPI())).toThrow("OMP Advisor Review Protocol v1 is required");
+		expect(() => activate(api.toAPI())).not.toThrow();
 		expect(api.getRegisteredTools()).toEqual([]);
+		expect(api.getRegisteredCommands()).toEqual(["compliance"]);
+		await api.fireCommand("compliance", "doctor");
+		expect(api.logs.some((line) => line.includes("Doctor protocol: missing"))).toBe(true);
+		await expect(api.fireCommand("compliance", "status")).rejects.toThrow("Protocol v1 is required");
 	});
 
 	it("注册全部七类 Advisor lifecycle 事件", async () => {
@@ -341,6 +345,75 @@ describe("extension activate — no lazy file side-effects", () => {
 
 		expect(existsSync(join(sessionRoot, ".omp/compliance/project.json"))).toBe(true);
 		expect(existsSync(join(tmpDir, ".omp/compliance/project.json"))).toBe(false);
+		rmSync(sessionRoot, { recursive: true, force: true });
+	});
+
+	it("真实命令 doctor 展示六类运行健康状态", async () => {
+		const sessionRoot = mkdtempSync(join(tmpdir(), "ext-doctor-"));
+		Bun.spawnSync(["git", "init"], { cwd: sessionRoot });
+		const api = new FakeExtensionAPI(createFakeExtensionContext({ cwd: sessionRoot, sessionId: "doctor-session" }));
+		const activate = (await import("../src/extension")).default;
+		activate(api.toAPI());
+		await api.fireSessionStart();
+
+		await api.fireCommand("compliance", "doctor");
+
+		for (const component of ["protocol", "advisor", "xd", "codebase", "project", "storage"]) {
+			expect(api.logs.some((line) => line.includes(`Doctor ${component}:`))).toBe(true);
+		}
+		expect(api.logs.some((line) => line.includes("Doctor protocol: ready"))).toBe(true);
+		expect(api.logs.some((line) => line.includes("Doctor project: ready"))).toBe(true);
+		expect(api.logs.some((line) => line.includes("Doctor storage: ready"))).toBe(true);
+		rmSync(sessionRoot, { recursive: true, force: true });
+	});
+
+	it("doctor 在 Codebase 工具未发现时不得仅凭派生绑定报告 ready", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ext-doctor-no-codebase-"));
+		Bun.spawnSync(["git", "init"], { cwd: root });
+		const api = new FakeExtensionAPI(createFakeExtensionContext({ cwd: root, sessionId: "doctor-no-codebase" }));
+		const activate = (await import("../src/extension")).default;
+		activate(api.toAPI());
+		await api.fireSessionStart();
+
+		await api.fireCommand("compliance", "doctor");
+		expect(api.logs.some((line) => line.includes("Doctor codebase: missing"))).toBe(true);
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	it("remote 漂移保持失败关闭，只有显式 rebind 命令更新项目绑定", async () => {
+		const sessionRoot = mkdtempSync(join(tmpdir(), "ext-rebind-"));
+		Bun.spawnSync(["git", "init"], { cwd: sessionRoot });
+		Bun.spawnSync(["git", "remote", "add", "origin", "https://github.com/acme/original.git"], {
+			cwd: sessionRoot,
+		});
+		const context = createFakeExtensionContext({ cwd: sessionRoot, sessionId: "rebind-session" });
+		const api = new FakeExtensionAPI(context);
+		const activate = (await import("../src/extension")).default;
+		activate(api.toAPI());
+		await api.fireSessionStart();
+		const projectPath = join(sessionRoot, ".omp/compliance/project.json");
+		const before = JSON.parse(readFileSync(projectPath, "utf8")) as {
+			projectId: string;
+			gitRemoteIdentity: string;
+			reboundAt?: string;
+		};
+
+		Bun.spawnSync(["git", "remote", "set-url", "origin", "https://github.com/acme/renamed.git"], {
+			cwd: sessionRoot,
+		});
+		await expect(api.fireSessionSwitch(context)).rejects.toThrow("project_mismatch");
+		expect(JSON.parse(readFileSync(projectPath, "utf8")).gitRemoteIdentity).toBe(before.gitRemoteIdentity);
+
+		await api.fireCommand("compliance", "rebind");
+		const after = JSON.parse(readFileSync(projectPath, "utf8")) as {
+			projectId: string;
+			gitRemoteIdentity: string;
+			reboundAt?: string;
+		};
+		expect(after.projectId).toBe(before.projectId);
+		expect(after.gitRemoteIdentity).toBe("git-remote:v1://github.com/acme/renamed");
+		expect(after.reboundAt).toBeDefined();
+		expect(api.logs.some((line) => line.includes("Compliance project rebound"))).toBe(true);
 		rmSync(sessionRoot, { recursive: true, force: true });
 	});
 
@@ -481,6 +554,32 @@ describe("extension activate — no lazy file side-effects", () => {
 
 		expect(api.getAllTools()).not.toContain("compliance_verdict");
 		expect(api.getAllTools()).not.toContain("brainstorm_review");
+	});
+
+	it("overridden 终态重启后仍可通过 status 和 history 审计", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ext-override-restart-"));
+		writeFileSync(join(root, "tdd.md"), TDD_FIXTURE, "utf8");
+		Bun.spawnSync(["git", "init"], { cwd: root });
+		Bun.spawnSync(["git", "config", "user.email", "test@example.com"], { cwd: root });
+		Bun.spawnSync(["git", "config", "user.name", "Test"], { cwd: root });
+		Bun.spawnSync(["git", "add", "tdd.md"], { cwd: root });
+		Bun.spawnSync(["git", "commit", "-m", "init"], { cwd: root });
+		const activate = (await import("../src/extension")).default;
+		const first = new FakeExtensionAPI(createFakeExtensionContext({ cwd: root, sessionId: "override-first" }));
+		activate(first.toAPI());
+		await first.fireSessionStart();
+		await first.fireCommand("compliance", "start tdd.md");
+		await first.fireCommand("compliance", "override --reason audited-release-exception");
+
+		const restarted = new FakeExtensionAPI(createFakeExtensionContext({ cwd: root, sessionId: "override-restarted" }));
+		activate(restarted.toAPI());
+		await restarted.fireSessionStart();
+		await restarted.fireCommand("compliance", "status");
+		await restarted.fireCommand("compliance", "history");
+
+		expect(restarted.logs.some((line) => line.includes("Status: overridden"))).toBe(true);
+		expect(restarted.logs.some((line) => line.includes("Manual override"))).toBe(true);
+		rmSync(root, { recursive: true, force: true });
 	});
 
 	it("activate 后 before_agent_start 会注入专题自动评审提示", async () => {

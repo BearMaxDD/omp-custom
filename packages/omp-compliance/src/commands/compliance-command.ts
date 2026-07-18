@@ -7,12 +7,51 @@
  * Status and history are READ-ONLY projections — no side effects.
  */
 
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { ComplianceRuntime } from "../runtime/compliance-runtime";
 import { readHistory } from "../status/history-reader";
 import { toStatusViewModel } from "../status/status-view-model";
 
 // ─── Command Registration ───────────────────────────────────────────
+
+export type DoctorStatus = "ready" | "missing" | "error" | "rebind_required" | "project_mismatch";
+
+export interface DoctorCheck {
+	readonly status: DoctorStatus;
+	readonly detail: string;
+}
+
+export type ComplianceDoctorReport = Readonly<
+	Record<"protocol" | "advisor" | "xd" | "codebase" | "project" | "storage", DoctorCheck>
+>;
+
+export interface ComplianceCommandServices {
+	doctor(context: ExtensionCommandContext): Promise<ComplianceDoctorReport>;
+	rebind(context: ExtensionCommandContext): Promise<{ status: "bound"; projectId: string }>;
+}
+
+const USAGE =
+	"/compliance start <tdd.md> | stop | resume <task_id> | status | history | doctor | rebind | override --reason <reason>";
+const DOCTOR_COMPONENTS = ["protocol", "advisor", "xd", "codebase", "project", "storage"] as const;
+
+function parseOverrideReason(args: readonly string[]): string {
+	const reasonFlag = args.indexOf("--reason");
+	if (reasonFlag < 0 || reasonFlag === args.length - 1) {
+		throw new Error("Usage: /compliance override --reason <reason>");
+	}
+	let reason = args
+		.slice(reasonFlag + 1)
+		.join(" ")
+		.trim();
+	if (
+		reason.length >= 2 &&
+		((reason.startsWith('"') && reason.endsWith('"')) || (reason.startsWith("'") && reason.endsWith("'")))
+	) {
+		reason = reason.slice(1, -1).trim();
+	}
+	if (!reason || reason.length > 2048) throw new Error("Override reason must be bounded and non-empty");
+	return reason;
+}
 
 /**
  * Register the /compliance command on the extension API.
@@ -26,22 +65,36 @@ import { toStatusViewModel } from "../status/status-view-model";
  */
 export function registerComplianceCommand(
 	api: Pick<ExtensionAPI, "logger" | "registerCommand">,
-	runtime: ComplianceRuntime,
+	runtime: ComplianceRuntime | undefined,
+	services: ComplianceCommandServices,
 ): void {
 	api.registerCommand("compliance", {
-		description:
-			"Manage compliance tasks. " + "Usage: /compliance start <tdd.md> | stop | resume <task_id> | status | history",
+		description: `Manage compliance tasks. Usage: ${USAGE}`,
 		getArgumentCompletions: () =>
-			["start", "stop", "resume", "status", "history"].map((value) => ({ value, label: value })),
-		handler: async (rawArgs: string) => {
+			["start", "stop", "resume", "status", "history", "doctor", "rebind", "override"].map((value) => ({
+				value,
+				label: value,
+			})),
+		handler: async (rawArgs: string, context: ExtensionCommandContext) => {
 			const args: string[] = Array.isArray(rawArgs)
 				? (rawArgs as string[])
 				: rawArgs.trim().split(/\s+/).filter(Boolean);
 			if (args.length === 0) {
-				throw new Error("Usage: /compliance start <tdd.md> | stop | resume <task_id> | status | history");
+				throw new Error(`Usage: ${USAGE}`);
 			}
 
 			const subcommand = args[0].toLowerCase();
+			if (subcommand === "doctor") {
+				const report = await services.doctor(context);
+				for (const component of DOCTOR_COMPONENTS) {
+					const check = report[component];
+					api.logger.info(`Doctor ${component}: ${check.status} — ${check.detail}`);
+				}
+				return;
+			}
+			if (!runtime) {
+				throw new Error("OMP Advisor Review Protocol v1 is required");
+			}
 
 			switch (subcommand) {
 				case "start": {
@@ -132,10 +185,21 @@ export function registerComplianceCommand(
 					break;
 				}
 
+				case "rebind": {
+					const result = await services.rebind(context);
+					api.logger.info(`Compliance project rebound: ${result.projectId} (status: ${result.status})`);
+					break;
+				}
+
+				case "override": {
+					const reason = parseOverrideReason(args);
+					const state = await runtime.overrideCompletion({ actor: "user", operator: "user", reason });
+					api.logger.info(`Compliance: 人工越权 (status: ${state.status})`);
+					break;
+				}
+
 				default:
-					throw new Error(
-						`Unknown subcommand: ${subcommand}. Usage: /compliance start <tdd.md> | stop | resume <task_id> | status | history`,
-					);
+					throw new Error(`Unknown subcommand: ${subcommand}. Usage: ${USAGE}`);
 			}
 		},
 	});

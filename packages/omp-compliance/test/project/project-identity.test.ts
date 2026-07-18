@@ -117,6 +117,24 @@ describe("ProjectIdentityStore", () => {
 		expect(readBinding(moved)).toEqual(initial.binding);
 	});
 
+	it("仅显式 rebind 更新路径和 codebase 绑定并保留逻辑项目 UUID", () => {
+		const original = initGit("git@github.com:acme/widget.git");
+		const initial = ProjectIdentityStore.open(original, { codebaseProjectId: "codebase-before" });
+		const moved = `${original}-moved`;
+		renameSync(original, moved);
+		cleanup.splice(cleanup.indexOf(original), 1, moved);
+		expect(ProjectIdentityStore.open(moved, { codebaseProjectId: "codebase-after" }).status).toBe("project_mismatch");
+
+		const rebound = ProjectIdentityStore.rebind(moved, { codebaseProjectId: "codebase-after" });
+
+		expect(rebound.status).toBe("bound");
+		expect(rebound.binding.projectId).toBe(initial.binding.projectId);
+		expect(rebound.binding.canonicalRoot).toBe(realpathSync(moved));
+		expect(rebound.binding.codebaseProjectId).toBe("codebase-after");
+		expect(rebound.binding.reboundAt).toBeDefined();
+		expect(ProjectIdentityStore.open(moved, { codebaseProjectId: "codebase-after" }).status).toBe("bound");
+	});
+
 	it("returns project_mismatch when the remote identity changes", () => {
 		const root = initGit("https://github.com/acme/widget.git");
 		const initial = ProjectIdentityStore.open(root);
@@ -127,6 +145,21 @@ describe("ProjectIdentityStore", () => {
 		expect(reopened.status).toBe("project_mismatch");
 		expect(reopened.binding).toEqual(initial.binding);
 		expect(readBinding(root)).toEqual(initial.binding);
+	});
+
+	it("remote 变化不会自动改写，但显式 rebind 会留下 reboundAt", () => {
+		const root = initGit("https://github.com/acme/widget.git");
+		const initial = ProjectIdentityStore.open(root);
+		git(root, "remote", "set-url", "origin", "https://github.com/acme/renamed-widget.git");
+		expect(ProjectIdentityStore.open(root).status).toBe("project_mismatch");
+		expect(readBinding(root).gitRemoteIdentity).toBe(initial.binding.gitRemoteIdentity);
+
+		const rebound = ProjectIdentityStore.rebind(root);
+
+		expect(rebound.status).toBe("bound");
+		expect(rebound.binding.projectId).toBe(initial.binding.projectId);
+		expect(rebound.binding.gitRemoteIdentity).toBe("git-remote:v1://github.com/acme/renamed-widget");
+		expect(rebound.binding.reboundAt).toBeDefined();
 	});
 
 	it("returns project_mismatch when a non-git SSH user changes", () => {

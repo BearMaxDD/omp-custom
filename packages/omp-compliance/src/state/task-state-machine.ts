@@ -33,7 +33,11 @@ export function transition(state: TaskState, event: TaskEvent): TaskState {
 		return state;
 	}
 	if (event.type === "override") {
-		return update(state, { status: "overridden", error: `Overridden by ${event.actor}: ${event.reason}` });
+		return update(state, {
+			status: "overridden",
+			activeReviewId: undefined,
+			error: `Overridden by ${event.actor}: ${event.reason}`,
+		});
 	}
 
 	switch (state.status) {

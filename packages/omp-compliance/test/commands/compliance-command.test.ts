@@ -6,7 +6,7 @@ import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "@oh-my-pi/pi-co
 import type { RegisteredCommand } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { ComplianceReviewRegistry } from "../../src/advisor/review-envelope";
 import type { ComplianceReviewDependencies } from "../../src/advisor/review-envelope";
-import { registerComplianceCommand } from "../../src/commands/compliance-command";
+import { type ComplianceCommandServices, registerComplianceCommand } from "../../src/commands/compliance-command";
 import { EvidenceStore } from "../../src/evidence/evidence-store";
 import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
@@ -72,6 +72,9 @@ let api: FakeCommandAPI;
 let runtime: ComplianceRuntime;
 let store: EvidenceStore;
 let collector: CollectorRuntime;
+let doctorCalls: number;
+let rebindCalls: number;
+let commandServices: ComplianceCommandServices;
 
 beforeEach(() => {
 	// Create a temp workspace for each test
@@ -112,6 +115,25 @@ beforeEach(() => {
 	api = new FakeCommandAPI();
 	store = new EvidenceStore(evidenceDir);
 	collector = new CollectorRuntime();
+	doctorCalls = 0;
+	rebindCalls = 0;
+	commandServices = {
+		doctor: async () => {
+			doctorCalls += 1;
+			return {
+				protocol: { status: "ready", detail: "Advisor Review Protocol v1" },
+				advisor: { status: "ready", detail: "requestAdvisorReview available" },
+				xd: { status: "ready", detail: "xd:// dispatcher available" },
+				codebase: { status: "ready", detail: "runtime-test-project" },
+				project: { status: "ready", detail: "bound" },
+				storage: { status: "ready", detail: "writable" },
+			};
+		},
+		rebind: async () => {
+			rebindCalls += 1;
+			return { status: "bound", projectId: "project-rebound" };
+		},
+	};
 	const registry = new ComplianceReviewRegistry();
 	const reviewDeps: ComplianceReviewDependencies = {
 		sessionId: () => "test-session",
@@ -132,7 +154,7 @@ beforeEach(() => {
 		}),
 	);
 
-	registerComplianceCommand(api.toAPI(), runtime);
+	registerComplianceCommand(api.toAPI(), runtime, commandServices);
 });
 
 // ─── Test Helper ────────────────────────────────────────────────────
@@ -210,6 +232,89 @@ describe("ComplianceCommand — /compliance resume", () => {
 		const taskId = runtime.currentTaskState?.taskId;
 		// Can't resume an active task
 		expect(cmd.handler(["resume", taskId])).rejects.toThrow("not stalled");
+	});
+});
+
+describe("ComplianceCommand — doctor/rebind", () => {
+	it("doctor 显示 protocol、Advisor、xd、codebase、project 和 storage", async () => {
+		await getCmd().handler(["doctor"]);
+
+		for (const component of ["protocol", "advisor", "xd", "codebase", "project", "storage"]) {
+			expect(api.logs.some((line) => line.includes(`Doctor ${component}: ready`))).toBe(true);
+		}
+		expect(doctorCalls).toBe(1);
+		expect(rebindCalls).toBe(0);
+	});
+
+	it("项目重绑定只在显式 rebind 用户命令中执行", async () => {
+		await getCmd().handler(["status"]);
+		expect(rebindCalls).toBe(0);
+
+		await getCmd().handler(["rebind"]);
+		expect(rebindCalls).toBe(1);
+		expect(api.logs.some((line) => line.includes("project-rebound"))).toBe(true);
+	});
+});
+
+describe("ComplianceCommand — /compliance override", () => {
+	it("拒绝缺失或空白的越权原因", async () => {
+		await getCmd().handler(["start", "tdd.md"]);
+		await expect(getCmd().handler(["override"])).rejects.toThrow("--reason");
+		await expect(getCmd().handler(["override", "--reason", "   "])).rejects.toThrow("reason");
+	});
+
+	it("用户命令写永久审计记录并进入独立 overridden 终态", async () => {
+		await getCmd().handler(["start", "tdd.md"]);
+		const task = runtime.currentTaskState;
+		if (!task) throw new Error("missing active task");
+
+		await getCmd().handler(["override", "--reason", "紧急发布窗口，人工承担风险"]);
+
+		expect(runtime.currentTaskState?.status).toBe("overridden");
+		expect(runtime.currentTaskState?.lastVerdict?.status).not.toBe("pass");
+		const overrides = await store.readOverrides(task.taskId);
+		expect(overrides).toHaveLength(1);
+		expect(overrides[0]).toMatchObject({
+			taskId: task.taskId,
+			projectId: task.projectId,
+			operator: "user",
+			reason: "紧急发布窗口，人工承担风险",
+			contractHash: task.contractHash,
+			gitHead: expect.stringMatching(/^[0-9a-f]{40}$/),
+			diffHash: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+			evidenceRevision: task.evidenceRevision,
+			missingChecks: expect.any(Array),
+			stalledReason: expect.any(String),
+			attempt: task.attempt,
+			createdAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+		});
+		expect(overrides[0]?.overrideId).toMatch(/^override:[0-9a-f-]{36}$/);
+		expect(api.logs.some((line) => line.includes("人工越权"))).toBe(true);
+
+		await getCmd().handler(["history"]);
+		expect(api.logs.some((line) => line.includes("Manual override"))).toBe(true);
+	});
+
+	it("永久审计写入前脱敏越权原因", async () => {
+		await getCmd().handler(["start", "tdd.md"]);
+		const taskId = String(runtime.currentTaskState?.taskId);
+		await getCmd().handler(["override", "--reason", "Authorization:", "Bearer", "secret-token-value"]);
+
+		const [record] = await store.readOverrides(taskId);
+		expect(record?.reason).toContain("[REDACTED]");
+		expect(record?.reason).not.toContain("secret-token-value");
+	});
+
+	it("Runtime 拒绝 main 或 Advisor 身份直接申请越权", async () => {
+		await getCmd().handler(["start", "tdd.md"]);
+		await expect(
+			runtime.overrideCompletion({ actor: "main", operator: "user", reason: "model request" }),
+		).rejects.toThrow("Only an explicit user command");
+		await expect(
+			runtime.overrideCompletion({ actor: "advisor", operator: "user", reason: "advisor request" }),
+		).rejects.toThrow("Only an explicit user command");
+		expect(runtime.currentTaskState?.status).toBe("active");
+		expect(await store.readOverrides(String(runtime.currentTaskState?.taskId))).toHaveLength(0);
 	});
 });
 

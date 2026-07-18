@@ -182,4 +182,18 @@ describe("toStatusViewModel", () => {
 		expect(view.status).toBe("stalled");
 		expect(view.advisor.available).toBe(true);
 	});
+
+	it("overridden 使用独立终态且不得展示为 pass", () => {
+		const view = toStatusViewModel(
+			activeTask({
+				status: "overridden",
+				lastVerdict: undefined,
+				error: "Overridden by user: emergency release",
+			}),
+		);
+		expect(view.status).toBe("overridden");
+		expect(view.advisor.available).toBe(false);
+		expect(view.outcome).toBe("manual_override");
+		expect(view.lastVerdict?.status).not.toBe("pass");
+	});
 });

@@ -35,7 +35,7 @@ export interface HistoryEvent {
  * metadata are omitted from the summary to avoid flooding the display.
  */
 export async function readHistory(store: EvidenceStore, taskId: string): Promise<HistoryEvent[]> {
-	const records = await store.readAll(taskId);
+	const [records, overrides] = await Promise.all([store.readAll(taskId), store.readOverrides(taskId)]);
 
 	const events: HistoryEvent[] = [];
 
@@ -51,6 +51,14 @@ export async function readHistory(store: EvidenceStore, taskId: string): Promise
 			attempt: record.attempt,
 			verdictSummary: record.verdictSummary ? redact(record.verdictSummary) : undefined,
 			worktreeFingerprintShort: wfShort,
+		});
+	}
+	for (const override of overrides) {
+		events.push({
+			timestamp: override.createdAt,
+			event: "overridden",
+			summary: `Manual override — ${redact(override.reason)}`,
+			attempt: override.attempt,
 		});
 	}
 
