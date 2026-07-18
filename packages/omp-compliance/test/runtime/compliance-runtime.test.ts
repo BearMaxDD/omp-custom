@@ -260,6 +260,58 @@ describe("ComplianceRuntime — start", () => {
 });
 
 describe("ComplianceRuntime — persisted recovery", () => {
+	it("state 写盘失败后从 Scheduler 和 Evidence 恢复孤立 Completion Review", async () => {
+		const schedulerStore = new ControllableSchedulerStore();
+		let durableSnapshot: ComplianceRuntimePersistenceSnapshot | undefined;
+		let stateWrites = 0;
+		let reviewRequests = 0;
+		const firstDependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			schedulerStore,
+			requestAdvisorReview: async (request) => {
+				reviewRequests += 1;
+				return { status: "accepted", reviewId: request.reviewId };
+			},
+		});
+		const firstRuntime = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps, {
+			...firstDependencies,
+			persistRuntimeState: (_taskId, snapshot) => {
+				stateWrites += 1;
+				if (stateWrites > 1) throw new Error("state disk full");
+				durableSnapshot = structuredClone(snapshot);
+			},
+		});
+		await firstRuntime.start("tdd.md");
+		await expect(firstRuntime.requestCompletion({ summary: "Done" })).rejects.toThrow("state disk full");
+		if (!durableSnapshot) throw new Error("active state was not persisted");
+		expect(durableSnapshot.taskState?.status).toBe("active");
+
+		const recoveredDependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			schedulerStore,
+			requestAdvisorReview: async (request) => {
+				reviewRequests += 1;
+				return { status: "accepted", reviewId: request.reviewId };
+			},
+		});
+		const recovered = new ComplianceRuntime(
+			() => store,
+			new CollectorRuntime(),
+			api,
+			tmpDir,
+			reviewDeps,
+			recoveredDependencies,
+		);
+		await recoveredDependencies.scheduler.restore();
+		await recovered.restorePersistedState(firstDependencies.strictEvidence().taskContract, durableSnapshot);
+		await recovered.retryDueReviews();
+
+		expect(reviewRequests).toBe(2);
+		expect(recovered.currentTaskState?.status).toBe("advisor_reviewing");
+	});
+
 	it("重启后将 Scheduler 回收的 in-flight Completion Review 自动重新提交", async () => {
 		const schedulerStore = new ControllableSchedulerStore();
 		let persisted: ComplianceRuntimePersistenceSnapshot | undefined;
@@ -316,6 +368,72 @@ describe("ComplianceRuntime — persisted recovery", () => {
 		expect(reviewRequests).toBe(2);
 		expect(recoveredRuntime.currentTaskState?.status).toBe("advisor_reviewing");
 		expect(recoveredRuntime.currentTaskState?.activeReviewId).not.toBe(persisted.activeEnvelope?.reviewId);
+	});
+
+	it("session 恢复会续提已提交但终态 state 未落盘的 Verdict journal", async () => {
+		const schedulerStore = new ControllableSchedulerStore();
+		let persisted: ComplianceRuntimePersistenceSnapshot | undefined;
+		const firstDependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			schedulerStore,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		});
+		const firstRuntime = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps, {
+			...firstDependencies,
+			persistRuntimeState: (_taskId, snapshot) => {
+				persisted = structuredClone(snapshot);
+			},
+		});
+		const { taskId } = await firstRuntime.start("tdd.md");
+		await firstRuntime.requestCompletion({ summary: "Done" });
+		if (!persisted?.taskState?.activeReviewId || !persisted.activeEnvelope) {
+			throw new Error("advisor reviewing state was not persisted");
+		}
+		await store.append({
+			schemaVersion: 1,
+			timestamp: new Date().toISOString(),
+			taskId,
+			contractPath: "tdd.md",
+			contractHash: persisted.taskState.contractHash,
+			attempt: persisted.taskState.attempt,
+			event: "verdict_commit_prepared",
+			signalDigest: persisted.activeEnvelope.reviewId,
+			commitRecovery: { reviewEnvelope: persisted.activeEnvelope, status: "pass" },
+		} as never);
+		await firstDependencies.scheduler.handleLifecycle(
+			{
+				type: "advisor_run_completed",
+				reviewId: persisted.activeEnvelope.reviewId,
+				trigger: "compliance_review",
+				priority: 100,
+				primarySessionId: "primary",
+				advisorSessionId: "advisor",
+				timestamp: new Date().toISOString(),
+				verdictSubmitted: true,
+			},
+			false,
+		);
+
+		const recoveredDependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			schedulerStore,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		});
+		const recovered = new ComplianceRuntime(
+			() => store,
+			new CollectorRuntime(),
+			api,
+			tmpDir,
+			reviewDeps,
+			recoveredDependencies,
+		);
+		await recoveredDependencies.scheduler.restore();
+		await recovered.restorePersistedState(firstDependencies.strictEvidence().taskContract, persisted);
+
+		expect(recovered.currentTaskState?.status).toBe("completed");
+		expect((await store.readAll(taskId)).some((record) => record.event === "completed")).toBe(true);
 	});
 });
 

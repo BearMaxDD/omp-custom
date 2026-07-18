@@ -213,12 +213,9 @@ export class ComplianceRuntime {
 		return this.serializeRuntimeOperation(async () => {
 			if (snapshot.schemaVersion !== 1 || !snapshot.taskState) throw new Error("Persisted task state is inactive");
 			const taskContract = validateTaskContractIntegrity(taskContractInput);
-			const state = snapshot.taskState;
+			let state = structuredClone(snapshot.taskState);
 			const contract = loadComplianceContract(join(this.repoRoot, taskContract.tddPath ?? ""), this.repoRoot);
 			const currentGit = this.authoritativeGit();
-			const authoritativeAdvisor = state.activeReviewId
-				? await this.authoritativeAdvisorEnvelope(state.taskId, state.activeReviewId)
-				: undefined;
 			if (
 				!RECOVERABLE_TASK_STATUSES.has(state.status) ||
 				state.taskId !== taskContract.taskId ||
@@ -240,30 +237,74 @@ export class ComplianceRuntime {
 			) {
 				throw new Error("Persisted compliance task context mismatch");
 			}
+			const recoveredCommit = await this.recoverInterruptedVerdictCommit(taskContract, contract, currentGit);
+			if (recoveredCommit) {
+				this.taskState = recoveredCommit;
+				this.contract = contract;
+				this.activeAdvisorEnvelope = undefined;
+				return recoveredCommit;
+			}
+			const queuedCompliance = this.scheduler
+				.snapshot()
+				.queued.filter((intent) => intent.taskId === state.taskId && intent.trigger === "compliance_review");
+			if (queuedCompliance.length > 1) throw new Error("Multiple pending compliance Reviews found");
+			let restoredActiveEnvelope = snapshot.activeEnvelope;
+			if (!state.activeReviewId && queuedCompliance.length === 1) {
+				if (state.status !== "active" || restoredActiveEnvelope) {
+					throw new Error("Persisted compliance task and Scheduler mismatch");
+				}
+				const orphanReviewId = queuedCompliance[0]?.reviewId;
+				const orphanEnvelope = orphanReviewId
+					? await this.authoritativeEnvelope(state.taskId, orphanReviewId)
+					: undefined;
+				if (!orphanEnvelope) throw new Error("Authoritative orphan Review Envelope is missing");
+				state = transition(state, {
+					type: "completion_requested",
+					reviewId: orphanEnvelope.reviewId,
+					evidenceRevision: orphanEnvelope.evidenceRevision,
+					gitHead: orphanEnvelope.gitHead,
+					diffHash: orphanEnvelope.diffHash,
+				});
+				state = transition(state, {
+					type: "review_failed",
+					reviewId: orphanEnvelope.reviewId,
+					reason: "Completion Review recovered from Scheduler after state persistence failure",
+				});
+				restoredActiveEnvelope = orphanEnvelope;
+			}
+			const authoritativeEnvelope = state.activeReviewId
+				? await this.authoritativeEnvelope(state.taskId, state.activeReviewId)
+				: undefined;
+			const authoritativeAdvisor = state.activeReviewId
+				? await this.authoritativeAdvisorEnvelope(state.taskId, state.activeReviewId)
+				: undefined;
 			if (state.activeReviewId) {
 				if (
 					state.diffHash !== currentGit.diffHash ||
-					!snapshot.activeEnvelope ||
+					!restoredActiveEnvelope ||
+					!authoritativeEnvelope ||
 					!authoritativeAdvisor ||
-					!this.persistedEnvelopeMatches(snapshot.activeEnvelope, snapshot.activeEnvelope) ||
-					snapshot.activeEnvelope.reviewId !== state.activeReviewId ||
-					snapshot.activeEnvelope.taskId !== state.taskId ||
-					snapshot.activeEnvelope.projectId !== state.projectId ||
-					snapshot.activeEnvelope.contractHash !== state.contractHash ||
-					snapshot.activeEnvelope.evidenceRevision !== state.evidenceRevision ||
-					snapshot.activeEnvelope.gitHead !== state.gitHead ||
-					snapshot.activeEnvelope.diffHash !== state.diffHash ||
-					snapshot.activeEnvelope.attempt !== state.attempt ||
-					snapshot.activeEnvelope.trigger !== "compliance_review" ||
+					!this.persistedEnvelopeMatches(authoritativeEnvelope, restoredActiveEnvelope) ||
+					restoredActiveEnvelope.reviewId !== state.activeReviewId ||
+					restoredActiveEnvelope.taskId !== state.taskId ||
+					restoredActiveEnvelope.projectId !== state.projectId ||
+					restoredActiveEnvelope.contractHash !== state.contractHash ||
+					restoredActiveEnvelope.evidenceRevision !== state.evidenceRevision ||
+					restoredActiveEnvelope.gitHead !== state.gitHead ||
+					restoredActiveEnvelope.gitHead !== currentGit.gitHead ||
+					restoredActiveEnvelope.diffHash !== state.diffHash ||
+					restoredActiveEnvelope.diffHash !== currentGit.diffHash ||
+					restoredActiveEnvelope.attempt !== state.attempt ||
+					restoredActiveEnvelope.trigger !== "compliance_review" ||
 					authoritativeAdvisor.reviewId !== state.activeReviewId ||
 					authoritativeAdvisor.taskId !== state.taskId ||
 					authoritativeAdvisor.projectId !== state.projectId ||
 					authoritativeAdvisor.contractHash !== state.contractHash ||
-					authoritativeAdvisor.evidenceRevision !== snapshot.activeEnvelope.evidenceRevision ||
-					authoritativeAdvisor.gitHead !== snapshot.activeEnvelope.gitHead ||
-					authoritativeAdvisor.diffHash !== snapshot.activeEnvelope.diffHash ||
-					authoritativeAdvisor.attempt !== snapshot.activeEnvelope.attempt ||
-					authoritativeAdvisor.createdAt !== snapshot.activeEnvelope.createdAt ||
+					authoritativeAdvisor.evidenceRevision !== restoredActiveEnvelope.evidenceRevision ||
+					authoritativeAdvisor.gitHead !== restoredActiveEnvelope.gitHead ||
+					authoritativeAdvisor.diffHash !== restoredActiveEnvelope.diffHash ||
+					authoritativeAdvisor.attempt !== restoredActiveEnvelope.attempt ||
+					authoritativeAdvisor.createdAt !== restoredActiveEnvelope.createdAt ||
 					authoritativeAdvisor.trigger !== "compliance_review" ||
 					typeof authoritativeAdvisor.sessionId !== "string" ||
 					authoritativeAdvisor.sessionId.length === 0 ||
@@ -275,10 +316,10 @@ export class ComplianceRuntime {
 				) {
 					throw new Error("Persisted compliance Review Envelope mismatch");
 				}
-			} else if (snapshot.activeEnvelope) {
+			} else if (restoredActiveEnvelope) {
 				throw new Error("Persisted compliance Review Envelope is unexpected");
 			}
-			this.taskState = structuredClone(state);
+			this.taskState = state;
 			if (
 				state.activeReviewId &&
 				(state.status === "completion_requested" || state.status === "advisor_reviewing") &&
@@ -291,7 +332,7 @@ export class ComplianceRuntime {
 				});
 			}
 			this.contract = contract;
-			this.activeEnvelope = snapshot.activeEnvelope;
+			this.activeEnvelope = restoredActiveEnvelope;
 			this.activeAdvisorEnvelope = authoritativeAdvisor;
 			if (this.activeAdvisorEnvelope) this.reviewDeps.registry.put(this.activeAdvisorEnvelope);
 			return this.taskState;
