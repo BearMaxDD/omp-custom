@@ -1,3 +1,4 @@
+import { types as utilTypes } from "node:util";
 import { codebaseToolAccess, isTrustedCodebaseServerId } from "./codebase-tool-policy";
 import { type CanonicalToolIdentity, canonicalArgsFingerprint, canonicalizeToolIdentity } from "./tool-identity";
 
@@ -39,25 +40,61 @@ export type ToolEventClassification =
 	| { kind: "ignored" };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
+	return typeof value === "object" && value !== null && !utilTypes.isProxy(value) && !Array.isArray(value);
 }
 
 function stringField(value: unknown): string | undefined {
 	return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
-function eventArgs(event: ToolCallLike): unknown {
-	return event.type === "tool_call" ? event.input : event.params;
+interface DataField {
+	present: boolean;
+	value: unknown;
 }
 
-function isXdevCandidate(event: ToolCallLike): boolean {
-	if (event.toolName !== "write") return false;
-	const args = eventArgs(event);
-	return isRecord(args) && typeof args.path === "string" && args.path.trim().toLowerCase().startsWith("xd://");
+function dataField(value: object, key: string): DataField | null {
+	if (utilTypes.isProxy(value)) return null;
+	const descriptor = Object.getOwnPropertyDescriptor(value, key);
+	if (!descriptor) return { present: false, value: undefined };
+	if (!descriptor.enumerable || !("value" in descriptor)) return null;
+	return { present: true, value: descriptor.value };
 }
 
-function isTrustedCodebaseCandidate(event: ToolCallLike, toolName: string): boolean {
-	const serverName = stringField(event.serverName);
+const EVENT_FIELD_NAMES = [
+	"type",
+	"toolName",
+	"toolCallId",
+	"input",
+	"params",
+	"serverName",
+	"parentToolCallId",
+	"outerToolCallId",
+	"details",
+] as const;
+
+type SafeEventFields = Record<(typeof EVENT_FIELD_NAMES)[number], unknown>;
+
+function safeEventFields(event: ToolCallLike | ToolResultLike): SafeEventFields | null {
+	if (typeof event !== "object" || event === null || utilTypes.isProxy(event)) return null;
+	const fields = {} as SafeEventFields;
+	for (const key of EVENT_FIELD_NAMES) {
+		const field = dataField(event, key);
+		if (!field) return null;
+		fields[key] = field.value;
+	}
+	return fields;
+}
+
+function isXdevCandidate(toolName: string, args: unknown): boolean {
+	if (toolName !== "write" || !isRecord(args)) return false;
+	const path = dataField(args, "path");
+	return Boolean(
+		path?.present && typeof path.value === "string" && path.value.trim().toLowerCase().startsWith("xd://"),
+	);
+}
+
+function isTrustedCodebaseCandidate(serverNameValue: unknown, toolName: string): boolean {
+	const serverName = stringField(serverNameValue);
 	if (serverName !== undefined && !isTrustedCodebaseServerId(serverName)) return false;
 	if (codebaseToolAccess(toolName)) return serverName !== undefined;
 	for (const prefix of ["mcp__codebase_memory_mcp__", "mcp__codebase_memory__"] as const) {
@@ -66,16 +103,17 @@ function isTrustedCodebaseCandidate(event: ToolCallLike, toolName: string): bool
 	return false;
 }
 
-function diagnoseXdevCall(event: ToolCallLike): InvalidXdevReason | "help" {
-	if (event.type !== "tool_call") return "invalid_outer_event";
-	if (!isRecord(event.input)) return "invalid_content";
-	const path = event.input.path;
-	if (typeof path !== "string") return "invalid_xdev_uri";
-	const trimmedPath = path.trim();
+function diagnoseXdevCall(type: unknown, args: unknown): InvalidXdevReason | "help" {
+	if (type !== "tool_call") return "invalid_outer_event";
+	if (!isRecord(args)) return "invalid_content";
+	const path = dataField(args, "path");
+	if (!path?.present || typeof path.value !== "string") return "invalid_xdev_uri";
+	const trimmedPath = path.value.trim();
 	const toolName = trimmedPath.slice("xd://".length);
 	if (!toolName || /[/?#\\]/.test(toolName) || toolName === "." || toolName === "..") return "invalid_xdev_uri";
-	if (typeof event.input.content !== "string") return "invalid_content";
-	const content = event.input.content.trim();
+	const contentField = dataField(args, "content");
+	if (!contentField?.present || typeof contentField.value !== "string") return "invalid_content";
+	const content = contentField.value.trim();
 	if (/^(?:|\?|help|describe)$/i.test(content)) return "help";
 	let parsed: unknown;
 	try {
@@ -90,35 +128,41 @@ function diagnoseXdevCall(event: ToolCallLike): InvalidXdevReason | "help" {
 }
 
 export function classifyToolCallEvent(event: ToolCallLike): ToolEventClassification {
-	const toolCallId = stringField(event.toolCallId);
-	const toolName = stringField(event.toolName);
+	const fields = safeEventFields(event);
+	if (!fields) return { kind: "ignored" };
+	const toolCallId = stringField(fields.toolCallId);
+	const toolName = stringField(fields.toolName);
 	if (!toolCallId || !toolName) return { kind: "ignored" };
-	if (event.type !== undefined && event.type !== "tool_call") return { kind: "ignored" };
+	if (fields.type !== undefined && fields.type !== "tool_call") return { kind: "ignored" };
+	const args = fields.type === "tool_call" ? fields.input : fields.params;
+	if (utilTypes.isProxy(args)) {
+		return toolName === "write" ? { kind: "invalid_xdev", toolCallId, reason: "invalid_content" } : { kind: "ignored" };
+	}
 	const identity = canonicalizeToolIdentity({
 		toolName,
-		serverName: stringField(event.serverName),
-		args: eventArgs(event),
+		serverName: stringField(fields.serverName),
+		args,
 	});
 	if (!identity) {
 		if (
-			isTrustedCodebaseCandidate(event, toolName) &&
-			isRecord(eventArgs(event)) &&
-			canonicalArgsFingerprint(eventArgs(event)) === null
+			isTrustedCodebaseCandidate(fields.serverName, toolName) &&
+			isRecord(args) &&
+			canonicalArgsFingerprint(args) === null
 		) {
 			return { kind: "invalid_xdev", toolCallId, reason: "unserializable_args" };
 		}
-		if (!isXdevCandidate(event)) return { kind: "ignored" };
-		const reason = diagnoseXdevCall(event);
+		if (!isXdevCandidate(toolName, args)) return { kind: "ignored" };
+		const reason = diagnoseXdevCall(fields.type, args);
 		return reason === "help" ? { kind: "ignored" } : { kind: "invalid_xdev", toolCallId, reason };
 	}
-	if (identity.transport === "xdev" && event.type !== "tool_call") {
+	if (identity.transport === "xdev" && fields.type !== "tool_call") {
 		return { kind: "invalid_xdev", toolCallId, reason: "invalid_outer_event" };
 	}
 	return {
 		kind: "valid",
 		event: {
 			toolCallId,
-			correlationId: stringField(event.parentToolCallId) ?? stringField(event.outerToolCallId) ?? toolCallId,
+			correlationId: stringField(fields.parentToolCallId) ?? stringField(fields.outerToolCallId) ?? toolCallId,
 			identity,
 		},
 	};
@@ -133,24 +177,46 @@ export function classifyToolResultEvent(
 	event: ToolResultLike,
 	expectedQualifiedName?: string,
 ): ToolEventClassification {
-	if (event.type !== "tool_result" || event.toolName !== "write" || !isRecord(event.input)) {
+	const fields = safeEventFields(event);
+	if (!fields || fields.type !== "tool_result" || fields.toolName !== "write") {
 		return { kind: "ignored" };
 	}
-	const call = classifyToolCallEvent({ ...event, type: "tool_call" });
+	const toolCallId = stringField(fields.toolCallId);
+	if (!toolCallId) return { kind: "ignored" };
+	if (!isRecord(fields.input)) {
+		return { kind: "invalid_xdev", toolCallId, reason: "invalid_content" };
+	}
+	const call = classifyToolCallEvent({
+		type: "tool_call",
+		toolName: fields.toolName,
+		toolCallId,
+		input: fields.input,
+		serverName: fields.serverName,
+		parentToolCallId: fields.parentToolCallId,
+		outerToolCallId: fields.outerToolCallId,
+	});
 	if (call.kind !== "valid" || call.event.identity.transport !== "xdev") return call;
-	const toolCallId = call.event.toolCallId;
-	if (!isRecord(event.details) || !isRecord(event.details.xdev)) {
+	if (!isRecord(fields.details)) {
 		return { kind: "invalid_xdev", toolCallId, reason: "missing_xdev_details" };
 	}
-	const xdev = event.details.xdev;
-	if (xdev.mode === "help" || xdev.mode === "describe") return { kind: "ignored" };
-	if (xdev.mode !== "execute" || typeof xdev.tool !== "string" || !isRecord(xdev.args)) {
+	const xdevField = dataField(fields.details, "xdev");
+	if (!xdevField?.present || !isRecord(xdevField.value)) {
 		return { kind: "invalid_xdev", toolCallId, reason: "missing_xdev_details" };
 	}
-	if (xdev.tool !== call.event.identity.toolName) {
+	const mode = dataField(xdevField.value, "mode");
+	const tool = dataField(xdevField.value, "tool");
+	const args = dataField(xdevField.value, "args");
+	if (!mode || !tool || !args) {
+		return { kind: "invalid_xdev", toolCallId, reason: "missing_xdev_details" };
+	}
+	if (mode.value === "help" || mode.value === "describe") return { kind: "ignored" };
+	if (mode.value !== "execute" || typeof tool.value !== "string" || !isRecord(args.value)) {
+		return { kind: "invalid_xdev", toolCallId, reason: "missing_xdev_details" };
+	}
+	if (tool.value !== call.event.identity.toolName) {
 		return { kind: "invalid_xdev", toolCallId, reason: "tool_mismatch" };
 	}
-	const resultFingerprint = canonicalArgsFingerprint(xdev.args);
+	const resultFingerprint = canonicalArgsFingerprint(args.value);
 	if (!resultFingerprint) return { kind: "invalid_xdev", toolCallId, reason: "unserializable_args" };
 	if (resultFingerprint !== call.event.identity.argsFingerprint) {
 		return { kind: "invalid_xdev", toolCallId, reason: "args_mismatch" };

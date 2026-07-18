@@ -1,5 +1,33 @@
 import { describe, expect, it } from "bun:test";
-import { unwrapToolCallEvent, unwrapToolResultEvent } from "../../src/xdev/event-unwrapper";
+import {
+	classifyToolCallEvent,
+	classifyToolResultEvent,
+	unwrapToolCallEvent,
+	unwrapToolResultEvent,
+} from "../../src/xdev/event-unwrapper";
+
+function proxyWithTrapCounters<T extends object>(target: T, throwing: boolean) {
+	const traps = { get: 0, ownKeys: 0, getOwnPropertyDescriptor: 0 };
+	const failOr = <V>(value: V): V => {
+		if (throwing) throw new Error("不得执行 Proxy trap");
+		return value;
+	};
+	const proxy = new Proxy(target, {
+		get: (_target, key, receiver) => {
+			traps.get++;
+			return failOr(Reflect.get(target, key, receiver));
+		},
+		ownKeys: () => {
+			traps.ownKeys++;
+			return failOr(Reflect.ownKeys(target));
+		},
+		getOwnPropertyDescriptor: (_target, key) => {
+			traps.getOwnPropertyDescriptor++;
+			return failOr(Reflect.getOwnPropertyDescriptor(target, key));
+		},
+	});
+	return { proxy, traps };
+}
 
 describe("unwrapToolCallEvent", () => {
 	it("仅展开正式 write + xd:// URI + JSON object content", () => {
@@ -73,6 +101,36 @@ describe("unwrapToolCallEvent", () => {
 				params: { path: "xd://search_graph", content: "{}" },
 			}),
 		).toBeNull();
+	});
+
+	it.each([false, true])("classifyToolCallEvent 对 input Proxy fail closed 且 trap 为 0 (throwing=%s)", (throwing) => {
+		const { proxy: input, traps } = proxyWithTrapCounters(
+			{ path: "xd://search_graph", content: '{"query":"proxy"}' },
+			throwing,
+		);
+		let result: ReturnType<typeof classifyToolCallEvent> | undefined;
+
+		expect(() => {
+			result = classifyToolCallEvent({ type: "tool_call", toolName: "write", toolCallId: "proxy-call", input });
+		}).not.toThrow();
+		expect(result?.kind).not.toBe("valid");
+		expect(traps).toEqual({ get: 0, ownKeys: 0, getOwnPropertyDescriptor: 0 });
+	});
+
+	it("classifyToolCallEvent 不执行 input accessor", () => {
+		let reads = 0;
+		const input = Object.defineProperty({ content: "{}" }, "path", {
+			enumerable: true,
+			get: () => {
+				reads++;
+				return "xd://search_graph";
+			},
+		});
+
+		expect(
+			classifyToolCallEvent({ type: "tool_call", toolName: "write", toolCallId: "accessor-call", input }).kind,
+		).not.toBe("valid");
+		expect(reads).toBe(0);
 	});
 });
 
@@ -166,5 +224,57 @@ describe("unwrapToolResultEvent", () => {
 				details: { xdev: { tool: "search_graph", mode: "execute", args: cyclic } },
 			}),
 		).toBeNull();
+	});
+
+	it.each(["details", "xdev"] as const)("classifyToolResultEvent 对 %s Proxy 不执行 trap 并 fail closed", (level) => {
+		for (const throwing of [false, true]) {
+			const target =
+				level === "details"
+					? { xdev: { tool: "search_graph", mode: "execute", args: {} } }
+					: { tool: "search_graph", mode: "execute", args: {} };
+			const { proxy, traps } = proxyWithTrapCounters(target, throwing);
+			const details = level === "details" ? proxy : { xdev: proxy };
+			let result: ReturnType<typeof classifyToolResultEvent> | undefined;
+
+			expect(() => {
+				result = classifyToolResultEvent({
+					type: "tool_result",
+					toolName: "write",
+					toolCallId: `proxy-result-${level}-${throwing}`,
+					input: { path: "xd://search_graph", content: "{}" },
+					details,
+				});
+			}).not.toThrow();
+			expect(result?.kind).not.toBe("valid");
+			expect(traps).toEqual({ get: 0, ownKeys: 0, getOwnPropertyDescriptor: 0 });
+		}
+	});
+
+	it.each(["xdev", "mode", "tool", "args"] as const)("classifyToolResultEvent 不执行 %s accessor", (field) => {
+		let reads = 0;
+		const xdev: Record<string, unknown> = { tool: "search_graph", mode: "execute", args: {} };
+		let details: Record<string, unknown> = { xdev };
+		const target = field === "xdev" ? details : xdev;
+		const accessorValue =
+			field === "xdev" ? xdev : field === "mode" ? "execute" : field === "tool" ? "search_graph" : {};
+		Object.defineProperty(target, field, {
+			enumerable: true,
+			get: () => {
+				reads++;
+				return accessorValue;
+			},
+		});
+		if (field === "xdev") details = target;
+
+		expect(
+			classifyToolResultEvent({
+				type: "tool_result",
+				toolName: "write",
+				toolCallId: `accessor-result-${field}`,
+				input: { path: "xd://search_graph", content: "{}" },
+				details,
+			}).kind,
+		).not.toBe("valid");
+		expect(reads).toBe(0);
 	});
 });
