@@ -119,10 +119,12 @@ function parseMcpFqn(toolName: string): { serverId: string; toolName: string } |
 	if (!toolName.startsWith("mcp__")) return null;
 	for (const serverId of ["codebase-memory-mcp", "codebase_memory_mcp", "codebase-memory"] as const) {
 		const serverPart = sanitizedServerId(serverId);
-		const prefix = `mcp__${serverPart}__`;
-		if (!toolName.startsWith(prefix)) continue;
-		const candidate = toolName.slice(prefix.length);
-		if (codebaseToolAccess(candidate)) return { serverId, toolName: candidate };
+		for (const separator of ["_", "__"] as const) {
+			const prefix = `mcp__${serverPart}${separator}`;
+			if (!toolName.startsWith(prefix)) continue;
+			const candidate = toolName.slice(prefix.length);
+			if (codebaseToolAccess(candidate)) return { serverId, toolName: candidate };
+		}
 	}
 	return null;
 }

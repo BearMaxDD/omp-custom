@@ -104,6 +104,8 @@ const CWD_MAX_BYTES = 1024;
 const SESSION_ID_MAX_BYTES = 256;
 const RESULT_REF_MAX_BYTES = 2 * 1024;
 const FAILURE_SCAN_MAX_DEPTH = 32;
+const FAILURE_SCAN_MAX_NODES = 4096;
+const FAILURE_SCAN_MAX_KEYS = 8192;
 const DETAILS_PRIORITY_KEYS = [
 	"results",
 	"async",
@@ -153,6 +155,46 @@ function boundedUtf8(value: string, maxBytes: number, label: string): string {
 	return `${prefix}${marker}`;
 }
 
+function utf8Prefix(value: string, maxBytes: number): string {
+	let prefix = "";
+	let used = 0;
+	for (const character of value) {
+		const bytes = utf8Length(character);
+		if (used + bytes > maxBytes) break;
+		prefix += character;
+		used += bytes;
+	}
+	return prefix;
+}
+
+function boundedTextContent(content: ReadonlyArray<{ type: string; text?: string }>, maxBytes: number): string {
+	const hash = createHash("sha256");
+	let prefix = "";
+	let prefixBytes = 0;
+	let totalBytes = 0;
+	let sawText = false;
+
+	for (const item of content) {
+		if (item.type !== "text" || typeof item.text !== "string") continue;
+		for (const fragment of [sawText ? "\n" : "", item.text]) {
+			if (!fragment) continue;
+			hash.update(fragment, "utf8");
+			const bytes = utf8Length(fragment);
+			totalBytes += bytes;
+			if (prefixBytes < maxBytes) {
+				const retained = utf8Prefix(fragment, maxBytes - prefixBytes);
+				prefix += retained;
+				prefixBytes += utf8Length(retained);
+			}
+		}
+		sawText = true;
+	}
+
+	if (!sawText || totalBytes <= maxBytes) return prefix;
+	const marker = `...[result:sha256:${hash.digest("hex")}]`;
+	return `${utf8Prefix(prefix, maxBytes - utf8Length(marker))}${marker}`;
+}
+
 function boundedIdentifier(value: string): string {
 	return boundedHashedString(value, IDENTIFIER_MAX_BYTES, "id");
 }
@@ -166,7 +208,8 @@ function boundedServerName(value: string): string {
 }
 
 interface SanitizeState {
-	truncated: boolean;
+	valueTruncated: boolean;
+	incomplete: boolean;
 }
 
 interface DetailSummary {
@@ -177,16 +220,16 @@ interface DetailSummary {
 
 function boundedStorageKey(value: string, state: SanitizeState): string {
 	if (utf8Length(value) <= IDENTIFIER_MAX_BYTES) return value;
-	state.truncated = true;
+	state.incomplete = true;
 	return `key:sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
 }
 
 function boundedJsonString(value: string, maxBytes: number, state: SanitizeState): string | null {
 	const capped = value.slice(0, DETAILS_MAX_STRING);
-	if (capped !== value) state.truncated = true;
+	if (capped !== value) state.valueTruncated = true;
 	let serialized = JSON.stringify(capped);
 	if (utf8Length(serialized) <= maxBytes) return serialized;
-	state.truncated = true;
+	state.valueTruncated = true;
 	let low = 0;
 	let high = capped.length;
 	while (low < high) {
@@ -208,13 +251,13 @@ function orderedDetailKeys(value: object, state: SanitizeState): string[] {
 	for (const key in value) {
 		if (!Object.hasOwn(value, key) || priority.has(key)) continue;
 		if (keys.length >= DETAILS_MAX_KEYS) {
-			state.truncated = true;
+			state.incomplete = true;
 			break;
 		}
 		keys.push(key);
 	}
 	if (keys.length > DETAILS_MAX_KEYS) {
-		state.truncated = true;
+		state.incomplete = true;
 		return keys.slice(0, DETAILS_MAX_KEYS);
 	}
 	return keys;
@@ -234,20 +277,20 @@ function sanitizeDetailJson(
 		return utf8Length(serialized) <= maxBytes ? serialized : null;
 	}
 	if (typeof value === "number") {
-		if (!Number.isFinite(value)) state.truncated = true;
+		if (!Number.isFinite(value)) state.incomplete = true;
 		const serialized = Number.isFinite(value) ? String(value) : JSON.stringify("[Unsupported:number]");
 		return utf8Length(serialized) <= maxBytes ? serialized : null;
 	}
 	if (typeof value !== "object") {
-		state.truncated = true;
+		state.incomplete = true;
 		return boundedJsonString(`[Unsupported:${typeof value}]`, maxBytes, state);
 	}
 	if (ancestors.has(value)) {
-		state.truncated = true;
+		state.incomplete = true;
 		return boundedJsonString("[Circular]", maxBytes, state);
 	}
 	if (depth >= DETAILS_MAX_DEPTH) {
-		state.truncated = true;
+		state.incomplete = true;
 		return boundedJsonString("[MaxDepth]", maxBytes, state);
 	}
 
@@ -255,14 +298,14 @@ function sanitizeDetailJson(
 	try {
 		if (Array.isArray(value)) {
 			if (maxBytes < 2) return null;
-			if (value.length > DETAILS_MAX_ARRAY) state.truncated = true;
+			if (value.length > DETAILS_MAX_ARRAY) state.incomplete = true;
 			const parts: string[] = [];
 			let used = 2;
 			for (const item of value.slice(0, DETAILS_MAX_ARRAY)) {
 				const separatorBytes = parts.length === 0 ? 0 : 1;
 				const child = sanitizeDetailJson(item, depth + 1, ancestors, maxBytes - used - separatorBytes, state);
 				if (child === null) {
-					state.truncated = true;
+					state.incomplete = true;
 					break;
 				}
 				parts.push(child);
@@ -280,7 +323,7 @@ function sanitizeDetailJson(
 			const separatorBytes = parts.length === 0 ? 0 : 1;
 			const overhead = separatorBytes + utf8Length(keyJson) + 1;
 			if (used + overhead >= maxBytes) {
-				state.truncated = true;
+				state.incomplete = true;
 				break;
 			}
 			let child: string | null;
@@ -293,11 +336,11 @@ function sanitizeDetailJson(
 					state,
 				);
 			} catch {
-				state.truncated = true;
+				state.incomplete = true;
 				child = boundedJsonString("[Unreadable]", maxBytes - used - overhead, state);
 			}
 			if (child === null) {
-				state.truncated = true;
+				state.incomplete = true;
 				continue;
 			}
 			parts.push(`${keyJson}:${child}`);
@@ -309,24 +352,56 @@ function sanitizeDetailJson(
 	}
 }
 
+function boundedStructuredRef(value: unknown, maxBytes: number): string {
+	const state: SanitizeState = { valueTruncated: false, incomplete: false };
+	try {
+		return sanitizeDetailJson(value, 0, new Set(), maxBytes, state) ?? "[unserializable]";
+	} catch {
+		return "[unserializable]";
+	}
+}
+
+interface FailureScanState {
+	remainingNodes: number;
+	remainingKeys: number;
+	incomplete: boolean;
+}
+
 function summarizeFailures(
 	value: unknown,
 	depth = 0,
 	ancestors: Set<object> = new Set(),
+	state: FailureScanState = {
+		remainingNodes: FAILURE_SCAN_MAX_NODES,
+		remainingKeys: FAILURE_SCAN_MAX_KEYS,
+		incomplete: false,
+	},
 ): { failure: boolean; incomplete: boolean } {
 	if (typeof value !== "object" || value === null) return { failure: false, incomplete: false };
-	if (ancestors.has(value) || depth >= FAILURE_SCAN_MAX_DEPTH) return { failure: false, incomplete: true };
+	if (ancestors.has(value) || depth >= FAILURE_SCAN_MAX_DEPTH) {
+		state.incomplete = true;
+		return { failure: false, incomplete: true };
+	}
+	if (state.remainingNodes <= 0) {
+		state.incomplete = true;
+		return { failure: false, incomplete: true };
+	}
+	state.remainingNodes--;
 	ancestors.add(value);
 	let failure = false;
-	let incomplete = false;
 	try {
 		for (const key in value) {
 			if (!Object.hasOwn(value, key)) continue;
+			if (state.remainingKeys <= 0) {
+				state.incomplete = true;
+				break;
+			}
+			state.remainingKeys--;
 			let child: unknown;
 			try {
 				child = (value as Record<string, unknown>)[key];
 			} catch {
-				incomplete = true;
+				state.incomplete = true;
 				continue;
 			}
 			if (["exitCode", "exit", "code"].includes(key)) {
@@ -337,16 +412,15 @@ function summarizeFailures(
 				if (["failed", "failure", "error", "aborted", "cancelled"].includes(child.toLowerCase())) failure = true;
 			}
 			if (key === "error" && (child === true || (typeof child === "string" && child.length > 0))) failure = true;
-			const nested = summarizeFailures(child, depth + 1, ancestors);
+			const nested = summarizeFailures(child, depth + 1, ancestors, state);
 			failure ||= nested.failure;
-			incomplete ||= nested.incomplete;
 		}
 	} catch {
-		incomplete = true;
+		state.incomplete = true;
 	} finally {
 		ancestors.delete(value);
 	}
-	return { failure, incomplete };
+	return { failure, incomplete: state.incomplete };
 }
 
 export class ToolEventCollector {
@@ -772,12 +846,12 @@ export class ToolEventCollector {
 	 */
 	private truncateParams(params: object): Record<string, unknown> {
 		const result: Record<string, unknown> = {};
-		const state: SanitizeState = { truncated: false };
+		const state: SanitizeState = { valueTruncated: false, incomplete: false };
 		let count = 0;
 		for (const key in params) {
 			if (!Object.hasOwn(params, key)) continue;
 			if (count >= DETAILS_MAX_KEYS) {
-				state.truncated = true;
+				state.incomplete = true;
 				break;
 			}
 			const storedKey = boundedStorageKey(key, state);
@@ -785,7 +859,7 @@ export class ToolEventCollector {
 				result[storedKey] = this.truncateValue((params as Record<string, unknown>)[key]);
 			} catch {
 				result[storedKey] = "[Unreadable]";
-				state.truncated = true;
+				state.incomplete = true;
 			}
 			count++;
 		}
@@ -827,17 +901,9 @@ export class ToolEventCollector {
 	 */
 	private extractResultRef(event: ToolResultEvent | LegacySyntheticToolResultEvent): string {
 		if (isOfficialToolResultEvent(event)) {
-			const text = event.content
-				.filter((item) => item.type === "text")
-				.map((item) => item.text)
-				.join("\n");
+			const text = boundedTextContent(event.content, RESULT_REF_MAX_BYTES);
 			if (text) return boundedUtf8(text, RESULT_REF_MAX_BYTES, "result");
-			try {
-				const json = JSON.stringify(event.details ?? event) ?? "[undefined]";
-				return boundedUtf8(json, RESULT_REF_MAX_BYTES, "result");
-			} catch {
-				return "[unserializable]";
-			}
+			return boundedStructuredRef(event.details ?? event, RESULT_REF_MAX_BYTES);
 		}
 		if (typeof event.resultRef === "string") return boundedUtf8(event.resultRef, RESULT_REF_MAX_BYTES, "result");
 		if (typeof event.content === "string") {
@@ -846,12 +912,7 @@ export class ToolEventCollector {
 		if (typeof event.output === "string") {
 			return boundedUtf8(event.output, RESULT_REF_MAX_BYTES, "result");
 		}
-		try {
-			const json = JSON.stringify(event.result ?? event) ?? "[undefined]";
-			return boundedUtf8(json, RESULT_REF_MAX_BYTES, "result");
-		} catch {
-			return "[unserializable]";
-		}
+		return boundedStructuredRef(event.result ?? event, RESULT_REF_MAX_BYTES);
 	}
 
 	private extractStructuredDetails(event: ToolResultEvent | LegacySyntheticToolResultEvent): DetailSummary {
@@ -859,7 +920,7 @@ export class ToolEventCollector {
 		if (typeof value !== "object" || value === null || Array.isArray(value)) {
 			return { truncated: false, failure: false };
 		}
-		const state: SanitizeState = { truncated: false };
+		const state: SanitizeState = { valueTruncated: false, incomplete: false };
 		const failureSummary = summarizeFailures(value);
 		try {
 			const serialized = sanitizeDetailJson(value, 0, new Set(), DETAILS_MAX_BYTES, state);
@@ -870,7 +931,7 @@ export class ToolEventCollector {
 					typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
 						? (parsed as Record<string, unknown>)
 						: undefined,
-				truncated: state.truncated || failureSummary.incomplete,
+				truncated: state.incomplete || failureSummary.incomplete,
 				failure: failureSummary.failure,
 			};
 		} catch {

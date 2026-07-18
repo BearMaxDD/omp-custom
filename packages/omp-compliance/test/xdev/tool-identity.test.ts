@@ -48,6 +48,23 @@ describe("canonicalizeToolIdentity", () => {
 		);
 	});
 
+	it("规范化 HOST v17 createMCPToolName 生成的单下划线正式 FQN", () => {
+		expectIdentity(
+			canonicalizeToolIdentity({
+				toolName: "mcp__codebase_memory_mcp_search_graph",
+				args: { query: "host-v17" },
+			}),
+			{
+				transport: "mcp",
+				serverId: "codebase-memory-mcp",
+				toolName: "search_graph",
+				qualifiedName: "codebase-memory-mcp.search_graph",
+				args: { query: "host-v17" },
+				access: "read",
+			},
+		);
+	});
+
 	it("canonical JSON 按键排序且 fingerprint 与对象插入顺序无关", () => {
 		const a = { z: [3, { b: true, a: null }], a: "value" };
 		const b = { a: "value", z: [3, { a: null, b: true }] };
@@ -128,7 +145,6 @@ describe("canonicalizeToolIdentity", () => {
 		expect(
 			canonicalizeToolIdentity({ toolName: "delete_project", serverName: "codebase-memory-mcp", args: {} }),
 		).toBeNull();
-		expect(canonicalizeToolIdentity({ toolName: "mcp__codebase_memory_mcp_search_graph", args: {} })).toBeNull();
 		expect(canonicalizeToolIdentity({ toolName: "mcp__other_codebase_memory_mcp__search_graph", args: {} })).toBeNull();
 	});
 

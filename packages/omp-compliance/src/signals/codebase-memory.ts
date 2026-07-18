@@ -40,6 +40,7 @@ const QUERY_TOOLS: ReadonlySet<string> = new Set([
 
 /** The MCP server name expected for codebase-memory tools. */
 const EXPECTED_SERVER = "codebase-memory";
+const EXPECTED_QUALIFIED_PREFIX = "codebase-memory-mcp.";
 
 /**
  * Input types accepted by normalizeCodebaseMemory.
@@ -61,17 +62,11 @@ interface SingleInput {
  * - other tools:      never considered index-readiness
  */
 export function codebaseIndexReady(toolName: string, result: { success: boolean; status?: string }): boolean {
-	const normalizedToolName = shortToolName(toolName);
 	return (
 		result.success === true &&
-		((normalizedToolName === "index_repository" && (result.status === "indexed" || result.status === "ready")) ||
-			(normalizedToolName === "index_status" && result.status === "ready"))
+		((toolName === "index_repository" && (result.status === "indexed" || result.status === "ready")) ||
+			(toolName === "index_status" && result.status === "ready"))
 	);
-}
-
-function shortToolName(toolName: string): string {
-	const dotted = toolName.split(".").pop() ?? toolName;
-	return dotted.split("__").pop() ?? dotted;
 }
 
 /**
@@ -115,23 +110,21 @@ export function normalizeCodebaseMemory(paired: PairedInput | SingleInput): {
 	for (const { call, result } of paired) {
 		const toolName = call.toolName;
 		const serverName = call.serverName ?? "";
-		const shortName = shortToolName(toolName);
 
 		if (serverName !== EXPECTED_SERVER) continue;
-
-		// Extract the short tool name (strip server prefix if FQN)
-		if (!RECOGNIZED_TOOLS.has(shortName)) continue;
+		if (call.qualifiedName !== `${EXPECTED_QUALIFIED_PREFIX}${toolName}`) continue;
+		if (!RECOGNIZED_TOOLS.has(toolName)) continue;
 
 		const success = result?.success ?? false;
 
 		// Failed and missing results never establish retrieval evidence.
-		if (result?.success === true && QUERY_TOOLS.has(shortName)) {
+		if (result?.success === true && QUERY_TOOLS.has(toolName)) {
 			const refs = extractReferences(result.resultRef);
 			allRefs.push(...refs);
 		}
 
-		if (result?.success === true && QUERY_TOOLS.has(shortName)) {
-			queryNames.push(shortName);
+		if (result?.success === true && QUERY_TOOLS.has(toolName)) {
+			queryNames.push(toolName);
 		}
 
 		evidences.push({

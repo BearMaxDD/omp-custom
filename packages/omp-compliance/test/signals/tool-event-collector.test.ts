@@ -759,6 +759,101 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 		expect(snap.subagentDelegations[0]).toMatchObject({ status: "insufficient", codebaseRefs: [] });
 	});
 
+	it("多块大文本按字节预算增量构造 resultRef，不调用数组 filter/map/join", () => {
+		collector.recordCall(makeCall("bash", {}, "bounded-text-blocks"));
+		const content = [
+			{ type: "text", text: "a".repeat(1024 * 1024) },
+			{ type: "text", text: "b".repeat(1024 * 1024) },
+		] as ToolResultEvent["content"] & {
+			filter: never;
+			map: never;
+			join: never;
+		};
+		Object.defineProperties(content, {
+			filter: {
+				value: () => {
+					throw new Error("不得调用 filter");
+				},
+			},
+			map: {
+				value: () => {
+					throw new Error("不得调用 map");
+				},
+			},
+			join: {
+				value: () => {
+					throw new Error("不得调用 join");
+				},
+			},
+		});
+
+		expect(() =>
+			collector.recordResult({
+				type: "tool_result",
+				toolName: "bash",
+				toolCallId: "bounded-text-blocks",
+				input: {},
+				isError: false,
+				content,
+				details: undefined,
+			}),
+		).not.toThrow();
+		expect(new TextEncoder().encode(collector.snapshot().results[0].resultRef).byteLength).toBeLessThanOrEqual(2048);
+	});
+
+	it("failure 摘要对宽对象使用全局键预算并标记扫描不完整", () => {
+		let reads = 0;
+		const wide: Record<string, unknown> = {};
+		for (let index = 0; index < 10_000; index++) {
+			Object.defineProperty(wide, `key-${index}`, {
+				enumerable: true,
+				get: () => {
+					reads++;
+					return 0;
+				},
+			});
+		}
+		collector.recordCall(makeCall("bash", {}, "wide-failure-scan"));
+		collector.recordResult({
+			type: "tool_result",
+			toolName: "bash",
+			toolCallId: "wide-failure-scan",
+			input: {},
+			isError: false,
+			content: [{ type: "text", text: "ok" }],
+			details: wide,
+		});
+
+		expect(reads).toBeLessThan(10_000);
+		expect(collector.snapshot().results[0].detailsTruncated).toBe(true);
+	});
+
+	it("failure 摘要对大数组使用全局节点预算并标记扫描不完整", () => {
+		let reads = 0;
+		const large = Array.from({ length: 10_000 }, () =>
+			Object.defineProperty({}, "exitCode", {
+				enumerable: true,
+				get: () => {
+					reads++;
+					return 0;
+				},
+			}),
+		);
+		collector.recordCall(makeCall("bash", {}, "large-failure-scan"));
+		collector.recordResult({
+			type: "tool_result",
+			toolName: "bash",
+			toolCallId: "large-failure-scan",
+			input: {},
+			isError: false,
+			content: [{ type: "text", text: "ok" }],
+			details: { results: large },
+		});
+
+		expect(reads).toBeLessThan(10_000);
+		expect(collector.snapshot().results[0].detailsTruncated).toBe(true);
+	});
+
 	it("2MiB 长期字符串字段与 Map key 均保持固定字节预算", () => {
 		const huge = "超长字段".repeat(256 * 1024);
 		const context = {

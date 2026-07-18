@@ -33,9 +33,7 @@ export function normalizeTaskDelegation(
 	const results: TaskDelegationEvidence[] = [];
 
 	for (const { call, result } of paired) {
-		// Only match the official "task" tool
-		const shortName = call.toolName.includes(".") ? (call.toolName.split(".").pop() ?? call.toolName) : call.toolName;
-		if (shortName !== TASK_TOOL_NAME) continue;
+		if (call.toolName !== TASK_TOOL_NAME) continue;
 
 		if (!result) {
 			// Call with no result → insufficient evidence
@@ -169,10 +167,85 @@ function collectOutputArtifacts(details: Record<string, unknown>): string[] {
 	return [...new Set(artifacts)];
 }
 
+const AGENT_SOURCES = new Set(["bundled", "user", "project"]);
+
 function isTaskToolDetails(
 	details: Record<string, unknown>,
 ): details is Record<string, unknown> & { results: unknown[] } {
-	return Array.isArray(details.results);
+	if (
+		!(details.projectAgentsDir === null || typeof details.projectAgentsDir === "string") ||
+		!Array.isArray(details.results) ||
+		!isFiniteNumber(details.totalDurationMs)
+	) {
+		return false;
+	}
+	if (details.outputPaths !== undefined && !isStringArray(details.outputPaths)) return false;
+	if (details.async !== undefined && !isTaskAsyncDetails(details.async)) return false;
+	return details.results.every(isSingleResult);
+}
+
+function isSingleResult(value: unknown): value is Record<string, unknown> {
+	const result = readRecord(value);
+	if (!result) return false;
+	if (
+		!isFiniteNumber(result.index) ||
+		!isNonEmptyString(result.id) ||
+		!isNonEmptyString(result.agent) ||
+		!AGENT_SOURCES.has(String(result.agentSource)) ||
+		typeof result.task !== "string" ||
+		!isFiniteNumber(result.exitCode) ||
+		typeof result.output !== "string" ||
+		typeof result.stderr !== "string" ||
+		typeof result.truncated !== "boolean" ||
+		!isFiniteNumber(result.durationMs) ||
+		!isFiniteNumber(result.tokens) ||
+		!isFiniteNumber(result.requests)
+	) {
+		return false;
+	}
+	for (const key of [
+		"assignment",
+		"description",
+		"lastIntent",
+		"error",
+		"abortReason",
+		"outputPath",
+		"patchPath",
+		"branchName",
+		"branchBaseSha",
+		"resolvedModel",
+	] as const) {
+		if (result[key] !== undefined && typeof result[key] !== "string") return false;
+	}
+	if (result.aborted !== undefined && typeof result.aborted !== "boolean") return false;
+	if (result.modelOverride !== undefined && !isStringOrStringArray(result.modelOverride)) return false;
+	return true;
+}
+
+function isTaskAsyncDetails(value: unknown): boolean {
+	const details = readRecord(value);
+	return (
+		details !== undefined &&
+		["running", "completed", "failed"].includes(String(details.state)) &&
+		isNonEmptyString(details.jobId) &&
+		details.type === "task"
+	);
+}
+
+function isStringArray(value: unknown): value is string[] {
+	return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isStringOrStringArray(value: unknown): boolean {
+	return typeof value === "string" || isStringArray(value);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0;
+}
+
+function isFiniteNumber(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value);
 }
 
 function readRecord(value: unknown): Record<string, unknown> | undefined {

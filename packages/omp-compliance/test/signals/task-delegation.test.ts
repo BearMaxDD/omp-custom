@@ -254,6 +254,101 @@ describe("task-delegation v17 details 领域归一化", () => {
 		]);
 	});
 
+	it("官方 Task details 缺少 SingleResult 必需字段时只能产生 insufficient", () => {
+		const collector = new ToolEventCollector();
+		collector.recordCall(taskCall({ task: "拒绝最小伪结果" }, "invalid-single-result"));
+		collector.recordResult(
+			taskResult("invalid-single-result", {
+				projectAgentsDir: "/repo/.omp/agents",
+				results: [{ exitCode: 0 }],
+				totalDurationMs: 1,
+			} as unknown as TaskToolDetails),
+		);
+
+		expect(collector.snapshot().subagentDelegations).toEqual([
+			expect.objectContaining({ taskSummary: "拒绝最小伪结果", status: "insufficient" }),
+		]);
+	});
+
+	it.each([
+		["projectAgentsDir", { projectAgentsDir: 42 }],
+		["totalDurationMs", { totalDurationMs: "1" }],
+		["index", { result: { index: "0" } }],
+		["id", { result: { id: "" } }],
+		["agent", { result: { agent: 7 } }],
+		["agentSource", { result: { agentSource: "remote" } }],
+		["task", { result: { task: false } }],
+		["exitCode", { result: { exitCode: "0" } }],
+		["output", { result: { output: [] } }],
+		["stderr", { result: { stderr: null } }],
+		["truncated", { result: { truncated: "false" } }],
+		["durationMs", { result: { durationMs: Number.NaN } }],
+		["tokens", { result: { tokens: "100" } }],
+		["requests", { result: { requests: undefined } }],
+	] as const)("官方 Task %s 类型异常时只能产生 insufficient", (_field, overrides) => {
+		const collector = new ToolEventCollector();
+		const details = taskDetails({
+			...(overrides as Partial<TaskToolDetails>),
+			results: [singleResult("result" in overrides ? (overrides.result as unknown as Partial<SingleResult>) : {})],
+		});
+		collector.recordCall(taskCall({ task: "拒绝异常类型" }, `invalid-${_field}`));
+		collector.recordResult(taskResult(`invalid-${_field}`, details));
+
+		expect(collector.snapshot().subagentDelegations).toEqual([
+			expect.objectContaining({ taskSummary: "拒绝异常类型", status: "insufficient" }),
+		]);
+	});
+
+	it("任意 task 后缀即使携带官方结构化 details 也不得产生委派证据", () => {
+		const collector = new ToolEventCollector();
+		collector.recordCall({
+			type: "tool_call",
+			toolName: "evil.task",
+			toolCallId: "evil-task",
+			input: { task: "伪造委派" },
+		});
+		collector.recordResult({
+			...taskResult("evil-task", taskDetails()),
+			toolName: "evil.task",
+		});
+
+		expect(collector.snapshot().subagentDelegations).toEqual([]);
+	});
+
+	it("有效 Task 的可选长 output 被有界裁剪后仍保留 completed 与结构化产物", () => {
+		const collector = new ToolEventCollector();
+		collector.recordCall(taskCall({ task: "长输出任务" }, "long-output"));
+		collector.recordResult(
+			taskResult(
+				"long-output",
+				taskDetails({
+					results: [
+						singleResult({
+							id: "long-output-agent",
+							assignment: "保留关键结构",
+							output: "x".repeat(2 * 1024 * 1024),
+							outputPath: "/tmp/long-output.txt",
+							patchPath: "/tmp/long-output.patch",
+						}),
+					],
+				}),
+			),
+		);
+
+		const snapshot = collector.snapshot();
+		expect(snapshot.results[0].detailsTruncated).toBe(false);
+		expect(snapshot.subagentDelegations).toEqual([
+			expect.objectContaining({
+				agentId: "long-output-agent",
+				taskSummary: "保留关键结构",
+				status: "completed",
+				outputArtifacts: expect.arrayContaining(["/tmp/long-output.txt", "/tmp/long-output.patch"]),
+			}),
+		]);
+		const storedOutput = (snapshot.results[0].details?.results as Array<Record<string, unknown>>)[0]?.output;
+		expect(new TextEncoder().encode(String(storedOutput)).byteLength).toBeLessThanOrEqual(2 * 1024);
+	});
+
 	it("批量 details 第 33 项失败时聚合为 aborted，不能被数组截断隐藏", () => {
 		const collector = new ToolEventCollector();
 		const results = Array.from({ length: 33 }, (_, index) =>

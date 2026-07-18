@@ -34,7 +34,7 @@ function mcpResult(
 describe("codebase-memory Task 8 可信 server 边界", () => {
 	it("正式 v17 MCP FQN 无 serverName 仍从精确 FQN 建立 Evidence", () => {
 		const collector = new ToolEventCollector();
-		const toolName = "mcp__codebase_memory_mcp__search_graph";
+		const toolName = "mcp__codebase_memory_mcp_search_graph";
 		collector.recordCall({ type: "tool_call", toolName, toolCallId: toolName, input: { query: "trusted" } });
 		collector.recordResult({
 			type: "tool_result",
@@ -64,6 +64,24 @@ describe("codebase-memory Task 8 可信 server 边界", () => {
 			content: [{ type: "text", text: "packages/omp-compliance/src/extension.ts" }],
 			isError: false,
 			details: { file_path: "packages/omp-compliance/src/extension.ts" },
+		});
+
+		expect(collector.snapshot().codebaseMemory).toEqual({ indexReady: false, queries: [], references: [] });
+	});
+
+	it("canonical identity 拒绝的任意工具后缀不得伪造 Codebase Evidence", () => {
+		const collector = new ToolEventCollector();
+		collector.recordCall({
+			toolName: "evil.search_graph",
+			toolCallId: "evil-search-graph",
+			serverName: "codebase-memory",
+			params: { query: "spoofed" },
+		});
+		collector.recordResult({
+			toolName: "evil.search_graph",
+			toolCallId: "evil-search-graph",
+			success: true,
+			resultRef: "packages/forged.ts",
 		});
 
 		expect(collector.snapshot().codebaseMemory).toEqual({ indexReady: false, queries: [], references: [] });
