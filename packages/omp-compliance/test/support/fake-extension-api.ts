@@ -24,6 +24,7 @@ export class FakeExtensionAPI {
 	public readonly tools: string[] = [];
 	public readonly toolDefinitions: ToolDefinition[] = [];
 	public readonly commands: string[] = [];
+	public readonly commandHandlers = new Map<string, RegisteredCommand["handler"]>();
 	public readonly eventHandlers: Map<string, Array<(event: unknown, context?: ExtensionContext) => unknown>> =
 		new Map();
 	public readonly sentMessages: CustomMessagePayload[] = [];
@@ -55,6 +56,7 @@ export class FakeExtensionAPI {
 		},
 	): void {
 		this.commands.push(name);
+		this.commandHandlers.set(name, _options.handler);
 	}
 
 	on(event: string, handler: (event: unknown, context?: ExtensionContext) => unknown): void {
@@ -158,6 +160,17 @@ export class FakeExtensionAPI {
 		for (const handler of handlers) {
 			await handler({ type: "session_start" }, context);
 		}
+	}
+
+	async fireSessionSwitch(context: ExtensionContext = this.createContext()): Promise<void> {
+		const handlers = this.eventHandlers.get("session_switch") ?? [];
+		for (const handler of handlers) await handler({ type: "session_switch" }, context);
+	}
+
+	async fireCommand(name: string, args: string): Promise<void> {
+		const handler = this.commandHandlers.get(name);
+		if (!handler) throw new Error(`Command not registered: ${name}`);
+		await handler(args, this.createContext());
 	}
 
 	/** Return which tool names would be blocked by handlers (for compliance assertions). */

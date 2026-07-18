@@ -1,5 +1,7 @@
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { realpathSync } from "node:fs";
+import { join, normalize, sep } from "node:path";
 import type {
 	AdvisorBeforeRunEvent,
 	AdvisorReviewCapabilities,
@@ -38,14 +40,27 @@ import { createTopicReadyTool } from "./brainstorm/topic-ready-tool";
 import { TopicStore } from "./brainstorm/topic-store";
 import { registerBrainstormCommand } from "./commands/brainstorm-command";
 import { registerComplianceCommand } from "./commands/compliance-command";
+import { loadComplianceContract } from "./contract/load-contract";
+import type { TaskContract } from "./contract/types";
+import { loadTaskContractFromTdd } from "./contracts/task-contract";
 import { deterministicEvidenceEventId } from "./evidence/event-log";
 import { EvidenceRepository } from "./evidence/evidence-repository";
 import { EvidenceStore } from "./evidence/evidence-store";
+import type { ProjectBinding } from "./project/project-identity";
 import { ProjectIdentityStore } from "./project/project-identity";
-import { ComplianceRuntime, readAuthoritativeGitContext } from "./runtime/compliance-runtime";
+import {
+	ComplianceRuntime,
+	type StrictCompletionEvidence,
+	readAuthoritativeGitContext,
+} from "./runtime/compliance-runtime";
 import { type CanonicalBuiltinToolIdentity, type CanonicalToolCall, PreToolPolicy } from "./runtime/pre-tool-policy";
 import { JsonFileReviewSchedulerStore, ReviewScheduler } from "./scheduler/review-scheduler";
-import { CollectorRuntime } from "./signals/collector-runtime";
+import {
+	createCodebaseEvidencePack,
+	createTrustedCodebaseValidationContext,
+	validateCodebasePack,
+} from "./signals/codebase-memory";
+import { type CollectorRuntime, createControlledCollectorRuntime } from "./signals/collector-runtime";
 import { registerComplianceCompleteTool } from "./tools/compliance-complete-tool";
 import { unwrapToolCallEvent } from "./xdev/event-unwrapper";
 import { canonicalArgsFingerprint } from "./xdev/tool-identity";
@@ -72,6 +87,90 @@ const ADVISOR_LIFECYCLE_EVENTS = [
 
 function evidenceRevision(value: string | undefined): `sha256:${string}` {
 	return value?.startsWith("sha256:") ? (value as `sha256:${string}`) : UNBOUND_EVIDENCE_REVISION;
+}
+
+function repositoryRoot(cwd: string): string {
+	const canonicalCwd = normalize(realpathSync(cwd)).split(sep).join("/");
+	const result = spawnSync("git", ["-C", canonicalCwd, "rev-parse", "--show-toplevel"], {
+		encoding: "utf8",
+	});
+	const root = result.status === 0 && result.stdout.trim() ? result.stdout.trim() : canonicalCwd;
+	return normalize(realpathSync(root)).split(sep).join("/");
+}
+
+function codebaseProjectForRoot(root: string): string {
+	return root.replace(/^\/+/, "").replaceAll("/", "-");
+}
+
+function tddFileEntry(value: string): string {
+	return value
+		.replace(/^\s*(?:[-*+]\s+|\d+[.)]\s+)/, "")
+		.replace(/^`|`$/g, "")
+		.trim();
+}
+
+function gitChangedFiles(root: string): { changedFiles: string[]; newFiles: string[] } {
+	const tracked = spawnSync("git", ["-C", root, "diff", "--name-only", "HEAD"], { encoding: "utf8" });
+	const untracked = spawnSync("git", ["-C", root, "ls-files", "--others", "--exclude-standard"], {
+		encoding: "utf8",
+	});
+	const newFiles =
+		untracked.status === 0
+			? untracked.stdout
+					.split("\n")
+					.filter(Boolean)
+					.filter((path) => !path.startsWith(".omp/"))
+			: [];
+	const changedFiles = [
+		...(tracked.status === 0
+			? tracked.stdout
+					.split("\n")
+					.filter(Boolean)
+					.filter((path) => !path.startsWith(".omp/"))
+			: []),
+		...newFiles,
+	];
+	return { changedFiles: [...new Set(changedFiles)].sort(), newFiles: [...new Set(newFiles)].sort() };
+}
+
+function evidenceMetadata(collector: CollectorRuntime): {
+	indexRevision?: string;
+	queriedAt: string;
+	requiredSymbols: string[];
+} {
+	const snapshot = collector.collector.snapshot();
+	let indexRevision: string | undefined;
+	let latestResult = 0;
+	const requiredSymbols = new Set<string>();
+	for (const result of snapshot.results) {
+		latestResult = Math.max(latestResult, Date.parse(result.timestamp) || 0);
+		if (result.success && result.details?.status === "ready" && typeof result.details.revision === "string") {
+			indexRevision = result.details.revision;
+		}
+		const pending: unknown[] = result.details ? [result.details] : [];
+		let visited = 0;
+		while (pending.length > 0 && visited < 256) {
+			visited += 1;
+			const value = pending.pop();
+			if (Array.isArray(value)) {
+				pending.push(...value);
+				continue;
+			}
+			if (!value || typeof value !== "object") continue;
+			for (const [key, child] of Object.entries(value)) {
+				if ((key === "qualified_name" || key === "qualifiedName") && typeof child === "string" && child.trim()) {
+					requiredSymbols.add(child.trim());
+				} else if (child && typeof child === "object") {
+					pending.push(child);
+				}
+			}
+		}
+	}
+	return {
+		indexRevision,
+		queriedAt: new Date(Math.max(Date.now(), latestResult + 1)).toISOString(),
+		requiredSymbols: [...requiredSymbols].sort(),
+	};
 }
 
 export interface ComplianceExtensionHost {
@@ -131,6 +230,8 @@ function createLazyBrainstormInfra(repoRoot: string): () => { coordinator: Topic
 }
 
 interface RuntimeBundle {
+	readonly sessionId: string;
+	readonly root: string;
 	readonly collector: CollectorRuntime;
 	readonly runtime: ComplianceRuntime;
 	readonly registry: ComplianceReviewRegistry;
@@ -139,11 +240,20 @@ interface RuntimeBundle {
 	readonly getBrainstormRuntime: () => BrainstormRuntime;
 	readonly retryBrainstormDueReviews: () => Promise<void>;
 	readonly ensureSchedulerReady: () => Promise<void>;
-	readonly evaluateToolCall: (event: ToolCallEvent, context: ExtensionContext) => ToolCallEventResult | undefined;
+	readonly initialize: () => Promise<void>;
+	readonly prepareTask: (tddPath: string) => void;
+	readonly evaluateToolCall: (
+		event: ToolCallEvent,
+		context: ExtensionContext,
+	) => Promise<ToolCallEventResult | undefined>;
 	readonly handleAdvisorLifecycle: (event: AdvisorReviewLifecycleEvent) => Promise<void>;
 }
 
-function canonicalPreToolCall(event: ToolCallEvent, runtime: ComplianceRuntime): CanonicalToolCall | undefined {
+function canonicalPreToolCall(
+	event: ToolCallEvent,
+	runtime: ComplianceRuntime,
+	currentRevision: `sha256:${string}`,
+): CanonicalToolCall | undefined {
 	const state = runtime.currentTaskState;
 	const codebase = unwrapToolCallEvent(event);
 	if (codebase) {
@@ -152,7 +262,7 @@ function canonicalPreToolCall(event: ToolCallEvent, runtime: ComplianceRuntime):
 			taskId: state?.taskId ?? "unbound-task",
 			callId: codebase.toolCallId,
 			identity: codebase.identity,
-			evidenceRevision: evidenceRevision(state?.evidenceRevision),
+			evidenceRevision: currentRevision,
 		};
 	}
 	const toolName = GOVERNED_BUILTINS.get(event.toolName);
@@ -173,12 +283,19 @@ function canonicalPreToolCall(event: ToolCallEvent, runtime: ComplianceRuntime):
 		taskId: state?.taskId ?? "unbound-task",
 		callId: event.toolCallId,
 		identity,
-		evidenceRevision: evidenceRevision(state?.evidenceRevision),
+		evidenceRevision: currentRevision,
 	};
 }
 
-function createRuntimeBundle(api: ComplianceExtensionHost, repoRoot: string, sessionId: () => string): RuntimeBundle {
-	const collector = new CollectorRuntime();
+function createRuntimeBundle(
+	api: ComplianceExtensionHost,
+	repoRoot: string,
+	activeSessionId: string,
+	projectBinding: Readonly<ProjectBinding>,
+): RuntimeBundle {
+	const controlledCollector = createControlledCollectorRuntime();
+	const collector = controlledCollector.runtime;
+	const sessionId = () => activeSessionId;
 	const getEvidenceStore = createLazyEvidenceStore(repoRoot);
 	const getBrainstormInfra = createLazyBrainstormInfra(repoRoot);
 	const registry = new ComplianceReviewRegistry();
@@ -216,11 +333,56 @@ function createRuntimeBundle(api: ComplianceExtensionHost, repoRoot: string, ses
 		schedulerReady ??= scheduler.restore();
 		return schedulerReady;
 	};
+	const policyEvidence = new EvidenceRepository(join(repoRoot, DEFAULT_COMPLIANCE_DIR), repoRoot);
+	const codebaseProject = projectBinding.codebaseProjectId;
+	if (!codebaseProject) throw new Error("Compliance project is not bound to a Codebase project");
+	let preparedTaskContract: TaskContract | undefined;
+	const strictEvidence = (): StrictCompletionEvidence => {
+		if (!preparedTaskContract) throw new Error("TaskContract is not bound to the active task");
+		const metadata = evidenceMetadata(collector);
+		if (!metadata.indexRevision || metadata.requiredSymbols.length === 0) {
+			return { taskContract: preparedTaskContract, delegations: [] };
+		}
+		const git = readAuthoritativeGitContext(repoRoot);
+		const changed = gitChangedFiles(repoRoot);
+		const codebaseContext = createTrustedCodebaseValidationContext(controlledCollector.reader, {
+			taskContract: preparedTaskContract,
+			codebaseProjectId: codebaseProject,
+			currentDiffHash: git.diffHash,
+			indexRevision: metadata.indexRevision,
+			queriedAt: metadata.queriedAt,
+			changedFiles: changed.changedFiles,
+			newFiles: changed.newFiles,
+			allowedNewFileRoots: [],
+			unresolvedClaims: [],
+			requiredSymbols: metadata.requiredSymbols,
+		});
+		const codebasePack = createCodebaseEvidencePack(codebaseContext);
+		const packErrors = validateCodebasePack(codebasePack, codebaseContext);
+		if (packErrors.length > 0) throw new Error(`Codebase Evidence Pack rejected: ${packErrors.join(",")}`);
+		return {
+			taskContract: preparedTaskContract,
+			codebaseContext,
+			codebasePack,
+			delegations: [],
+		};
+	};
+	const prepareTask = (tddPath: string): void => {
+		const absolutePath = tddPath.startsWith("/") ? tddPath : join(repoRoot, tddPath);
+		const complianceContract = loadComplianceContract(absolutePath, repoRoot);
+		const git = readAuthoritativeGitContext(repoRoot);
+		const declaredFiles = complianceContract.summary.files.map(tddFileEntry).filter(Boolean);
+		const affectedFiles = declaredFiles.length > 0 ? declaredFiles : [complianceContract.tddPath];
+		preparedTaskContract = loadTaskContractFromTdd(absolutePath, repoRoot, {
+			projectId: projectBinding.projectId,
+			gitHead: git.gitHead,
+			affectedFiles,
+		});
+		policyEvidence.task(preparedTaskContract.taskId).contract.write(preparedTaskContract);
+	};
 	const runtime = new ComplianceRuntime(getEvidenceStore, collector, api, repoRoot, reviewDeps, {
 		scheduler,
-		strictEvidence: () => {
-			throw new Error("Strict Completion Evidence is not bound to the active task");
-		},
+		strictEvidence,
 		gitContext: () => readAuthoritativeGitContext(repoRoot),
 		readEnvelope: async (taskId, reviewId) => {
 			const records = (await getEvidenceStore().readAll(taskId)) as Array<{
@@ -248,7 +410,7 @@ function createRuntimeBundle(api: ComplianceExtensionHost, repoRoot: string, ses
 			projectContext: () => {
 				const git = readAuthoritativeGitContext(repoRoot);
 				return {
-					projectId: `project-${createHash("sha256").update(repoRoot).digest("hex").slice(0, 32)}`,
+					projectId: projectBinding.projectId,
 					gitHead: git.gitHead,
 					diffHash: git.diffHash,
 				};
@@ -261,7 +423,6 @@ function createRuntimeBundle(api: ComplianceExtensionHost, repoRoot: string, ses
 	const retryBrainstormDueReviews = async (): Promise<void> => {
 		if (brainstormRuntime) await brainstormRuntime.retryDueReviews();
 	};
-	const policyEvidence = new EvidenceRepository(join(repoRoot, DEFAULT_COMPLIANCE_DIR), repoRoot);
 	const policy = new PreToolPolicy({
 		append: (record) => {
 			const taskId = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(record.task) ? record.task : "unbound-task";
@@ -273,15 +434,34 @@ function createRuntimeBundle(api: ComplianceExtensionHost, repoRoot: string, ses
 			});
 		},
 	});
-	const evaluateToolCall = (event: ToolCallEvent, context: ExtensionContext): ToolCallEventResult | undefined => {
-		const call = canonicalPreToolCall(event, runtime);
+	const evaluateToolCall = async (
+		event: ToolCallEvent,
+		context: ExtensionContext,
+	): Promise<ToolCallEventResult | undefined> => {
+		let evidence: StrictCompletionEvidence | undefined;
+		if (preparedTaskContract) evidence = strictEvidence();
+		const currentRevision =
+			evidence?.codebasePack?.evidenceRevision ?? evidenceRevision(runtime.currentTaskState?.evidenceRevision);
+		const call = canonicalPreToolCall(event, runtime, currentRevision);
 		let result: ToolCallEventResult | undefined;
 		if (call) {
-			const state = runtime.currentTaskState;
 			const decision = policy.evaluate(call, {
-				evidenceRevision: evidenceRevision(state?.evidenceRevision),
+				evidenceRevision: currentRevision,
+				projectContext: {
+					projectId: projectBinding.projectId,
+					root: projectBinding.canonicalRoot,
+					codebaseProject,
+				},
+				...(preparedTaskContract ? { contract: preparedTaskContract } : {}),
+				...(evidence?.codebasePack ? { codebasePack: evidence.codebasePack } : {}),
+				...(evidence?.codebaseContext ? { trustedCodebaseContext: evidence.codebaseContext } : {}),
 			});
-			if (!decision.allow) result = { block: true, reason: decision.reason };
+			if (!decision.allow) {
+				if (decision.evidenceWriteFailed) {
+					await runtime.stallForInfrastructure("Pre-tool Evidence persistence failed");
+				}
+				result = { block: true, reason: decision.reason };
+			}
 		}
 		collector.recordToolCall(event, context);
 		return result;
@@ -293,7 +473,15 @@ function createRuntimeBundle(api: ComplianceExtensionHost, repoRoot: string, ses
 		}
 		await runtime.handleAdvisorLifecycle(event);
 	};
+	const initialize = async (): Promise<void> => {
+		policyEvidence.recover();
+		await ensureSchedulerReady();
+		await runtime.retryDueReviews();
+		await retryBrainstormDueReviews();
+	};
 	return {
+		sessionId: activeSessionId,
+		root: repoRoot,
 		collector,
 		runtime,
 		registry,
@@ -302,15 +490,24 @@ function createRuntimeBundle(api: ComplianceExtensionHost, repoRoot: string, ses
 		getBrainstormRuntime,
 		retryBrainstormDueReviews,
 		ensureSchedulerReady,
+		initialize,
+		prepareTask,
 		evaluateToolCall,
 		handleAdvisorLifecycle,
 	};
 }
 
-function runtimeProxy(getRuntime: () => ComplianceRuntime): ComplianceRuntime {
+function runtimeProxy(getBundle: () => RuntimeBundle): ComplianceRuntime {
 	return new Proxy({} as ComplianceRuntime, {
 		get: (_target, property) => {
-			const runtime = getRuntime();
+			const bundle = getBundle();
+			const runtime = bundle.runtime;
+			if (property === "start") {
+				return async (tddPath: string) => {
+					bundle.prepareTask(tddPath);
+					return runtime.start(tddPath);
+				};
+			}
 			const value = Reflect.get(runtime, property, runtime) as unknown;
 			return typeof value === "function" ? value.bind(runtime) : value;
 		},
@@ -319,37 +516,39 @@ function runtimeProxy(getRuntime: () => ComplianceRuntime): ComplianceRuntime {
 
 export default function activate(api: ComplianceExtensionHost): void {
 	assertAdvisorProtocolV1(api as Pick<ExtensionAPI, "advisorReviewCapabilities" | "requestAdvisorReview">);
-	let root: string | undefined;
-	let activeSessionId: string | undefined;
-	let bundle: RuntimeBundle | undefined;
+	const bundlesBySession = new Map<string, RuntimeBundle>();
+	let activeBundle: RuntimeBundle | undefined;
 	const bindSession = async (context: ExtensionContext): Promise<void> => {
-		const identity = ProjectIdentityStore.open(context.cwd);
+		const root = repositoryRoot(context.cwd);
+		const identity = ProjectIdentityStore.open(context.cwd, { codebaseProjectId: codebaseProjectForRoot(root) });
 		if (identity.status !== "bound") throw new Error(`OMP project binding requires ${identity.status}`);
-		const nextRoot = identity.observedRoot;
-		if (root !== nextRoot) {
-			root = nextRoot;
-			bundle = undefined;
+		const sessionId = context.sessionManager.getSessionId();
+		let current = bundlesBySession.get(sessionId);
+		if (!current || current.root !== identity.observedRoot) {
+			current = createRuntimeBundle(api, identity.observedRoot, sessionId, identity.binding);
+			bundlesBySession.set(sessionId, current);
 		}
-		activeSessionId = context.sessionManager.getSessionId();
-		await getBundle().ensureSchedulerReady();
+		activeBundle = current;
+		await current.initialize();
 	};
 	const getBundle = (): RuntimeBundle => {
-		if (!root || !activeSessionId) throw new Error("Compliance session is not initialized");
-		bundle ??= createRuntimeBundle(api, root, () => {
-			if (!activeSessionId) throw new Error("Compliance session is not initialized");
-			return activeSessionId;
-		});
-		return bundle;
+		if (!activeBundle) throw new Error("Compliance session is not initialized");
+		return activeBundle;
 	};
-	const deferredRuntime = runtimeProxy(() => getBundle().runtime);
+	const bundleForSession = (sessionId: string): RuntimeBundle => bundlesBySession.get(sessionId) ?? getBundle();
+	const deferredRuntime = runtimeProxy(getBundle);
 
 	api.on("session_start", (_event, context) => bindSession(context));
 	api.on("session_switch", (_event, context) => bindSession(context));
 	api.on("before_agent_start", (event) => appendBrainstormGuidance(event));
-	api.on("tool_call", (event, context) => getBundle().evaluateToolCall(event, context));
-	api.on("tool_result", (event, context) => getBundle().collector.recordToolResult(event, context));
+	api.on("tool_call", (event, context) =>
+		bundleForSession(context.sessionManager.getSessionId()).evaluateToolCall(event, context),
+	);
+	api.on("tool_result", (event, context) =>
+		bundleForSession(context.sessionManager.getSessionId()).collector.recordToolResult(event, context),
+	);
 	api.on("advisor_before_run", async (event) => {
-		const current = getBundle();
+		const current = bundleForSession(event.primarySessionId);
 		const complianceResult = createComplianceAdvisorHook(current.registry, current.runtime)(event);
 		if (complianceResult) return complianceResult;
 		if (event.trigger !== "brainstorm_review") return undefined;
@@ -375,15 +574,18 @@ export default function activate(api: ComplianceExtensionHost): void {
 		)(event);
 	});
 	for (const eventName of ADVISOR_LIFECYCLE_EVENTS) {
-		api.on(eventName, (event) => getBundle().handleAdvisorLifecycle(event));
+		api.on(eventName, (event) => bundleForSession(event.primarySessionId).handleAdvisorLifecycle(event));
 	}
-	api.on("turn_end", async (event) => {
-		if (!bundle) return;
-		bundle.collector.recordTurnEnd({ ...event });
-		await bundle.runtime.retryDueReviews();
-		await bundle.retryBrainstormDueReviews();
+	api.on("turn_end", async (event, context) => {
+		if (!activeBundle) return;
+		const current = bundleForSession(context.sessionManager.getSessionId());
+		current.collector.recordTurnEnd({ ...event });
+		await current.runtime.retryDueReviews();
+		await current.retryBrainstormDueReviews();
 	});
-	api.on("agent_end", () => bundle?.collector.refreshPresentation());
+	api.on("agent_end", (_event, context) => {
+		if (activeBundle) bundleForSession(context.sessionManager.getSessionId()).collector.refreshPresentation();
+	});
 
 	registerComplianceCommand(api, deferredRuntime);
 	registerComplianceCompleteTool(api, deferredRuntime);
@@ -393,7 +595,7 @@ export default function activate(api: ComplianceExtensionHost): void {
 			get runtime(): BrainstormRuntime {
 				return getBundle().getBrainstormRuntime();
 			},
-			sessionId: () => activeSessionId ?? "unknown",
+			sessionId: () => activeBundle?.sessionId ?? "unknown",
 		}),
 	);
 	api.registerTool(

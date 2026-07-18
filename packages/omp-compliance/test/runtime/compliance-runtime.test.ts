@@ -268,6 +268,17 @@ describe("ComplianceRuntime — stop", () => {
 // ─── Tests: Resume ──────────────────────────────────────────────────
 
 describe("ComplianceRuntime — resume", () => {
+	it("关键 Evidence 持久化失败后可将活动任务置为 stalled", async () => {
+		await runtime.start("tdd.md");
+		const state = await runtime.stallForInfrastructure("Evidence persistence failed");
+
+		expect(state?.status).toBe("stalled");
+		expect(runtime.currentTaskState).toMatchObject({
+			status: "stalled",
+			error: "Evidence persistence failed",
+		});
+	});
+
 	it("should throw when no stalled task matches the given id", async () => {
 		expect(runtime.resume("non-existent")).rejects.toThrow("No stalled task");
 	});

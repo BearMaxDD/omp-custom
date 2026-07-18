@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "@oh-my-pi/pi-coding-agent/advisor/index";
@@ -258,6 +258,60 @@ describe("extension activate — no lazy file side-effects", () => {
 		}
 	});
 
+	it("session_switch 后仍按 primarySessionId 路由旧会话的 Advisor 回合", async () => {
+		const firstRoot = mkdtempSync(join(tmpdir(), "ext-session-first-"));
+		const secondRoot = mkdtempSync(join(tmpdir(), "ext-session-second-"));
+		for (const root of [firstRoot, secondRoot]) {
+			Bun.spawnSync(["git", "init"], { cwd: root });
+			Bun.spawnSync(["git", "config", "user.email", "test@example.com"], { cwd: root });
+			Bun.spawnSync(["git", "config", "user.name", "Test"], { cwd: root });
+			Bun.spawnSync(["git", "commit", "--allow-empty", "-m", "init"], { cwd: root });
+		}
+		const firstContext = createFakeExtensionContext({ cwd: firstRoot, sessionId: "session-first" });
+		const secondContext = createFakeExtensionContext({ cwd: secondRoot, sessionId: "session-second" });
+		const api = new FakeExtensionAPI(firstContext);
+		let request: AdvisorReviewRequest | undefined;
+		api.requestAdvisorReview = async (value) => {
+			request = value;
+			return { status: "accepted", reviewId: value.reviewId };
+		};
+		const activate = (await import("../src/extension")).default;
+		activate(api.toAPI());
+		await api.fireSessionStart();
+		const topicTool = api.toolDefinitions.find((tool) => tool.name === "brainstorm_topic_ready");
+		if (!topicTool) throw new Error("brainstorm_topic_ready was not registered");
+		const submitted = await topicTool.execute(
+			"topic-session-first",
+			{
+				topic_kind: "architecture",
+				title: "Keep session-bound review routing",
+				candidate_decision: "Retain runtime bundles until their Advisor review lifecycle finishes.",
+				constraints: ["A later session may become active first."],
+				success_criteria: ["The original review receives its verdict tool."],
+				codebase_relevance: "none",
+				discussion_summary: "The host can deliver Advisor events after session_switch.",
+			},
+			undefined,
+			undefined,
+			{} as never,
+		);
+		expect(submitted.isError).toBe(false);
+		if (!request) throw new Error("Advisor review was not requested");
+
+		await api.fireSessionSwitch(secondContext);
+		const augmentation = await api.fireAdvisorBeforeRun({
+			reviewId: request.reviewId,
+			trigger: "brainstorm_review",
+			metadata: { reviewId: request.reviewId },
+			primarySessionId: "session-first",
+		});
+
+		expect(augmentation?.verdictToolNames).toEqual(["brainstorm_review"]);
+		expect(augmentation?.additionalTools?.map((tool) => tool.name)).toEqual(["brainstorm_review"]);
+		rmSync(firstRoot, { recursive: true, force: true });
+		rmSync(secondRoot, { recursive: true, force: true });
+	});
+
 	it("session_start 使用 context.cwd 初始化项目，而不是激活进程 cwd", async () => {
 		const sessionRoot = mkdtempSync(join(tmpdir(), "ext-session-root-"));
 		Bun.spawnSync(["git", "init"], { cwd: sessionRoot });
@@ -285,6 +339,93 @@ describe("extension activate — no lazy file side-effects", () => {
 		const audit = readFileSync(join(tmpDir, ".omp/compliance/tasks/unbound-task/events.jsonl"), "utf8");
 		expect(audit).toContain('"event":"tool_call_blocked"');
 		expect(audit).toContain('"reason":"missing_contract"');
+	});
+
+	it("真实扩展入口绑定 TDD 和 Codebase Pack 后放行契约内写操作", async () => {
+		const sessionRoot = mkdtempSync(join(tmpdir(), "ext-policy-flow-"));
+		mkdirSync(join(sessionRoot, "src"), { recursive: true });
+		writeFileSync(join(sessionRoot, "src/index.ts"), "export const value = 1;\n", "utf8");
+		writeFileSync(
+			join(sessionRoot, "tdd.md"),
+			[
+				"# Policy flow",
+				"",
+				"## Scope",
+				"- update value",
+				"",
+				"## Files",
+				"- src/index.ts",
+				"",
+				"## Tests",
+				"- bun test",
+				"",
+				"## Verification",
+				"- bun test",
+				"",
+				"## Completion",
+				"- passing",
+			].join("\n"),
+			"utf8",
+		);
+		Bun.spawnSync(["git", "init"], { cwd: sessionRoot });
+		Bun.spawnSync(["git", "config", "user.email", "test@example.com"], { cwd: sessionRoot });
+		Bun.spawnSync(["git", "config", "user.name", "Test"], { cwd: sessionRoot });
+		Bun.spawnSync(["git", "add", "."], { cwd: sessionRoot });
+		Bun.spawnSync(["git", "commit", "-m", "init"], { cwd: sessionRoot });
+		const api = new FakeExtensionAPI(createFakeExtensionContext({ cwd: sessionRoot, sessionId: "policy-session" }));
+		const activate = (await import("../src/extension")).default;
+		activate(api.toAPI());
+		await api.fireSessionStart();
+		const project = realpathSync(sessionRoot).replace(/^\/+/, "").replaceAll("/", "-");
+		const fixtures = [
+			{
+				name: "index_status",
+				input: { project },
+				details: { status: "ready", revision: "index-v1" },
+			},
+			{
+				name: "search_graph",
+				input: { project, query: "value" },
+				details: { results: [{ qualified_name: "src.index.value", file_path: "src/index.ts" }] },
+			},
+			{
+				name: "get_code_snippet",
+				input: { project, qualified_name: "src.index.value" },
+				details: { qualified_name: "src.index.value", file_path: "src/index.ts", line: 1 },
+			},
+			{
+				name: "trace_path",
+				input: { project, function_name: "src.index.value", direction: "outbound" },
+				details: {
+					source: "src.index.value",
+					target: "src.index.consumer",
+					direction: "outbound",
+					file_path: "src/index.ts",
+				},
+			},
+		] as const;
+		for (const [index, fixture] of fixtures.entries()) {
+			const toolName = `mcp__codebase_memory_mcp__${fixture.name}`;
+			const toolCallId = `policy-codebase-${index}`;
+			expect((await api.fireToolCall(toolName, fixture.input, toolCallId)).block).toBe(false);
+			await api.fireToolResult({
+				toolName,
+				toolCallId,
+				input: fixture.input,
+				content: [{ type: "text", text: JSON.stringify(fixture.details) }],
+				isError: false,
+				details: fixture.details,
+			});
+		}
+
+		await api.fireCommand("compliance", "start tdd.md");
+		const decision = await api.fireToolCall("edit", {
+			path: "src/index.ts",
+			oldText: "export const value = 1;",
+			newText: "export const value = 2;",
+		});
+		expect(decision).toEqual({ block: false, reasons: [] });
+		rmSync(sessionRoot, { recursive: true, force: true });
 	});
 
 	it("主代理工具列表不暴露临时裁决工具", async () => {

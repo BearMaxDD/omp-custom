@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { beforeAll, describe, expect, it } from "bun:test";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { $ } from "bun";
@@ -6,6 +6,10 @@ import { FakeExtensionAPI } from "./support/fake-extension-api";
 
 describe("omp-compliance installation smoke", () => {
 	const pkgRoot = join(__dirname, "..");
+
+	beforeAll(async () => {
+		await $`bun run build`.cwd(pkgRoot);
+	});
 
 	it("npm pack includes expected files", async () => {
 		const result = await $`npm pack --dry-run 2>&1`.cwd(pkgRoot);

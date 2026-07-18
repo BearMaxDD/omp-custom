@@ -98,8 +98,8 @@ export interface ComplianceRuntimeHost {
 
 export interface StrictCompletionEvidence {
 	readonly taskContract: TaskContract;
-	readonly codebasePack: CodebaseEvidencePack;
-	readonly codebaseContext: TrustedCodebaseValidationContext;
+	readonly codebasePack?: CodebaseEvidencePack;
+	readonly codebaseContext?: TrustedCodebaseValidationContext;
 	readonly delegations: readonly DelegationRecord[];
 }
 
@@ -822,6 +822,21 @@ export class ComplianceRuntime {
 		return this.taskState;
 	}
 
+	stallForInfrastructure(reason: string): Promise<TaskState | null> {
+		return this.serializeRuntimeOperation(async () => {
+			if (!this.taskState || this.taskState.status === "completed" || this.taskState.status === "overridden") {
+				return this.taskState;
+			}
+			this.taskState = {
+				...this.taskState,
+				status: "stalled",
+				error: reason,
+				updatedAt: new Date().toISOString(),
+			};
+			return this.taskState;
+		});
+	}
+
 	/**
 	 * Transition the current task from remediation_required back to active
 	 * (agent has applied the fixes and is ready for re-completion).
@@ -912,6 +927,9 @@ export class ComplianceRuntime {
 			contract.gitHead !== currentGit.gitHead
 		) {
 			throw new Error("TaskContract context mismatch");
+		}
+		if (!evidence.codebasePack || !evidence.codebaseContext) {
+			throw new Error("Codebase Evidence Pack is not ready");
 		}
 		const packErrors = validateCodebasePack(evidence.codebasePack, evidence.codebaseContext);
 		if (packErrors.length > 0 || evidence.codebasePack.diffHash !== currentGit.diffHash) {

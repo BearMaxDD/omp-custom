@@ -896,6 +896,18 @@ describe("ProjectIdentityStore", () => {
 		expect(existsSync(bindingPath(root))).toBe(false);
 	});
 
+	it("accepts the Evidence Repository project snapshot lock on reopen", () => {
+		const root = initGit();
+		const initial = ProjectIdentityStore.open(root);
+		const directory = join(root, ".omp", "compliance");
+		writeFileSync(join(directory, ".project.json.lock"), "");
+
+		const reopened = ProjectIdentityStore.open(root);
+
+		expect(reopened.status).toBe("bound");
+		expect(reopened.binding).toEqual(initial.binding);
+	});
+
 	it("fails closed when storage is replaced during temp-to-ready publication", async () => {
 		const root = initGit();
 		const ompDirectory = join(root, ".omp");
