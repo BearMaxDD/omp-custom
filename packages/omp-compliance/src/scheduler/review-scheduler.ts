@@ -257,6 +257,7 @@ export class ReviewScheduler {
 	#nextSequence = 0;
 	#operationTail: Promise<void> = Promise.resolve();
 	#pumping: Promise<void> | undefined;
+	#restored = false;
 	#lifecycleWaiters = new Map<string, () => void>();
 
 	constructor(options: ReviewSchedulerOptions) {
@@ -279,8 +280,12 @@ export class ReviewScheduler {
 
 	restore(): Promise<void> {
 		return this.#serialize(async () => {
+			if (this.#restored) return;
 			const raw = await this.#store.load();
-			if (!raw) return;
+			if (!raw) {
+				this.#restored = true;
+				return;
+			}
 			const restored = this.#validateState(raw);
 			await this.#transaction(() => {
 				this.#queued = [...restored.queued];
@@ -294,6 +299,7 @@ export class ReviewScheduler {
 				this.#inFlight = undefined;
 				sortQueue(this.#queued);
 			});
+			this.#restored = true;
 		});
 	}
 

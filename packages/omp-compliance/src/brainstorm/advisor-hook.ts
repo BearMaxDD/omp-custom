@@ -55,6 +55,8 @@ export function createBrainstormAdvisorHook(
 		return {
 			additionalSystemContext: `${envelope.rules}\n\n${envelope.context}`,
 			additionalTools: [createBrainstormReviewTool(envelope, coordinator, registry, sendMessage)],
+			requestedToolNames: [...envelope.requestedToolNames],
+			verdictToolNames: ["brainstorm_review"],
 			metadata: Object.freeze({ brainstormReviewId: envelope.reviewId }),
 		};
 	};

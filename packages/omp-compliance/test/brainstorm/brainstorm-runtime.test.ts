@@ -16,6 +16,8 @@ import { BrainstormReviewRegistry } from "../../src/brainstorm/review-registry";
 import { TopicCoordinator } from "../../src/brainstorm/topic-coordinator";
 import { TopicStore } from "../../src/brainstorm/topic-store";
 import type { BrainstormTopicReadyInput } from "../../src/brainstorm/types";
+import { ReviewScheduler } from "../../src/scheduler/review-scheduler";
+import type { ReviewSchedulerState, ReviewSchedulerStore } from "../../src/scheduler/review-scheduler";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
 import { FakeCodebaseMemory } from "../support/fake-codebase-memory";
 import { validTopicInput } from "./fixtures";
@@ -31,25 +33,61 @@ function tempDir(): string {
 interface BrainstormRuntimeHarnessOverrides {
 	requestAdvisorReview: (request: AdvisorReviewRequest) => Promise<AdvisorReviewReceipt>;
 	getAllTools?: () => readonly string[];
-	reviewTimeoutMs?: number;
+	withCodebaseEvidence?: boolean;
+	now?: () => number;
+}
+
+class MemorySchedulerStore implements ReviewSchedulerStore {
+	state: ReviewSchedulerState | undefined;
+	async load(): Promise<ReviewSchedulerState | undefined> {
+		return this.state ? structuredClone(this.state) : undefined;
+	}
+	async save(state: ReviewSchedulerState): Promise<void> {
+		this.state = structuredClone(state);
+	}
+}
+
+function schedulerFor(
+	requestAdvisorReview: BrainstormRuntimeHarnessOverrides["requestAdvisorReview"],
+	now: () => number = () => Date.now(),
+): ReviewScheduler {
+	return new ReviewScheduler({
+		clock: { now },
+		random: () => 0,
+		store: new MemorySchedulerStore(),
+		requester: requestAdvisorReview,
+	});
 }
 
 function createBrainstormRuntimeHarness(overrides: BrainstormRuntimeHarnessOverrides) {
 	const collector = new CollectorRuntime();
+	if (overrides.withCodebaseEvidence !== false) {
+		const memory = new FakeCodebaseMemory(collector.collector);
+		memory.recordIndexReady();
+		memory.recordSearchGraph("brainstorm", ["TopicCoordinator"]);
+		memory.recordGetSnippet("src/brainstorm.ts", "submitTopic");
+	}
 	const store = new TopicStore(tempDir());
 	const coordinator = new TopicCoordinator(store);
 	const registry = new BrainstormReviewRegistry();
+	const scheduler = schedulerFor(overrides.requestAdvisorReview, overrides.now);
 	const runtime = new BrainstormRuntime({
 		api: { requestAdvisorReview: overrides.requestAdvisorReview },
 		collector,
 		coordinator,
 		registry,
 		requestAdvisorReview: overrides.requestAdvisorReview,
+		scheduler,
+		ensureSchedulerReady: () => scheduler.restore(),
+		projectContext: () => ({
+			projectId: "project-brainstorm",
+			gitHead: "a".repeat(40),
+			diffHash: `sha256:${"b".repeat(64)}`,
+		}),
 		getAllTools: overrides.getAllTools ?? (() => []),
 		sessionId: () => "session-1",
-		reviewTimeoutMs: overrides.reviewTimeoutMs,
 	});
-	return { runtime, coordinator, registry, collector };
+	return { runtime, coordinator, registry, collector, scheduler };
 }
 
 // ─── Suite ─────────────────────────────────────────────────────────────
@@ -75,7 +113,7 @@ describe("BrainstormRuntime", () => {
 			inputHash: result.topic.inputHash,
 		});
 		expect(result.status).toBe("advisor_reviewing");
-		expect(result.reviewId).toMatch(/^br-/);
+		expect(result.reviewId).toMatch(/^review:/);
 	});
 
 	it("transitions topic to advisor_reviewing on successful submission", async () => {
@@ -154,15 +192,24 @@ describe("BrainstormRuntime", () => {
 		expect(result.topic.status).toBe("review_unavailable");
 	});
 
-	it("transitions to review_unavailable and consumes the envelope after timeout", async () => {
+	it("completed without verdict lifecycle 后进入 review_unavailable 并消费 Envelope", async () => {
 		const harness = createBrainstormRuntimeHarness({
 			requestAdvisorReview: async (request) => ({ status: "accepted" as const, reviewId: request.reviewId }),
-			reviewTimeoutMs: 10,
 		});
 
 		const result = await harness.runtime.submitTopic(validTopicInput());
 		expect(result.status).toBe("advisor_reviewing");
-		await Bun.sleep(30);
+		if (!result.reviewId) throw new Error("missing review id");
+		await harness.runtime.handleAdvisorLifecycle({
+			type: "advisor_run_completed",
+			reviewId: result.reviewId,
+			trigger: "brainstorm_review",
+			priority: 80,
+			primarySessionId: "primary",
+			advisorSessionId: "advisor",
+			timestamp: new Date().toISOString(),
+			verdictSubmitted: false,
+		});
 		expect(harness.coordinator.current()?.status).toBe("review_unavailable");
 		expect(harness.registry.get(result.reviewId ?? "")).toBeUndefined();
 	});
@@ -212,6 +259,12 @@ describe("BrainstormRuntime", () => {
 				consume: (id: string) => registry.consume(id),
 			} as never,
 			requestAdvisorReview: async () => ({ status: "accepted" as const, reviewId: "r" }),
+			scheduler: schedulerFor(async (request) => ({ status: "accepted" as const, reviewId: request.reviewId })),
+			projectContext: () => ({
+				projectId: "project-brainstorm",
+				gitHead: "a".repeat(40),
+				diffHash: `sha256:${"b".repeat(64)}`,
+			}),
 			getAllTools: () => [],
 			sessionId: () => "s1",
 		});
@@ -234,11 +287,91 @@ describe("BrainstormRuntime", () => {
 			coordinator,
 			registry,
 			requestAdvisorReview: async () => ({ status: "accepted" as const, reviewId: "r" }),
+			scheduler: schedulerFor(async (request) => ({ status: "accepted" as const, reviewId: request.reviewId })),
+			projectContext: () => ({
+				projectId: "project-brainstorm",
+				gitHead: "a".repeat(40),
+				diffHash: `sha256:${"b".repeat(64)}`,
+			}),
 			getAllTools: () => ["search_graph"],
 			sessionId: () => "s1",
 		});
 		const result = await runtime.submitTopic(validTopicInput({ codebase_relevance: "required" }));
 		const envelope = registry.get(result.reviewId);
 		expect(envelope?.requestedToolNames).toEqual(["search_graph"]);
+	});
+
+	it("required 代码议题缺少只读证据 Pack 时不请求 Advisor", async () => {
+		const reviewRequests: AdvisorReviewRequest[] = [];
+		const harness = createBrainstormRuntimeHarness({
+			withCodebaseEvidence: false,
+			requestAdvisorReview: async (request) => {
+				reviewRequests.push(request);
+				return { status: "accepted", reviewId: request.reviewId };
+			},
+		});
+
+		const result = await harness.runtime.submitTopic(validTopicInput({ codebase_relevance: "required" }));
+
+		expect(result.status).toBe("review_unavailable");
+		expect(reviewRequests).toHaveLength(0);
+		expect(harness.coordinator.current()?.status).toBe("review_unavailable");
+	});
+
+	it("Advisor failed 后进入 review_unavailable 并由 Scheduler 退避重试", async () => {
+		let now = Date.now();
+		const reviewRequests: AdvisorReviewRequest[] = [];
+		const harness = createBrainstormRuntimeHarness({
+			now: () => now,
+			requestAdvisorReview: async (request) => {
+				reviewRequests.push(request);
+				return { status: "accepted", reviewId: request.reviewId };
+			},
+		});
+		const submitted = await harness.runtime.submitTopic(validTopicInput());
+		if (!submitted.reviewId) throw new Error("missing review id");
+
+		await harness.runtime.handleAdvisorLifecycle({
+			type: "advisor_run_failed",
+			reviewId: submitted.reviewId,
+			trigger: "brainstorm_review",
+			priority: 80,
+			primarySessionId: "primary",
+			advisorSessionId: "advisor",
+			timestamp: new Date(now).toISOString(),
+			failureClass: "provider",
+			errorSummary: "provider unavailable",
+		});
+		expect(harness.coordinator.current()?.status).toBe("review_unavailable");
+		expect(harness.scheduler.snapshot().queued).toHaveLength(1);
+
+		now += 5_000;
+		await harness.runtime.retryDueReviews();
+		expect(reviewRequests).toHaveLength(2);
+		expect(harness.coordinator.current()?.status).toBe("advisor_reviewing");
+		expect(harness.scheduler.snapshot().inFlight?.attempt).toBe(2);
+	});
+
+	it("高优先级 Completion 占用 Advisor 时保留 Brainstorm 排队 Envelope", async () => {
+		const harness = createBrainstormRuntimeHarness({
+			requestAdvisorReview: async (request) => ({ status: "accepted", reviewId: request.reviewId }),
+		});
+		await harness.scheduler.enqueue({
+			trigger: "compliance_review",
+			priority: 100,
+			projectId: "project-brainstorm",
+			taskId: "task-compliance",
+			contractHash: "sha256:contract",
+			evidenceRevision: "sha256:evidence",
+			gitHead: "a".repeat(40),
+			diffHash: `sha256:${"b".repeat(64)}`,
+		});
+		await harness.scheduler.pump();
+
+		const result = await harness.runtime.submitTopic(validTopicInput());
+
+		expect(result.status).toBe("advisor_reviewing");
+		expect(harness.registry.get(result.reviewId)).toBeDefined();
+		expect(harness.scheduler.snapshot().queued.some((intent) => intent.trigger === "brainstorm_review")).toBe(true);
 	});
 });

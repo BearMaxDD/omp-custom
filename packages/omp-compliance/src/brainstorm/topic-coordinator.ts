@@ -39,7 +39,7 @@ type BrainstormTopicStatus = BrainstormTopicState["status"];
 /** Valid state transitions: source -> [allowed targets]. */
 const TRANSITIONS: Record<BrainstormTopicStatus, BrainstormTopicStatus[]> = {
 	drafting: ["ready_for_advisor_review"],
-	ready_for_advisor_review: ["advisor_reviewing"],
+	ready_for_advisor_review: ["advisor_reviewing", "review_unavailable"],
 	advisor_reviewing: ["awaiting_user_decision", "review_unavailable"],
 	review_unavailable: ["awaiting_user_decision", "drafting", "ready_for_advisor_review"],
 	awaiting_user_decision: ["decided", "parked", "drafting"],

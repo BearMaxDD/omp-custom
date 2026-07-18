@@ -45,6 +45,9 @@ describe("brainstorm + compliance isolation — activate", () => {
 		// Both advisor_before_run and tool_call handlers are bound
 		const boundEvents = api.getBoundEvents();
 		expect(boundEvents).toContain("advisor_before_run");
+		expect(boundEvents).toContain("advisor_run_completed");
+		expect(boundEvents).toContain("advisor_run_failed");
+		expect(boundEvents).toContain("advisor_run_cancelled");
 		expect(boundEvents).toContain("session_start");
 		expect(boundEvents).toContain("session_switch");
 		expect(boundEvents).toContain("tool_call");

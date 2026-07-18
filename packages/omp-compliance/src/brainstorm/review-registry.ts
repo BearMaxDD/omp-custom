@@ -13,7 +13,12 @@
 export interface BrainstormReviewEnvelope {
 	readonly reviewId: string;
 	readonly topicId: string;
+	readonly projectId: string;
 	readonly inputHash: `sha256:${string}`;
+	readonly evidenceRevision: string;
+	readonly gitHead: string;
+	readonly diffHash: string;
+	readonly trigger: "brainstorm_review";
 	readonly context: string;
 	readonly rules: string;
 	readonly requestedToolNames: readonly string[];

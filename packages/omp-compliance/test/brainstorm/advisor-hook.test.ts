@@ -13,7 +13,12 @@ function makeEnvelope(overrides: Partial<BrainstormReviewEnvelope> = {}): Brains
 	return Object.freeze({
 		reviewId: "review-bs-1",
 		topicId: "topic-01",
+		projectId: "project-brainstorm",
 		inputHash: "sha256:abc" as const,
+		evidenceRevision: "sha256:evidence",
+		gitHead: "a".repeat(40),
+		diffHash: "sha256:diff",
+		trigger: "brainstorm_review",
 		context: "test-brainstorm-context",
 		rules: "test-brainstorm-rules",
 		requestedToolNames: [],
@@ -112,6 +117,8 @@ describe("createBrainstormAdvisorHook", () => {
 		expect(result).toBeDefined();
 		expect(result?.additionalSystemContext).toBe("test-brainstorm-rules\n\ntest-brainstorm-context");
 		expect(result?.additionalTools?.map((t) => t.name)).toEqual(["brainstorm_review"]);
+		expect(result?.requestedToolNames).toEqual(names);
+		expect(result?.verdictToolNames).toEqual(["brainstorm_review"]);
 	});
 
 	it("matches on brainstorm_review trigger", () => {
@@ -132,6 +139,16 @@ describe("createBrainstormAdvisorHook", () => {
 		const hook = createBrainstormAdvisorHook(registry, coordinator, () => {});
 		const result = hook(brainstormEvent({ reviewId: "nonexistent", metadata: { reviewId: "nonexistent" } }));
 		expect(result).toBeUndefined();
+	});
+
+	it("compliance_review 不消费 Brainstorm Envelope", () => {
+		const registry = new BrainstormReviewRegistry();
+		const envelope = makeEnvelope();
+		registry.put(envelope);
+		const hook = createBrainstormAdvisorHook(registry, makeCoordinator(), () => {});
+
+		expect(hook({ ...brainstormEvent(), trigger: "compliance_review" })).toBeUndefined();
+		expect(registry.get(envelope.reviewId)).toBe(envelope);
 	});
 });
 

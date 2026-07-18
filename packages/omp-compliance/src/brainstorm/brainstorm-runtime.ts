@@ -7,8 +7,13 @@
  * independent advisor for review.
  */
 
-import { randomUUID } from "node:crypto";
-import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "@oh-my-pi/pi-coding-agent/advisor/review-protocol";
+import { createHash } from "node:crypto";
+import type {
+	AdvisorReviewLifecycleEvent,
+	AdvisorReviewReceipt,
+	AdvisorReviewRequest,
+} from "@oh-my-pi/pi-coding-agent/advisor/review-protocol";
+import type { ReviewScheduler } from "../scheduler/review-scheduler";
 import type { CollectorRuntime } from "../signals/collector-runtime";
 import { BRAINSTORM_REVIEW_RULES } from "./advisor-rules";
 import { buildTopicCodebaseEvidence } from "./codebase-evidence";
@@ -30,15 +35,21 @@ export interface BrainstormRuntimeConfig {
 	readonly registry: BrainstormReviewRegistry;
 	/** Adapter for requesting an advisor review (injectable for tests). */
 	readonly requestAdvisorReview: (request: AdvisorReviewRequest) => Promise<AdvisorReviewReceipt>;
+	/** Shared single-priority Advisor scheduler. */
+	readonly scheduler: ReviewScheduler;
+	/** Idempotently restore the shared scheduler before first use. */
+	readonly ensureSchedulerReady?: () => Promise<void>;
+	/** Authoritative project and Git identity for the review scope. */
+	readonly projectContext: () => {
+		readonly projectId: string;
+		readonly gitHead: string;
+		readonly diffHash: string;
+	};
 	/** Get all currently registered tool names. */
 	readonly getAllTools: () => readonly string[];
 	/** Get the current session ID. */
 	readonly sessionId: () => string;
-	/** Maximum time to wait for a structured Advisor review. */
-	readonly reviewTimeoutMs?: number;
 }
-
-const DEFAULT_REVIEW_TIMEOUT_MS = 120_000;
 
 // ─── Submit Topic Result ───────────────────────────────────────────────
 
@@ -71,6 +82,7 @@ export interface BrainstormSubmitTopicResult {
  */
 export class BrainstormRuntime {
 	private config: BrainstormRuntimeConfig;
+	private activeEnvelope: import("./review-registry").BrainstormReviewEnvelope | undefined;
 
 	constructor(config: BrainstormRuntimeConfig) {
 		this.config = config;
@@ -85,7 +97,8 @@ export class BrainstormRuntime {
 	 * a new review. Conflicts return the active topic id without change.
 	 */
 	async submitTopic(input: BrainstormTopicReadyInput): Promise<BrainstormSubmitTopicResult> {
-		const { coordinator, registry, collector } = this.config;
+		const { coordinator, registry, collector, scheduler } = this.config;
+		await this.ensureSchedulerReady();
 
 		// 1. Collect tool event evidence snapshot
 		const snapshot = collector.collector.snapshot();
@@ -110,6 +123,10 @@ export class BrainstormRuntime {
 
 		// 3. Build codebase evidence, topic packet, rules, and envelope
 		const codebaseEvidence = buildTopicCodebaseEvidence(topic.input.codebase_relevance, snapshot);
+		if (topic.input.codebase_relevance === "required" && codebaseEvidence.mode !== "available") {
+			await coordinator.markReviewUnavailable(topic.topicId, "Required read-only codebase evidence is unavailable");
+			return { topic, status: "review_unavailable" };
+		}
 		const packet = buildTopicPacket(topic, snapshot);
 		const context = renderTopicPacket(packet);
 		const available = new Set(this.config.getAllTools());
@@ -118,11 +135,37 @@ export class BrainstormRuntime {
 			toolNames.length > 0
 				? `${BRAINSTORM_REVIEW_RULES}\n\nAvailable codebase read-only tools: ${toolNames.join(", ")}`
 				: BRAINSTORM_REVIEW_RULES;
-		const reviewId = `br-${randomUUID()}`;
+		const project = this.config.projectContext();
+		const evidenceRevision = snapshot.codebaseMemory.pack?.evidenceRevision ?? evidenceRevisionFor(snapshot);
+		const enqueued = await scheduler.enqueue({
+			trigger: "brainstorm_review",
+			priority: 80,
+			projectId: project.projectId,
+			taskId: `brainstorm-${topic.topicId}`,
+			topicId: topic.topicId,
+			contractHash: topic.inputHash,
+			evidenceRevision,
+			gitHead: project.gitHead,
+			diffHash: project.diffHash,
+			taskAttempt: topic.attempt,
+			metadata: {
+				sessionId: this.config.sessionId(),
+				topicId: topic.topicId,
+				inputHash: topic.inputHash,
+				codebaseRelevance: topic.input.codebase_relevance,
+			},
+		});
+		const reviewAttempt = Math.max(1, enqueued.intent.attempt + 1);
+		const reviewId = reviewIdFor(enqueued.intent.dedupeKey, reviewAttempt);
 		const envelope = {
 			reviewId,
 			topicId: topic.topicId,
+			projectId: project.projectId,
 			inputHash: topic.inputHash,
+			evidenceRevision,
+			gitHead: project.gitHead,
+			diffHash: project.diffHash,
+			trigger: "brainstorm_review" as const,
 			context,
 			rules,
 			requestedToolNames: Object.freeze([...toolNames]),
@@ -130,30 +173,29 @@ export class BrainstormRuntime {
 		};
 
 		// 4a. Transition state before envelope registration
-		await coordinator.markReviewRequested(topic.topicId, reviewId);
+		try {
+			await coordinator.markReviewRequested(topic.topicId, reviewId);
+		} catch (error) {
+			await scheduler.abandonReview(enqueued.intent.reviewId);
+			throw error;
+		}
 		// 4b. Register envelope (state is now advisor_reviewing)
 		registry.put(envelope);
-		// 5. Request advisor review
+		this.activeEnvelope = envelope;
+		// 5. Dispatch through the shared Scheduler.
 		try {
-			const receipt = await this.config.requestAdvisorReview({
-				reviewId,
-				trigger: "brainstorm_review",
-				priority: 80,
-				metadata: {
-					sessionId: this.config.sessionId(),
-					taskId: `brainstorm-${topic.topicId}`,
-					topicId: topic.topicId,
-					inputHash: topic.inputHash,
-					codebaseRelevance: topic.input.codebase_relevance,
-				},
-			});
-			if (receipt.status !== "accepted") {
-				registry.consume(reviewId);
-				await coordinator.markReviewUnavailable(topic.topicId, "Advisor review not accepted");
-				return { reviewId, topic, status: "review_unavailable" };
+			await scheduler.pump();
+			const schedulerState = scheduler.snapshot();
+			if (schedulerState.inFlight?.reviewId === reviewId) {
+				return { reviewId, topic, status: "advisor_reviewing" };
 			}
-			this.scheduleReviewTimeout(reviewId, topic.topicId);
-			return { reviewId, topic, status: "advisor_reviewing" };
+			const queued = schedulerState.queued.find((intent) => intent.dedupeKey === enqueued.intent.dedupeKey);
+			if (queued && schedulerState.inFlight) {
+				return { reviewId, topic, status: "advisor_reviewing" };
+			}
+			registry.consume(reviewId);
+			await coordinator.markReviewUnavailable(topic.topicId, "Advisor review not accepted");
+			return { reviewId, topic, status: "review_unavailable" };
 		} catch {
 			registry.consume(reviewId);
 			await coordinator.markReviewUnavailable(topic.topicId, "Advisor review request failed");
@@ -161,20 +203,68 @@ export class BrainstormRuntime {
 		}
 	}
 
-	private scheduleReviewTimeout(reviewId: string, topicId: string): void {
-		const timeoutMs = this.config.reviewTimeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
-		const timer = setTimeout(() => {
-			void this.expireReview(reviewId, topicId);
-		}, timeoutMs);
-		timer.unref?.();
-	}
-
-	private async expireReview(reviewId: string, topicId: string): Promise<void> {
-		const envelope = this.config.registry.consume(reviewId);
-		if (!envelope) return;
-
+	async handleAdvisorLifecycle(event: AdvisorReviewLifecycleEvent): Promise<void> {
+		if (event.trigger !== "brainstorm_review") return;
+		await this.config.scheduler.handleLifecycle(event, false);
 		const topic = this.config.coordinator.current();
-		if (topic?.topicId !== topicId || topic.status !== "advisor_reviewing") return;
-		await this.config.coordinator.markReviewUnavailable(topicId, "Advisor review timed out");
+		if (!topic || event.reviewId !== this.activeEnvelope?.reviewId) return;
+		if (
+			event.type === "advisor_run_failed" ||
+			event.type === "advisor_run_cancelled" ||
+			(event.type === "advisor_run_completed" && !event.verdictSubmitted)
+		) {
+			this.config.registry.consume(event.reviewId);
+			if (topic.status === "advisor_reviewing") {
+				await this.config.coordinator.markReviewUnavailable(topic.topicId, "Advisor review ended without a verdict");
+			}
+		}
 	}
+
+	async retryDueReviews(): Promise<void> {
+		await this.ensureSchedulerReady();
+		const topic = this.config.coordinator.current();
+		if (!topic || topic.status !== "review_unavailable" || !this.activeEnvelope) return;
+		const queued = this.config.scheduler.nextDueIntent(`brainstorm-${topic.topicId}`, "brainstorm_review");
+		if (!queued) return;
+		const reviewId = reviewIdFor(queued.dedupeKey, queued.attempt + 1);
+		try {
+			await this.config.coordinator.markReady(topic.topicId);
+			await this.config.coordinator.markReviewRequested(topic.topicId, reviewId);
+		} catch (error) {
+			if (this.config.coordinator.current()?.status === "ready_for_advisor_review") {
+				await this.config.coordinator.markReviewUnavailable(topic.topicId, "Advisor retry state persistence failed");
+			}
+			throw error;
+		}
+		const envelope = Object.freeze({ ...this.activeEnvelope, reviewId, createdAt: new Date().toISOString() });
+		this.config.registry.put(envelope);
+		this.activeEnvelope = envelope;
+		try {
+			await this.config.scheduler.pump();
+		} catch {
+			this.config.registry.consume(reviewId);
+			await this.config.coordinator.markReviewUnavailable(topic.topicId, "Advisor retry request failed");
+			return;
+		}
+		const schedulerState = this.config.scheduler.snapshot();
+		if (schedulerState.inFlight?.reviewId === reviewId) return;
+		const stillQueued = schedulerState.queued.some((intent) => intent.dedupeKey === queued.dedupeKey);
+		if (stillQueued && schedulerState.inFlight) return;
+		this.config.registry.consume(reviewId);
+		if (this.config.coordinator.current()?.status === "advisor_reviewing") {
+			await this.config.coordinator.markReviewUnavailable(topic.topicId, "Advisor retry not accepted");
+		}
+	}
+
+	private async ensureSchedulerReady(): Promise<void> {
+		if (this.config.ensureSchedulerReady) await this.config.ensureSchedulerReady();
+	}
+}
+
+function reviewIdFor(dedupeKey: string, attempt: number): string {
+	return `review:${dedupeKey.slice("sha256:".length)}:${attempt}`;
+}
+
+function evidenceRevisionFor(snapshot: ReturnType<CollectorRuntime["collector"]["snapshot"]>): string {
+	return `sha256:${createHash("sha256").update(JSON.stringify(snapshot)).digest("hex")}`;
 }

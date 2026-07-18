@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import type {
 	AdvisorBeforeRunEvent,
+	AdvisorReviewLifecycleEvent,
 	AdvisorReviewReceipt,
 	AdvisorReviewRequest,
 	AdvisorRunAugmentation,
@@ -58,6 +60,10 @@ export interface ComplianceExtensionHost {
 	on(event: "session_start", handler: ExtensionHandler<SessionStartEvent>): void;
 	on(event: "session_switch", handler: ExtensionHandler<SessionSwitchEvent>): void;
 	on(event: "advisor_before_run", handler: ExtensionHandler<AdvisorBeforeRunEvent, AdvisorRunAugmentation>): void;
+	on(event: "advisor_run_started", handler: ExtensionHandler<AdvisorReviewLifecycleEvent>): void;
+	on(event: "advisor_run_completed", handler: ExtensionHandler<AdvisorReviewLifecycleEvent>): void;
+	on(event: "advisor_run_failed", handler: ExtensionHandler<AdvisorReviewLifecycleEvent>): void;
+	on(event: "advisor_run_cancelled", handler: ExtensionHandler<AdvisorReviewLifecycleEvent>): void;
 	on(event: "before_agent_start", handler: ExtensionHandler<BeforeAgentStartEvent, BeforeAgentStartEventResult>): void;
 	on(event: "tool_call", handler: ExtensionHandler<ToolCallEvent, ToolCallEventResult>): void;
 	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): void;
@@ -175,6 +181,11 @@ export default function activate(api: ComplianceExtensionHost): void {
 			}
 		},
 	});
+	let schedulerReady: Promise<void> | undefined;
+	const ensureSchedulerReady = (): Promise<void> => {
+		schedulerReady ??= scheduler.restore();
+		return schedulerReady;
+	};
 
 	// Compliance runtime — the main coordinator (gets factory, not store)
 	const runtime = new ComplianceRuntime(getEvidenceStore, collector, api, repoRoot, reviewDeps, {
@@ -244,6 +255,29 @@ export default function activate(api: ComplianceExtensionHost): void {
 	// ── Register brainstorm command and tools (lazy — no FS side effects) ──
 	// TopicStore + TopicCoordinator only created on first actual use via getBrainstormInfra()
 	const getCoordinator = () => getBrainstormInfra().coordinator;
+	let brainstormRuntime: BrainstormRuntime | undefined;
+	const getBrainstormRuntime = (): BrainstormRuntime => {
+		brainstormRuntime ??= new BrainstormRuntime({
+			api: { requestAdvisorReview },
+			collector,
+			coordinator: getCoordinator(),
+			registry: brainstormRegistry,
+			requestAdvisorReview,
+			scheduler,
+			ensureSchedulerReady,
+			projectContext: () => {
+				const git = readAuthoritativeGitContext(repoRoot);
+				return {
+					projectId: `project-${createHash("sha256").update(repoRoot).digest("hex").slice(0, 32)}`,
+					gitHead: git.gitHead,
+					diffHash: git.diffHash,
+				};
+			},
+			getAllTools: () => api.getAllTools() as readonly string[],
+			sessionId: () => sessionId ?? "unknown",
+		});
+		return brainstormRuntime;
+	};
 	registerBrainstormCommand(api, getCoordinator);
 
 	// Tool registrations — use factory createTopicReadyTool for consistent
@@ -255,15 +289,7 @@ export default function activate(api: ComplianceExtensionHost): void {
 			// Runtime is created lazily — wrapped in a getter so the factory
 			// only accesses it when the handler is invoked.
 			get runtime(): BrainstormRuntime {
-				return new BrainstormRuntime({
-					api: { requestAdvisorReview },
-					collector,
-					coordinator: getCoordinator(),
-					registry: brainstormRegistry,
-					requestAdvisorReview,
-					getAllTools: () => api.getAllTools() as readonly string[],
-					sessionId: () => sessionId ?? "unknown",
-				});
+				return getBrainstormRuntime();
 			},
 			sessionId: () => sessionId ?? "unknown",
 		}),
@@ -277,8 +303,24 @@ export default function activate(api: ComplianceExtensionHost): void {
 		}),
 	);
 
+	const handleAdvisorLifecycle = async (event: AdvisorReviewLifecycleEvent): Promise<void> => {
+		if (event.trigger === "brainstorm_review") {
+			await getBrainstormRuntime().handleAdvisorLifecycle(event);
+			return;
+		}
+		await runtime.handleAdvisorLifecycle(event);
+	};
+	api.on("advisor_run_started", handleAdvisorLifecycle);
+	api.on("advisor_run_completed", handleAdvisorLifecycle);
+	api.on("advisor_run_failed", handleAdvisorLifecycle);
+	api.on("advisor_run_cancelled", handleAdvisorLifecycle);
+
 	// ── Passive event handlers ──
 	bindCollectorEvents(api, collector);
-	api.on("turn_end", (event) => collector.recordTurnEnd({ ...event }));
+	api.on("turn_end", async (event) => {
+		collector.recordTurnEnd({ ...event });
+		await runtime.retryDueReviews();
+		if (brainstormRuntime) await brainstormRuntime.retryDueReviews();
+	});
 	api.on("agent_end", () => collector.refreshPresentation());
 }
