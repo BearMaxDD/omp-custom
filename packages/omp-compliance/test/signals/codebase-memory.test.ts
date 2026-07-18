@@ -1,14 +1,16 @@
 import { describe, expect, it, test } from "bun:test";
 import type { ToolResultEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { TaskContract } from "../../src/contract/types";
 import {
 	codebaseIndexReady,
 	computeEvidenceRevision,
 	createCodebaseEvidencePack,
+	createTrustedCodebaseCapture,
 	normalizeCodebaseMemory,
 	validateCodebasePack,
 } from "../../src/signals/codebase-memory";
 import { ToolEventCollector } from "../../src/signals/tool-event-collector";
-import type { ToolCallRecord, ToolResultRecord } from "../../src/signals/types";
+import type { ToolCallRecord, ToolResultRecord, TrustedCodebaseValidationContext } from "../../src/signals/types";
 import { canonicalArgsFingerprint } from "../../src/xdev/tool-identity";
 
 function mcpCall(shortName: string, input: Record<string, unknown>, toolCallId: string) {
@@ -223,6 +225,10 @@ describe("codebaseIndexReady matrix", () => {
 
 describe("Codebase Evidence Pack", () => {
 	const codebaseProjectId = "codebase-demo";
+	const projectId = "123e4567-e89b-42d3-a456-426614174000";
+	const gitHead = "5e5560e5399236df8e403796291946ecf8bf7dba";
+	const callAt = "2026-07-18T07:59:00.000Z";
+	const resultAt = "2026-07-18T07:59:30.000Z";
 	const queriedAt = "2026-07-18T08:00:00.000Z";
 	const diffHash = `sha256:${"d".repeat(64)}`;
 
@@ -244,7 +250,7 @@ describe("Codebase Evidence Pack", () => {
 				qualifiedName: `codebase-memory-mcp.${toolName}`,
 				argsFingerprint,
 				params,
-				timestamp: queriedAt,
+				timestamp: callAt,
 			},
 			result: {
 				toolCallId: id,
@@ -254,7 +260,7 @@ describe("Codebase Evidence Pack", () => {
 				...(details ? { details } : {}),
 				detailsTruncated: false,
 				detailsFailure: !success,
-				timestamp: queriedAt,
+				timestamp: resultAt,
 			},
 		};
 	}
@@ -285,15 +291,56 @@ describe("Codebase Evidence Pack", () => {
 
 	function metadata(pairs = validPairs()) {
 		return {
-			projectId: "project-uuid",
+			taskContract: taskContract(),
 			codebaseProjectId,
-			gitHead: "5e5560e",
 			diffHash,
 			queriedAt,
-			affectedFiles: ["src/a.ts"],
 			allowedNewFileRoots: ["src/new"],
 			unresolvedClaims: [] as string[],
 			pairs,
+		};
+	}
+
+	function taskContract(
+		source: "tdd" | "lightweight" = "tdd",
+		affectedFiles = ["src/a.ts"],
+		identity: Partial<Pick<TaskContract, "taskId" | "projectId" | "gitHead">> = {},
+	): TaskContract {
+		const common = {
+			schemaVersion: 1,
+			taskId: identity.taskId ?? "task-12",
+			projectId: identity.projectId ?? projectId,
+			gitHead: identity.gitHead ?? gitHead,
+			scope: ["Task 12"],
+			acceptanceCriteria: ["通过"],
+			verificationCommands: ["bun test"],
+			delegationRequired: source === "tdd",
+			affectedFiles,
+		};
+		const tddHash = `sha256:${"c".repeat(64)}` as const;
+		const semantic = source === "tdd" ? { ...common, source, contractHash: tddHash } : { ...common, source };
+		const revision = canonicalArgsFingerprint(semantic);
+		if (!revision) throw new Error("test task contract must be hashable");
+		return {
+			...semantic,
+			contractHash: source === "tdd" ? tddHash : revision,
+			createdAt: queriedAt,
+			revision,
+		};
+	}
+
+	function context(
+		pairs = validPairs(),
+		overrides: Partial<TrustedCodebaseValidationContext> = {},
+	): TrustedCodebaseValidationContext {
+		return {
+			taskContract: taskContract(),
+			codebaseProjectId,
+			diffHash,
+			indexRevision: "idx-1",
+			trustedPairs: createTrustedCodebaseCapture(pairs),
+			newFiles: [],
+			...overrides,
 		};
 	}
 
@@ -301,10 +348,10 @@ describe("Codebase Evidence Pack", () => {
 		const pack = createCodebaseEvidencePack(metadata());
 		expect(pack).toMatchObject({
 			schemaVersion: 1,
-			projectId: "project-uuid",
+			projectId,
 			codebaseProjectId,
 			indexRevision: "idx-1",
-			gitHead: "5e5560e",
+			gitHead,
 			diffHash,
 			queriedAt,
 		});
@@ -322,7 +369,7 @@ describe("Codebase Evidence Pack", () => {
 		const forgedBody = { ...pack, indexRevision: "idx-forged" };
 		const { evidenceRevision: _old, ...withoutRevision } = forgedBody;
 		const forged = { ...withoutRevision, evidenceRevision: computeEvidenceRevision(withoutRevision) };
-		expect(validateCodebasePack(forged, [])).toContain("index_revision_mismatch");
+		expect(validateCodebasePack(forged, [], context())).toContain("index_revision_mismatch");
 	});
 
 	it("拒绝无关项目、无关 snippet 和无关 trace", () => {
@@ -331,9 +378,7 @@ describe("Codebase Evidence Pack", () => {
 				? pair("search_graph", "search", { project: "other", query: "demo.a" }, "file:src/a.ts")
 				: entry,
 		);
-		expect(validateCodebasePack(createCodebaseEvidencePack(metadata(wrongProject)), [])).toContain(
-			"project_mismatch:search_graph",
-		);
+		expect(() => createCodebaseEvidencePack(metadata(wrongProject))).toThrow("project_mismatch:search_graph");
 
 		const unrelatedSnippet = validPairs().map((entry) =>
 			entry.call.toolName === "get_code_snippet"
@@ -346,9 +391,9 @@ describe("Codebase Evidence Pack", () => {
 					)
 				: entry,
 		);
-		expect(validateCodebasePack(createCodebaseEvidencePack(metadata(unrelatedSnippet)), [])).toContain(
-			"missing_relevant_snippet",
-		);
+		expect(
+			validateCodebasePack(createCodebaseEvidencePack(metadata(unrelatedSnippet)), [], context(unrelatedSnippet)),
+		).toContain("missing_relevant_snippet");
 
 		const unrelatedTrace = validPairs().map((entry) =>
 			entry.call.toolName === "trace_path"
@@ -362,7 +407,7 @@ describe("Codebase Evidence Pack", () => {
 				: entry,
 		);
 		expect(
-			validateCodebasePack(createCodebaseEvidencePack(metadata(unrelatedTrace)), [], { crossModule: true }),
+			validateCodebasePack(createCodebaseEvidencePack(metadata(unrelatedTrace)), [], context(unrelatedTrace)),
 		).toContain("missing_relevant_trace");
 	});
 
@@ -402,9 +447,9 @@ describe("Codebase Evidence Pack", () => {
 					)
 				: entry,
 		);
-		expect(validateCodebasePack(createCodebaseEvidencePack(metadata(failedSnippet)), [])).toContain(
-			"missing_relevant_snippet",
-		);
+		expect(
+			validateCodebasePack(createCodebaseEvidencePack(metadata(failedSnippet)), [], context(failedSnippet)),
+		).toContain("missing_relevant_snippet");
 
 		const truncatedQuery = validPairs();
 		truncatedQuery[1] = {
@@ -417,13 +462,13 @@ describe("Codebase Evidence Pack", () => {
 	it("缺 architecture/search、snippet、index_status 均 invalid，index_repository 不替代", () => {
 		const pairs = validPairs();
 		const withoutDiscovery = pairs.filter((entry) => entry.call.toolName !== "search_graph");
-		expect(validateCodebasePack(createCodebaseEvidencePack(metadata(withoutDiscovery)), [])).toContain(
-			"missing_architecture_or_search",
-		);
+		expect(
+			validateCodebasePack(createCodebaseEvidencePack(metadata(withoutDiscovery)), [], context(withoutDiscovery)),
+		).toContain("missing_architecture_or_search");
 		const withoutSnippet = pairs.filter((entry) => entry.call.toolName !== "get_code_snippet");
-		expect(validateCodebasePack(createCodebaseEvidencePack(metadata(withoutSnippet)), [])).toContain(
-			"missing_relevant_snippet",
-		);
+		expect(
+			validateCodebasePack(createCodebaseEvidencePack(metadata(withoutSnippet)), [], context(withoutSnippet)),
+		).toContain("missing_relevant_snippet");
 		const repositoryOnly = pairs.filter((entry) => entry.call.toolName !== "index_status");
 		repositoryOnly.push(
 			pair(
@@ -433,9 +478,9 @@ describe("Codebase Evidence Pack", () => {
 				'{"status":"indexed","revision":"idx-1"}',
 			),
 		);
-		expect(validateCodebasePack(createCodebaseEvidencePack(metadata(repositoryOnly)), [])).toContain(
-			"missing_index_status",
-		);
+		expect(
+			validateCodebasePack(createCodebaseEvidencePack(metadata(repositoryOnly)), [], context(repositoryOnly)),
+		).toContain("missing_index_status");
 	});
 
 	it("query_graph 可替代跨模块 trace_path，但必须与 affectedFiles 相关", () => {
@@ -450,19 +495,19 @@ describe("Codebase Evidence Pack", () => {
 			),
 		);
 		const pack = createCodebaseEvidencePack(metadata(pairs));
-		expect(validateCodebasePack(pack, [], { crossModule: true })).not.toContain("missing_relevant_trace");
+		expect(validateCodebasePack(pack, [], context(pairs))).not.toContain("missing_relevant_trace");
 	});
 
 	it("新增文件只能位于 allowedNewFileRoots，unresolvedClaims 一律失败关闭", () => {
 		const pack = createCodebaseEvidencePack(metadata());
-		expect(validateCodebasePack(pack, ["src/new/item.ts"], { newFiles: ["src/new/item.ts"] })).not.toContain(
-			"new_file_outside_allowed_root:src/new/item.ts",
-		);
-		expect(validateCodebasePack(pack, ["other/item.ts"], { newFiles: ["other/item.ts"] })).toContain(
-			"new_file_outside_allowed_root:other/item.ts",
-		);
+		expect(
+			validateCodebasePack(pack, ["src/new/item.ts"], context(validPairs(), { newFiles: ["src/new/item.ts"] })),
+		).not.toContain("new_file_outside_allowed_root:src/new/item.ts");
+		expect(
+			validateCodebasePack(pack, ["other/item.ts"], context(validPairs(), { newFiles: ["other/item.ts"] })),
+		).toContain("new_file_outside_allowed_root:other/item.ts");
 		const unresolved = createCodebaseEvidencePack({ ...metadata(), unresolvedClaims: ["无法定位写入者"] });
-		expect(validateCodebasePack(unresolved, [])).toContain("unresolved_claim:无法定位写入者");
+		expect(validateCodebasePack(unresolved, [], context())).toContain("unresolved_claim:无法定位写入者");
 	});
 
 	it("changedFiles/options Proxy 与 accessor trap=0，ISO/hash/path/大小严格", () => {
@@ -474,20 +519,151 @@ describe("Codebase Evidence Pack", () => {
 				throw new Error("trap");
 			},
 		});
-		expect(() => validateCodebasePack(pack, changed)).toThrow();
+		expect(() => validateCodebasePack(pack, changed, context())).toThrow();
 		expect(reads).toBe(0);
-		const options = Object.defineProperty({}, "crossModule", {
+		const options = Object.defineProperty({}, "taskContract", {
 			enumerable: true,
 			get: () => {
 				reads++;
 				return true;
 			},
 		});
-		expect(() => validateCodebasePack(pack, [], options)).toThrow();
+		expect(() => validateCodebasePack(pack, [], options as never)).toThrow();
 		expect(reads).toBe(0);
 		expect(() => createCodebaseEvidencePack({ ...metadata(), queriedAt: "2026-07-18" })).toThrow();
 		expect(() => createCodebaseEvidencePack({ ...metadata(), diffHash: "sha256:bad" })).toThrow();
-		expect(() => createCodebaseEvidencePack({ ...metadata(), affectedFiles: ["../escape.ts"] })).toThrow();
-		expect(() => createCodebaseEvidencePack({ ...metadata(), projectId: "x".repeat(70_000) })).toThrow();
+		expect(() =>
+			createCodebaseEvidencePack({ ...metadata(), taskContract: taskContract("tdd", ["../escape.ts"]) }),
+		).toThrow();
+		expect(() =>
+			createCodebaseEvidencePack({
+				...metadata(),
+				taskContract: { ...taskContract(), projectId: "x".repeat(70_000) },
+			}),
+		).toThrow();
+	});
+
+	it("第三参数为必需可信上下文，Pack 元数据逐项与任务绑定", () => {
+		const pack = createCodebaseEvidencePack(metadata());
+		// @ts-expect-error TrustedCodebaseValidationContext is required.
+		expect(() => validateCodebasePack(pack, [])).toThrow();
+		expect(
+			validateCodebasePack(
+				pack,
+				[],
+				context(validPairs(), {
+					taskContract: taskContract("tdd", ["src/a.ts"], {
+						projectId: "123e4567-e89b-42d3-a456-426614174001",
+					}),
+				}),
+			),
+		).toContain("project_id_mismatch");
+		expect(validateCodebasePack(pack, [], context(validPairs(), { codebaseProjectId: "other-project" }))).toContain(
+			"codebase_project_id_mismatch",
+		);
+		expect(
+			validateCodebasePack(
+				pack,
+				[],
+				context(validPairs(), {
+					taskContract: taskContract("tdd", ["src/a.ts"], { gitHead: "a".repeat(40) }),
+				}),
+			),
+		).toContain("git_head_mismatch");
+		expect(validateCodebasePack(pack, [], context(validPairs(), { diffHash: `sha256:${"a".repeat(64)}` }))).toContain(
+			"diff_hash_mismatch",
+		);
+		expect(validateCodebasePack(pack, [], context(validPairs(), { indexRevision: "idx-2" }))).toContain(
+			"index_revision_mismatch",
+		);
+		expect(
+			validateCodebasePack(pack, [], context(validPairs(), { taskContract: taskContract("tdd", ["src/b.ts"]) })),
+		).toContain("affected_files_mismatch");
+	});
+
+	it("独立 trustedPairs 可阻止完全伪造、重算 hash 与跨任务重放", () => {
+		const originalPairs = validPairs();
+		const pack = createCodebaseEvidencePack(metadata(originalPairs));
+		const otherPairs = validPairs().map((entry) =>
+			entry.call.toolName === "get_code_snippet"
+				? pair(
+						"get_code_snippet",
+						"snippet-other",
+						{ project: codebaseProjectId, qualified_name: "other.z" },
+						"file:src/a.ts",
+						{ qualified_name: "other.z", file_path: "src/a.ts" },
+					)
+				: entry,
+		);
+		expect(validateCodebasePack(pack, [], context(otherPairs))).toContain("trusted_capture_mismatch");
+
+		const replayContext = context(originalPairs, {
+			taskContract: taskContract("tdd", ["src/a.ts"], { taskId: "other-task" }),
+		});
+		expect(validateCodebasePack(pack, [], replayContext)).toContain("task_contract_mismatch");
+	});
+
+	it("formal 自动要求 trace，lightweight 不允许通过可选参数绕过", () => {
+		const noTrace = validPairs().filter((entry) => entry.call.toolName !== "trace_path");
+		const pack = createCodebaseEvidencePack(metadata(noTrace));
+		expect(validateCodebasePack(pack, [], context(noTrace))).toContain("missing_relevant_trace");
+		expect(
+			validateCodebasePack(pack, [], context(noTrace, { taskContract: taskContract("lightweight") })),
+		).not.toContain("missing_relevant_trace");
+	});
+
+	it("同 affected path 的无关 symbol 和 trace 不能过关", () => {
+		const unrelated = validPairs().map((entry) => {
+			if (entry.call.toolName === "get_code_snippet") {
+				return pair(
+					"get_code_snippet",
+					"snippet",
+					{ project: codebaseProjectId, qualified_name: "other.z" },
+					"file:src/a.ts",
+					{ qualified_name: "other.z", file_path: "src/a.ts" },
+				);
+			}
+			if (entry.call.toolName === "trace_path") {
+				return pair(
+					"trace_path",
+					"trace",
+					{ project: codebaseProjectId, function_name: "other.z", direction: "outbound" },
+					"file:src/a.ts",
+					{ source: "other.z", target: "other.y", file_path: "src/a.ts" },
+				);
+			}
+			return entry;
+		});
+		const errors = validateCodebasePack(createCodebaseEvidencePack(metadata(unrelated)), [], context(unrelated));
+		expect(errors).toContain("missing_relevant_snippet");
+		expect(errors).toContain("missing_relevant_trace");
+	});
+
+	it("严格校验项目、Git 与 pair 时间顺序", () => {
+		expect(() =>
+			createCodebaseEvidencePack({
+				...metadata(),
+				taskContract: { ...taskContract(), projectId: "not-a-uuid" },
+			}),
+		).toThrow();
+		expect(() =>
+			createCodebaseEvidencePack({
+				...metadata(),
+				taskContract: { ...taskContract(), gitHead: "deadbeef" },
+			}),
+		).toThrow();
+		expect(() => createCodebaseEvidencePack({ ...metadata(), codebaseProjectId: "bad/project" })).toThrow();
+		const resultBeforeCall = validPairs();
+		resultBeforeCall[0] = {
+			...resultBeforeCall[0],
+			result: { ...resultBeforeCall[0].result, timestamp: "2026-07-18T07:58:00.000Z" },
+		};
+		expect(() => createCodebaseEvidencePack(metadata(resultBeforeCall))).toThrow("invalid_tool_time_order");
+		const resultAfterQuery = validPairs();
+		resultAfterQuery[0] = {
+			...resultAfterQuery[0],
+			result: { ...resultAfterQuery[0].result, timestamp: "2026-07-18T08:01:00.000Z" },
+		};
+		expect(() => createCodebaseEvidencePack(metadata(resultAfterQuery))).toThrow("invalid_tool_time_order");
 	});
 });

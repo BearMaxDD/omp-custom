@@ -5,11 +5,14 @@ import {
 	compareTaskContractRevision,
 	createLightweightTaskContract,
 	loadTaskContractFromTdd,
+	validateTaskContractIntegrity,
 } from "../../src/contracts/task-contract";
 
 const repoRoot = resolve(join(__dirname, "..", ".."));
 const fixture = join(__dirname, "..", "fixtures", "contracts", "code-task.md");
 const createdAt = "2026-07-18T08:00:00.000Z";
+const projectId = "123e4567-e89b-42d3-a456-426614174000";
+const gitHead = "5e5560e5399236df8e403796291946ecf8bf7dba";
 
 describe("统一任务契约分类", () => {
 	it.each([
@@ -46,8 +49,8 @@ describe("统一任务契约分类", () => {
 describe("正式与轻量任务契约", () => {
 	it("正式 TDD 生成 TRD 8.1 完整不可变契约", () => {
 		const contract = loadTaskContractFromTdd(fixture, repoRoot, {
-			projectId: "omp-custom",
-			gitHead: "5f3f782",
+			projectId,
+			gitHead,
 			affectedFiles: ["packages/omp-compliance/src/a.ts", "packages/omp-compliance/src/b.ts"],
 			createdAt,
 		});
@@ -55,8 +58,8 @@ describe("正式与轻量任务契约", () => {
 		expect(contract).toMatchObject({
 			schemaVersion: 1,
 			source: "tdd",
-			projectId: "omp-custom",
-			gitHead: "5f3f782",
+			projectId,
+			gitHead,
 			delegationRequired: true,
 			createdAt,
 		});
@@ -74,8 +77,8 @@ describe("正式与轻量任务契约", () => {
 	it("轻量契约也具有 contractHash，并复制输入防止可变别名", () => {
 		const affectedFiles = ["src/one.ts"];
 		const contract = createLightweightTaskContract({
-			projectId: "demo",
-			gitHead: "abc123",
+			projectId,
+			gitHead,
 			affectedFiles,
 			scope: ["修正文案"],
 			acceptanceCriteria: ["测试通过"],
@@ -93,8 +96,8 @@ describe("正式与轻量任务契约", () => {
 
 	it("createdAt 不参与语义 revision，命令顺序参与且稳定去重", () => {
 		const base = {
-			projectId: "demo",
-			gitHead: "abc123",
+			projectId,
+			gitHead,
 			affectedFiles: ["src/a.ts"],
 			scope: ["B", "A"],
 			acceptanceCriteria: ["done"],
@@ -114,8 +117,8 @@ describe("正式与轻量任务契约", () => {
 	it("createdAt 必须严格 ISO", () => {
 		expect(() =>
 			createLightweightTaskContract({
-				projectId: "demo",
-				gitHead: "abc",
+				projectId,
+				gitHead,
 				affectedFiles: ["src/a.ts"],
 				scope: ["x"],
 				acceptanceCriteria: ["x"],
@@ -124,6 +127,27 @@ describe("正式与轻量任务契约", () => {
 				createdAt: "2026-07-18",
 			}),
 		).toThrow();
+	});
+
+	it("完整性校验拒绝跨任务沿用旧 revision 与未知字段", () => {
+		const contract = createLightweightTaskContract({
+			projectId,
+			gitHead,
+			taskId: "task-a",
+			affectedFiles: ["src/a.ts"],
+			scope: ["x"],
+			acceptanceCriteria: ["x"],
+			verificationCommands: ["test"],
+			risk: "low",
+			createdAt,
+		});
+		expect(validateTaskContractIntegrity(contract)).toEqual(contract);
+		expect(() => validateTaskContractIntegrity({ ...contract, taskId: "task-b" })).toThrow(
+			"task_contract_revision_mismatch",
+		);
+		expect(() => validateTaskContractIntegrity({ ...contract, unknown: true } as never)).toThrow(
+			"unknown_task_contract_field:unknown",
+		);
 	});
 
 	it("revision 比较不执行 Proxy/accessor，并严格校验 sha256", () => {

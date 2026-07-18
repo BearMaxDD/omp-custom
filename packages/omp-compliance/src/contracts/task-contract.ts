@@ -9,6 +9,8 @@ const STRING_MAX_BYTES = 4096;
 const PATH_MAX_BYTES = 1024;
 const COLLECTION_MAX_ITEMS = 512;
 const SHA256_RE = /^sha256:[a-f0-9]{64}$/;
+const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const GIT_HEAD_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 const CLASSIFICATION_KEYS = new Set([
 	"affectedFiles",
 	"risk",
@@ -32,6 +34,23 @@ const LIGHTWEIGHT_KEYS = new Set([
 	"createdAt",
 ]);
 const FORMAL_KEYS = new Set(["projectId", "gitHead", "affectedFiles", "createdAt"]);
+const TASK_CONTRACT_KEYS = new Set([
+	"schemaVersion",
+	"source",
+	"taskId",
+	"projectId",
+	"documentPath",
+	"gitHead",
+	"affectedFiles",
+	"scope",
+	"acceptanceCriteria",
+	"verificationCommands",
+	"delegationRequired",
+	"revision",
+	"contractHash",
+	"createdAt",
+	"tddPath",
+]);
 
 export type TaskRisk = "low" | "medium" | "high";
 
@@ -91,6 +110,18 @@ function strictIso(value: unknown, label: string): string {
 	if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== text)
 		throw new TypeError(`invalid_${label}`);
 	return text;
+}
+
+function strictProjectId(value: unknown): string {
+	const projectId = boundedString(value, "project_id");
+	if (!UUID_V4_RE.test(projectId)) throw new TypeError("invalid_project_id");
+	return projectId.toLowerCase();
+}
+
+function strictGitHead(value: unknown): string {
+	const gitHead = boundedString(value, "git_head");
+	if (!GIT_HEAD_RE.test(gitHead)) throw new TypeError("invalid_git_head");
+	return gitHead.toLowerCase();
 }
 
 export function normalizeRepositoryPath(value: unknown): string {
@@ -203,8 +234,8 @@ export function createLightweightTaskContract(input: LightweightTaskContractInpu
 		schemaVersion: 1 as const,
 		source: "lightweight" as const,
 		taskId: safe.taskId ? boundedString(safe.taskId, "task_id") : "lightweight-task",
-		projectId: boundedString(safe.projectId, "project_id"),
-		gitHead: boundedString(safe.gitHead, "git_head"),
+		projectId: strictProjectId(safe.projectId),
+		gitHead: strictGitHead(safe.gitHead),
 		affectedFiles: normalizePaths(safe.affectedFiles, "affected_files"),
 		scope: normalizeStringSet(safe.scope, "scope"),
 		acceptanceCriteria: normalizeStringSet(safe.acceptanceCriteria, "acceptance_criteria"),
@@ -233,10 +264,10 @@ export function loadTaskContractFromTdd(
 		schemaVersion: 1 as const,
 		source: "tdd" as const,
 		taskId: contract.taskId,
-		projectId: boundedString(safe.projectId, "project_id"),
+		projectId: strictProjectId(safe.projectId),
 		documentPath,
 		contractHash: contract.contractHash,
-		gitHead: boundedString(safe.gitHead, "git_head"),
+		gitHead: strictGitHead(safe.gitHead),
 		affectedFiles: normalizePaths(safe.affectedFiles, "affected_files"),
 		scope: normalizeStringSet(contract.summary.scope, "scope", true),
 		acceptanceCriteria: normalizeStringSet(contract.summary.completionCriteria, "acceptance_criteria", true),
@@ -248,6 +279,64 @@ export function loadTaskContractFromTdd(
 		...semantic,
 		revision: semanticHash(semantic),
 		createdAt: strictIso(safe.createdAt ?? new Date().toISOString(), "created_at"),
+	});
+}
+
+export function validateTaskContractIntegrity(input: TaskContract): TaskContract {
+	const safe = parsedPlainInput<TaskContract>(input, "task_contract");
+	assertExactKeys(safe, TASK_CONTRACT_KEYS, "task_contract");
+	if (safe.schemaVersion !== 1 || (safe.source !== "tdd" && safe.source !== "lightweight")) {
+		throw new TypeError("invalid_task_contract");
+	}
+	if (typeof safe.delegationRequired !== "boolean") throw new TypeError("invalid_task_delegation_required");
+	const common = {
+		schemaVersion: 1 as const,
+		source: safe.source,
+		taskId: boundedString(safe.taskId, "task_id"),
+		projectId: strictProjectId(safe.projectId),
+		gitHead: strictGitHead(safe.gitHead),
+		affectedFiles: normalizePaths(safe.affectedFiles, "affected_files"),
+		scope: normalizeStringSet(safe.scope, "scope", safe.source === "tdd"),
+		acceptanceCriteria: normalizeStringSet(safe.acceptanceCriteria, "acceptance_criteria", safe.source === "tdd"),
+		verificationCommands: normalizeOrderedStrings(
+			safe.verificationCommands,
+			"verification_commands",
+			safe.source === "tdd",
+		),
+		delegationRequired: safe.delegationRequired,
+	};
+	const contractHash = (() => {
+		if (!SHA256_RE.test(safe.contractHash)) throw new TypeError("invalid_contract_hash");
+		return safe.contractHash;
+	})();
+	const documentPath = safe.documentPath === undefined ? undefined : normalizeRepositoryPath(safe.documentPath);
+	const tddPath = safe.tddPath === undefined ? undefined : normalizeRepositoryPath(safe.tddPath);
+	if (documentPath !== undefined && tddPath !== undefined && documentPath !== tddPath) {
+		throw new TypeError("task_contract_path_mismatch");
+	}
+	if (safe.source === "lightweight" && (documentPath !== undefined || tddPath !== undefined)) {
+		throw new TypeError("invalid_lightweight_document_path");
+	}
+	const semantic =
+		safe.source === "tdd"
+			? {
+					...common,
+					source: "tdd" as const,
+					...(documentPath === undefined ? {} : { documentPath }),
+					contractHash,
+					...(tddPath === undefined ? {} : { tddPath }),
+				}
+			: { ...common, source: "lightweight" as const };
+	const revision = semanticHash(semantic);
+	if (safe.revision !== revision) throw new TypeError("task_contract_revision_mismatch");
+	if (safe.source === "lightweight" && contractHash !== revision) {
+		throw new TypeError("task_contract_hash_mismatch");
+	}
+	return deepFreeze({
+		...semantic,
+		contractHash,
+		revision,
+		createdAt: strictIso(safe.createdAt, "created_at"),
 	});
 }
 

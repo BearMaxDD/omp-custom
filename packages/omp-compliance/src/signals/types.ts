@@ -14,6 +14,8 @@
  * task-delegation, verification) feeding off the same raw event stream.
  */
 
+import type { TaskContract } from "../contract/types";
+
 /** A captured tool_call event with selected fields. */
 export interface ToolCallRecord {
 	/** The tool name as emitted by the harness. */
@@ -84,6 +86,8 @@ export interface CodebaseToolEvidence {
 	readonly details?: Readonly<Record<string, unknown>>;
 	readonly detailsTruncated: boolean;
 	readonly detailsFailure: boolean;
+	readonly callTimestamp: string;
+	readonly resultTimestamp: string;
 }
 
 export interface CodebaseSymbolEvidence {
@@ -101,6 +105,7 @@ export interface CodebaseTraceEvidence {
 export interface CodebaseEvidencePack {
 	readonly schemaVersion: 1;
 	readonly projectId: string;
+	readonly taskContractRevision: `sha256:${string}`;
 	readonly codebaseProjectId: string;
 	readonly indexRevision: string;
 	readonly gitHead: string;
@@ -113,6 +118,25 @@ export interface CodebaseEvidencePack {
 	readonly symbols: readonly CodebaseSymbolEvidence[];
 	readonly traces: readonly CodebaseTraceEvidence[];
 	readonly evidenceRevision: `sha256:${string}`;
+}
+
+/**
+ * Nominal marker for a Collector-owned snapshot. This is an explicit handoff
+ * boundary, not a claim that same-process JavaScript cannot forge the value.
+ */
+export interface TrustedCodebaseCapture {
+	readonly __trustedCodebaseCaptureBrand: "collector_snapshot";
+	readonly pairs: ReadonlyArray<{ readonly call: ToolCallRecord; readonly result: ToolResultRecord }>;
+}
+
+export interface TrustedCodebaseValidationContext {
+	readonly taskContract: TaskContract;
+	readonly codebaseProjectId: string;
+	readonly diffHash: `sha256:${string}`;
+	readonly indexRevision: string;
+	readonly trustedPairs: TrustedCodebaseCapture;
+	readonly newFiles: readonly string[];
+	readonly requiredSymbols?: readonly string[];
 }
 
 /** Normalized evidence for one task (subagent) delegation. */

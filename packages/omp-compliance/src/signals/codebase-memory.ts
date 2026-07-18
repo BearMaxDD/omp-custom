@@ -17,7 +17,7 @@
 
 import { Buffer } from "node:buffer";
 import { types as utilTypes } from "node:util";
-import { normalizeRepositoryPath } from "../contracts/task-contract";
+import { normalizeRepositoryPath, validateTaskContractIntegrity } from "../contracts/task-contract";
 import { READONLY_CODEBASE_TOOLS, WRITE_CODEBASE_TOOLS } from "../xdev/codebase-tool-policy";
 import { canonicalArgsFingerprint, canonicalJson } from "../xdev/tool-identity";
 import type {
@@ -28,6 +28,8 @@ import type {
 	CodebaseTraceEvidence,
 	ToolCallRecord,
 	ToolResultRecord,
+	TrustedCodebaseCapture,
+	TrustedCodebaseValidationContext,
 } from "./types";
 
 /** The set of recognized codebase-memory tool names. */
@@ -59,22 +61,13 @@ const PACK_PATH_MAX_ITEMS = 512;
 const PACK_TOOL_MAX_ITEMS = 256;
 
 export interface CodebaseEvidencePackInput {
-	readonly projectId: string;
+	readonly taskContract: import("../contract/types").TaskContract;
 	readonly codebaseProjectId: string;
-	readonly gitHead: string;
 	readonly diffHash: string;
 	readonly queriedAt?: string;
-	readonly affectedFiles: readonly string[];
 	readonly allowedNewFileRoots: readonly string[];
 	readonly unresolvedClaims: readonly string[];
 	readonly pairs: ReadonlyArray<{ readonly call: ToolCallRecord; readonly result?: ToolResultRecord }>;
-}
-
-export interface CodebasePackValidationOptions {
-	readonly requiresTrace?: boolean;
-	readonly taskSource?: "tdd" | "lightweight";
-	readonly crossModule?: boolean;
-	readonly newFiles?: readonly string[];
 }
 
 /**
@@ -189,13 +182,14 @@ export function normalizeCodebaseMemory(paired: PairedInput | SingleInput): {
 }
 
 const SHA256_RE = /^sha256:[a-f0-9]{64}$/;
+const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const GIT_HEAD_RE = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
+const CODEBASE_PROJECT_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/;
 const PACK_INPUT_KEYS = new Set([
-	"projectId",
+	"taskContract",
 	"codebaseProjectId",
-	"gitHead",
 	"diffHash",
 	"queriedAt",
-	"affectedFiles",
 	"allowedNewFileRoots",
 	"unresolvedClaims",
 	"pairs",
@@ -204,6 +198,7 @@ const PACK_KEYS = new Set([
 	"schemaVersion",
 	"evidenceRevision",
 	"projectId",
+	"taskContractRevision",
 	"codebaseProjectId",
 	"indexRevision",
 	"gitHead",
@@ -216,7 +211,15 @@ const PACK_KEYS = new Set([
 	"allowedNewFileRoots",
 	"unresolvedClaims",
 ]);
-const OPTION_KEYS = new Set(["requiresTrace", "taskSource", "crossModule", "newFiles"]);
+const CONTEXT_KEYS = new Set([
+	"taskContract",
+	"codebaseProjectId",
+	"diffHash",
+	"indexRevision",
+	"trustedPairs",
+	"newFiles",
+	"requiredSymbols",
+]);
 const CALL_KEYS = new Set([
 	"toolName",
 	"toolCallId",
@@ -259,6 +262,44 @@ function strictHash(value: unknown, label: string): `sha256:${string}` {
 	const text = boundedPackString(value, label);
 	if (!SHA256_RE.test(text)) throw new TypeError(`invalid_${label}`);
 	return text as `sha256:${string}`;
+}
+
+function strictProjectId(value: unknown): string {
+	const projectId = boundedPackString(value, "project_id");
+	if (!UUID_V4_RE.test(projectId)) throw new TypeError("invalid_project_id");
+	return projectId.toLowerCase();
+}
+
+function strictGitHead(value: unknown): string {
+	const gitHead = boundedPackString(value, "git_head");
+	if (!GIT_HEAD_RE.test(gitHead)) throw new TypeError("invalid_git_head");
+	return gitHead;
+}
+
+function strictCodebaseProjectId(value: unknown): string {
+	const projectId = boundedPackString(value, "codebase_project_id");
+	if (!CODEBASE_PROJECT_RE.test(projectId) || projectId.includes(".."))
+		throw new TypeError("invalid_codebase_project_id");
+	return projectId;
+}
+
+function taskBinding(taskContract: import("../contract/types").TaskContract): {
+	projectId: string;
+	gitHead: string;
+	affectedFiles: string[];
+	revision: `sha256:${string}`;
+	source: "tdd" | "lightweight";
+	taskId: string;
+} {
+	const validated = validateTaskContractIntegrity(taskContract);
+	return {
+		projectId: strictProjectId(validated.projectId),
+		gitHead: strictGitHead(validated.gitHead),
+		affectedFiles: normalizePackPaths(validated.affectedFiles),
+		revision: strictHash(validated.revision, "task_contract_revision"),
+		source: validated.source,
+		taskId: boundedPackString(validated.taskId, "task_id"),
+	};
 }
 
 function plainCanonical<T>(value: unknown, label: string): T {
@@ -331,8 +372,8 @@ function normalizePair(pair: { call: ToolCallRecord; result?: ToolResultRecord }
 	);
 	if (paramsLossless && canonicalArgsFingerprint(params) !== argsFingerprint)
 		throw new TypeError("args_fingerprint_mismatch");
-	strictIso(call.timestamp, "tool_call_timestamp");
-	strictIso(result.timestamp, "tool_result_timestamp");
+	const callTimestamp = strictIso(call.timestamp, "tool_call_timestamp");
+	const resultTimestamp = strictIso(result.timestamp, "tool_result_timestamp");
 	const resultRef = boundedPackString(result.resultRef, "result_ref", true);
 	const details =
 		result.details === undefined ? undefined : plainCanonical<Record<string, unknown>>(result.details, "tool_details");
@@ -350,6 +391,8 @@ function normalizePair(pair: { call: ToolCallRecord; result?: ToolResultRecord }
 		...(details ? { details } : {}),
 		detailsTruncated: result.detailsTruncated,
 		detailsFailure: result.detailsFailure,
+		callTimestamp,
+		resultTimestamp,
 	};
 }
 
@@ -476,15 +519,31 @@ function deriveTraces(tools: readonly CodebaseToolEvidence[]): CodebaseTraceEvid
 	);
 }
 
-function deepFreezePack(pack: CodebaseEvidencePack): CodebaseEvidencePack {
-	const pending: object[] = [pack];
+function deepFreezeValue<T>(value: T): T {
+	const pending: object[] = typeof value === "object" && value !== null ? [value] : [];
 	while (pending.length > 0) {
 		const current = pending.pop();
 		if (!current || Object.isFrozen(current)) continue;
 		for (const child of Object.values(current)) if (typeof child === "object" && child !== null) pending.push(child);
 		Object.freeze(current);
 	}
-	return pack;
+	return value;
+}
+
+export function createTrustedCodebaseCapture(
+	pairs: ReadonlyArray<{ readonly call: ToolCallRecord; readonly result: ToolResultRecord }>,
+): TrustedCodebaseCapture {
+	const safePairs = plainCanonical<Array<{ call: ToolCallRecord; result: ToolResultRecord }>>(pairs, "trusted_pairs");
+	if (safePairs.length > PACK_TOOL_MAX_ITEMS) throw new TypeError("invalid_trusted_pairs");
+	const seen = new Map<string, string>();
+	for (const pair of safePairs) {
+		const tool = normalizePair(pair);
+		const canonical = canonicalJson(tool) ?? "";
+		const previous = seen.get(tool.toolCallId);
+		if (previous && previous !== canonical) throw new TypeError("conflicting_tool_call_id");
+		seen.set(tool.toolCallId, canonical);
+	}
+	return deepFreezeValue({ __trustedCodebaseCaptureBrand: "collector_snapshot", pairs: safePairs });
 }
 
 export function computeEvidenceRevision(pack: Omit<CodebaseEvidencePack, "evidenceRevision">): `sha256:${string}` {
@@ -496,11 +555,23 @@ export function computeEvidenceRevision(pack: Omit<CodebaseEvidencePack, "eviden
 export function createCodebaseEvidencePack(input: CodebaseEvidencePackInput): CodebaseEvidencePack {
 	const safe = plainCanonical<CodebaseEvidencePackInput>(input, "evidence_pack_input");
 	assertKeys(safe, PACK_INPUT_KEYS, "evidence_pack_input");
+	const task = taskBinding(safe.taskContract);
+	const codebaseProjectId = strictCodebaseProjectId(safe.codebaseProjectId);
+	const queriedAt = strictIso(safe.queriedAt ?? new Date().toISOString(), "queried_at");
 	if (!Array.isArray(safe.pairs) || safe.pairs.length > PACK_TOOL_MAX_ITEMS) throw new TypeError("invalid_tool_pairs");
 	const tools: CodebaseToolEvidence[] = [];
 	const seen = new Map<string, string>();
 	for (const pair of safe.pairs) {
 		const tool = normalizePair(pair);
+		if (tool.access === "read" && tool.params.project !== codebaseProjectId) {
+			throw new TypeError(`project_mismatch:${tool.toolName}`);
+		}
+		if (
+			Date.parse(tool.callTimestamp) > Date.parse(tool.resultTimestamp) ||
+			Date.parse(tool.resultTimestamp) > Date.parse(queriedAt)
+		) {
+			throw new TypeError("invalid_tool_time_order");
+		}
 		const canonical = canonicalJson(tool);
 		if (!canonical) throw new TypeError("invalid_tool_pair");
 		const previous = seen.get(tool.toolCallId);
@@ -519,20 +590,21 @@ export function createCodebaseEvidencePack(input: CodebaseEvidencePackInput): Co
 	if (readyRevisions.size > 1) throw new TypeError("conflicting_index_revision");
 	const body = {
 		schemaVersion: 1 as const,
-		projectId: boundedPackString(safe.projectId, "project_id"),
-		codebaseProjectId: boundedPackString(safe.codebaseProjectId, "codebase_project_id"),
+		projectId: task.projectId,
+		taskContractRevision: task.revision,
+		codebaseProjectId,
 		indexRevision: [...readyRevisions][0] ?? "",
-		gitHead: boundedPackString(safe.gitHead, "git_head"),
+		gitHead: task.gitHead,
 		diffHash: strictHash(safe.diffHash, "diff_hash"),
-		queriedAt: strictIso(safe.queriedAt ?? new Date().toISOString(), "queried_at"),
+		queriedAt,
 		tools,
 		symbols: deriveSymbols(tools),
 		traces: deriveTraces(tools),
-		affectedFiles: normalizePackPaths(safe.affectedFiles),
+		affectedFiles: task.affectedFiles,
 		allowedNewFileRoots: normalizePackPaths(safe.allowedNewFileRoots, true, "allowed_new_file_roots"),
 		unresolvedClaims: normalizeClaims(safe.unresolvedClaims),
 	};
-	return deepFreezePack({ ...body, evidenceRevision: computeEvidenceRevision(body) });
+	return deepFreezeValue({ ...body, evidenceRevision: computeEvidenceRevision(body) });
 }
 
 function pathCovered(path: string, affected: ReadonlySet<string>, roots: readonly string[]): boolean {
@@ -542,30 +614,45 @@ function pathCovered(path: string, affected: ReadonlySet<string>, roots: readonl
 export function validateCodebasePack(
 	pack: CodebaseEvidencePack,
 	changedFiles: readonly string[],
-	options: CodebasePackValidationOptions = {},
+	context: TrustedCodebaseValidationContext,
 ): string[] {
 	const safePack = plainCanonical<CodebaseEvidencePack>(pack, "evidence_pack");
 	const safeChanged = plainCanonical<readonly string[]>(changedFiles, "changed_files");
-	const safeOptions = plainCanonical<CodebasePackValidationOptions>(options, "pack_validation_options");
+	const safeContext = plainCanonical<TrustedCodebaseValidationContext>(context, "trusted_validation_context");
 	assertKeys(safePack, PACK_KEYS, "evidence_pack");
-	assertKeys(safeOptions, OPTION_KEYS, "pack_validation_options");
-	boundedPackString(safePack.projectId, "project_id");
-	boundedPackString(safePack.codebaseProjectId, "codebase_project_id");
-	boundedPackString(safePack.gitHead, "git_head");
+	assertKeys(safeContext, CONTEXT_KEYS, "trusted_validation_context");
+	if (safeContext.trustedPairs?.__trustedCodebaseCaptureBrand !== "collector_snapshot")
+		throw new TypeError("invalid_trusted_capture");
+	const task = taskBinding(safeContext.taskContract);
+	const contextCodebaseProjectId = strictCodebaseProjectId(safeContext.codebaseProjectId);
+	const contextDiffHash = strictHash(safeContext.diffHash, "context_diff_hash");
+	const contextIndexRevision = boundedPackString(safeContext.indexRevision, "context_index_revision");
+	const requiredSymbols = safeContext.requiredSymbols === undefined ? [] : normalizeClaims(safeContext.requiredSymbols);
+	strictProjectId(safePack.projectId);
+	strictHash(safePack.taskContractRevision, "task_contract_revision");
+	strictCodebaseProjectId(safePack.codebaseProjectId);
+	strictGitHead(safePack.gitHead);
 	boundedPackString(safePack.indexRevision, "index_revision", true);
 	if (safePack.schemaVersion !== 1 || !SHA256_RE.test(safePack.diffHash) || !SHA256_RE.test(safePack.evidenceRevision))
 		throw new TypeError("invalid_evidence_pack_schema");
 	strictIso(safePack.queriedAt, "queried_at");
 	const changed = normalizePackPaths(safeChanged, true, "changed_files");
-	const newFiles = normalizePackPaths(safeOptions.newFiles ?? [], true, "new_files");
+	const newFiles = normalizePackPaths(safeContext.newFiles, true, "new_files");
 	const affected = normalizePackPaths(safePack.affectedFiles);
 	const roots = normalizePackPaths(safePack.allowedNewFileRoots, true, "allowed_new_file_roots");
 	const claims = normalizeClaims(safePack.unresolvedClaims);
 	if (!Array.isArray(safePack.tools) || safePack.tools.length > PACK_TOOL_MAX_ITEMS)
 		throw new TypeError("invalid_tools");
-	const affectedSet = new Set(affected);
+	const affectedSet = new Set(task.affectedFiles);
 	const newSet = new Set(newFiles);
 	const errors: string[] = [];
+	if (safePack.projectId !== task.projectId) errors.push("project_id_mismatch");
+	if (safePack.taskContractRevision !== task.revision) errors.push("task_contract_mismatch");
+	if (safePack.codebaseProjectId !== contextCodebaseProjectId) errors.push("codebase_project_id_mismatch");
+	if (safePack.gitHead !== task.gitHead) errors.push("git_head_mismatch");
+	if (safePack.diffHash !== contextDiffHash) errors.push("diff_hash_mismatch");
+	if (safePack.indexRevision !== contextIndexRevision) errors.push("index_revision_mismatch");
+	if (canonicalJson(affected) !== canonicalJson(task.affectedFiles)) errors.push("affected_files_mismatch");
 	const trusted: CodebaseToolEvidence[] = [];
 	const ids = new Map<string, string>();
 	for (const raw of safePack.tools) {
@@ -578,17 +665,17 @@ export function validateCodebasePack(
 					qualifiedName: raw.qualifiedName,
 					argsFingerprint: raw.argsFingerprint,
 					params: raw.params,
-					timestamp: safePack.queriedAt,
+					timestamp: raw.callTimestamp,
 				},
 				result: {
 					toolCallId: raw.toolCallId,
 					success: raw.success,
 					source: raw.source,
 					resultRef: raw.resultRef,
-					details: raw.details,
+					...(raw.details ? { details: raw.details } : {}),
 					detailsTruncated: raw.detailsTruncated,
 					detailsFailure: raw.detailsFailure,
-					timestamp: safePack.queriedAt,
+					timestamp: raw.resultTimestamp,
 				},
 			});
 			const canonical = canonicalJson(tool) ?? "";
@@ -603,7 +690,7 @@ export function validateCodebasePack(
 		}
 	}
 	const projectValid = (tool: CodebaseToolEvidence) =>
-		tool.access !== "read" || tool.params.project === safePack.codebaseProjectId;
+		tool.access !== "read" || tool.params.project === contextCodebaseProjectId;
 	for (const tool of trusted) if (!projectValid(tool)) errors.push(`project_mismatch:${tool.toolName}`);
 	const successful = trusted.filter(
 		(tool) => tool.success && !tool.detailsFailure && !tool.detailsTruncated && projectValid(tool),
@@ -613,24 +700,44 @@ export function validateCodebasePack(
 		.map(indexFields)
 		.filter((field) => field.status === "ready" && field.revision);
 	if (statuses.length === 0) errors.push("missing_index_status");
-	else if (statuses.some((field) => field.revision !== safePack.indexRevision)) errors.push("index_revision_mismatch");
+	else if (
+		statuses.some((field) => field.revision !== safePack.indexRevision || field.revision !== contextIndexRevision)
+	)
+		errors.push("index_revision_mismatch");
 	if (!safePack.indexRevision) errors.push("missing_index_revision");
 	if (!successful.some((tool) => tool.toolName === "get_architecture" || tool.toolName === "search_graph"))
 		errors.push("missing_architecture_or_search");
-	const relevant = (tool: CodebaseToolEvidence) =>
-		relatedFiles(tool).some((file) => pathCovered(file, affectedSet, roots));
-	if (!successful.some((tool) => tool.toolName === "get_code_snippet" && relevant(tool)))
-		errors.push("missing_relevant_snippet");
-	const traceRequired =
-		safeOptions.requiresTrace === true ||
-		safeOptions.taskSource === "tdd" ||
-		safeOptions.crossModule === true ||
-		affected.length > 1;
-	if (
-		traceRequired &&
-		!successful.some((tool) => (tool.toolName === "trace_path" || tool.toolName === "query_graph") && relevant(tool))
-	)
-		errors.push("missing_relevant_trace");
+	const relevant = (tool: CodebaseToolEvidence) => relatedFiles(tool).some((file) => affectedSet.has(file));
+	const searchSymbols = new Set(
+		deriveSymbols(successful.filter((tool) => tool.toolName === "search_graph")).map((symbol) => symbol.qualifiedName),
+	);
+	const relevantSnippets = successful.filter((tool) => {
+		if (tool.toolName !== "get_code_snippet" || !relevant(tool)) return false;
+		const qualifiedName = tool.params.qualified_name;
+		return typeof qualifiedName === "string" && (searchSymbols.size === 0 || searchSymbols.has(qualifiedName));
+	});
+	if (relevantSnippets.length === 0) errors.push("missing_relevant_snippet");
+	const knownSymbols = new Set(deriveSymbols(successful).map((symbol) => symbol.qualifiedName));
+	const relevantSymbols = new Set(searchSymbols);
+	for (const snippet of relevantSnippets) {
+		const qualifiedName = snippet.params.qualified_name;
+		if (typeof qualifiedName === "string") relevantSymbols.add(qualifiedName);
+	}
+	for (const required of requiredSymbols)
+		if (!knownSymbols.has(required)) errors.push(`missing_required_symbol:${required}`);
+	const traceRequired = task.source === "tdd" || task.affectedFiles.length > 1;
+	const relevantTrace = (tool: CodebaseToolEvidence) => {
+		if (!(tool.toolName === "trace_path" || tool.toolName === "query_graph") || !relevant(tool)) return false;
+		const root = resultObject(tool);
+		const source = root.source ?? tool.params.function_name ?? tool.params.query;
+		const target = root.target;
+		return (
+			relevantSymbols.size === 0 ||
+			(typeof source === "string" && relevantSymbols.has(source)) ||
+			(typeof target === "string" && relevantSymbols.has(target))
+		);
+	};
+	if (traceRequired && !successful.some(relevantTrace)) errors.push("missing_relevant_trace");
 	for (const file of changed)
 		if (!affectedSet.has(file) && !(newSet.has(file) && pathCovered(file, affectedSet, roots)))
 			errors.push(`uncovered_file:${file}`);
@@ -641,6 +748,27 @@ export function validateCodebasePack(
 	const derivedTraces = deriveTraces(trusted);
 	if (canonicalJson(derivedSymbols) !== canonicalJson(safePack.symbols)) errors.push("symbols_mismatch");
 	if (canonicalJson(derivedTraces) !== canonicalJson(safePack.traces)) errors.push("traces_mismatch");
+	try {
+		const expectedPack = createCodebaseEvidencePack({
+			taskContract: safeContext.taskContract,
+			codebaseProjectId: contextCodebaseProjectId,
+			diffHash: contextDiffHash,
+			queriedAt: safePack.queriedAt,
+			allowedNewFileRoots: roots,
+			unresolvedClaims: claims,
+			pairs: safeContext.trustedPairs.pairs,
+		});
+		if (expectedPack.indexRevision !== contextIndexRevision) errors.push("index_revision_mismatch");
+		if (
+			canonicalJson(expectedPack.tools) !== canonicalJson(safePack.tools) ||
+			canonicalJson(expectedPack.symbols) !== canonicalJson(safePack.symbols) ||
+			canonicalJson(expectedPack.traces) !== canonicalJson(safePack.traces) ||
+			expectedPack.evidenceRevision !== safePack.evidenceRevision
+		)
+			errors.push("trusted_capture_mismatch");
+	} catch {
+		errors.push("trusted_capture_mismatch");
+	}
 	const { evidenceRevision: _ignored, ...revisionBody } = safePack;
 	if (computeEvidenceRevision(revisionBody) !== safePack.evidenceRevision) errors.push("evidence_revision_mismatch");
 	return [...new Set(errors)];
