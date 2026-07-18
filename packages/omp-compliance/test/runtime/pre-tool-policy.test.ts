@@ -362,6 +362,38 @@ describe("PreToolPolicy canonical Codebase identities", () => {
 });
 
 describe("PreToolPolicy trusted Codebase evidence gate", () => {
+	it.each([
+		["edit", { path: "src/existing.ts" }],
+		["write", { path: "src/existing.ts" }],
+		["bash", { command: "rm -- src/existing.ts" }],
+		["task", { prompt: "delegate Task 14" }],
+		["hub", { prompt: "delegate Task 14" }],
+	] as Array<[string, Record<string, unknown>]>)(
+		"rejects cross-task reuse for the side-effecting %s tool",
+		(toolName, args) => {
+			const valid = trustedEvidence();
+			const { records, sink } = recorder();
+			const decision = new PreToolPolicy(sink).evaluate(
+				builtinCall(toolName, args, {
+					taskId: "other-task",
+					evidenceRevision: valid.evidenceRevision,
+				}),
+				valid,
+			);
+
+			expect(decision).toEqual({ allow: false, reason: "task_identity_mismatch" });
+			expect(records).toHaveLength(1);
+			expect(records[0]).toMatchObject({
+				task: "other-task",
+				canonicalTool: toolName,
+				contractRevision: valid.contract.revision,
+				packEvidenceRevision: valid.codebasePack.evidenceRevision,
+				reason: "task_identity_mismatch",
+				remediationAction: "Use a tool call task identity that matches the validated trusted TaskContract.",
+			});
+		},
+	);
+
 	it("rejects an ordinary object pretending to be the Task 12 capability", () => {
 		const valid = trustedEvidence();
 		const forgedCapability = JSON.parse(JSON.stringify(valid.trustedCodebaseContext));

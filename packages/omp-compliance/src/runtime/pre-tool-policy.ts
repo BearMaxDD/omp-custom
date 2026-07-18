@@ -41,6 +41,7 @@ export type PreToolDenyReason =
 	| "advisor_tool_forbidden"
 	| "invalid_input"
 	| "invalid_codebase_evidence"
+	| "task_identity_mismatch"
 	| "missing_codebase_evidence"
 	| "missing_contract"
 	| "scope_violation"
@@ -114,6 +115,7 @@ const REMEDIATION_ACTIONS: Readonly<Record<PreToolDenyReason, string>> = {
 	advisor_tool_forbidden: "Use only canonical read-only Codebase tools from the Advisor.",
 	invalid_input: "Submit a bounded canonical tool call with plain data-only inputs.",
 	invalid_codebase_evidence: "Rebuild trusted Codebase evidence from the controlled collector before retrying.",
+	task_identity_mismatch: "Use a tool call task identity that matches the validated trusted TaskContract.",
 	missing_codebase_evidence: "Provide a trusted Codebase context and its validated Evidence Pack before retrying.",
 	missing_contract: "Provide a valid TaskContract before retrying the tool call.",
 	scope_violation: "Restrict mutation targets to the trusted contract and Codebase evidence scope.",
@@ -503,6 +505,9 @@ export class PreToolPolicy {
 			validatedContract.gitHead !== context.codebasePack.gitHead
 		) {
 			return deny("invalid_codebase_evidence");
+		}
+		if (call.taskId !== validatedContract.taskId || call.taskId !== trustedContract.taskId) {
+			return deny("task_identity_mismatch");
 		}
 		if (
 			call.evidenceRevision !== context.evidenceRevision ||
