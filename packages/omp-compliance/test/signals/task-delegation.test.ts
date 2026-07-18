@@ -1,7 +1,19 @@
 import { describe, expect, it } from "bun:test";
 import type { ToolCallEvent, ToolResultEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { SingleResult, TaskToolDetails } from "@oh-my-pi/pi-coding-agent/task/types";
-import { normalizeDelegationEvents } from "../../src/signals/task-delegation";
+import type { JobSnapshot } from "@oh-my-pi/pi-coding-agent/tools/hub/types";
+import { createLightweightTaskContract } from "../../src/contracts/task-contract";
+import {
+	createDelegationEvidenceVerifier,
+	createDelegationRecord,
+	createTrustedDelegationContext,
+	delegationSatisfiesGate,
+} from "../../src/delegation/delegation-supervisor";
+import {
+	applyNormalizedDelegationEvents,
+	createTrustedDelegationNormalizationContext,
+	normalizeDelegationEvents,
+} from "../../src/signals/task-delegation";
 import { ToolEventCollector } from "../../src/signals/tool-event-collector";
 import type { ToolCallRecord, ToolResultRecord } from "../../src/signals/types";
 
@@ -413,13 +425,37 @@ function storedResult(toolCallId: string, details?: Record<string, unknown>): To
 	};
 }
 
+function trustedHubContext(binding: Parameters<typeof createTrustedDelegationNormalizationContext>[1][number]) {
+	const taskContract = createLightweightTaskContract({
+		projectId: "123e4567-e89b-42d3-a456-426614174000",
+		gitHead: "a".repeat(40),
+		taskId: "task-14",
+		affectedFiles: ["src/owned.ts"],
+		scope: ["实现任务 14"],
+		acceptanceCriteria: ["通过完成门"],
+		verificationCommands: ["bun test"],
+		createdAt: "2026-07-18T10:00:00.000Z",
+		lowRisk: true,
+	});
+	const evidenceRevision = `sha256:${"b".repeat(64)}` as const;
+	const verifier = createDelegationEvidenceVerifier((revision) => ({
+		taskId: taskContract.taskId,
+		contractHash: taskContract.contractHash,
+		evidenceRevision: revision,
+	}));
+	return createTrustedDelegationNormalizationContext(
+		createTrustedDelegationContext({ taskContract, evidenceRevision }, verifier),
+		[binding],
+	);
+}
+
 describe("task/hub 统一委派事件", () => {
 	it("从真实 task details 产生 completed 事件和工具 Evidence ID", () => {
 		const call = storedCall("task", "task-call-14", { task: "实现任务 14" });
 		const events = normalizeDelegationEvents([{ call, result: storedResult(call.toolCallId, taskDetails()) }]);
-		expect(events).toEqual([
+		expect(events.at(-1)).toEqual(
 			expect.objectContaining({
-				delegationId: "delegation-1",
+				delegationId: "task-call-14",
 				agentId: "delegation-1",
 				sessionId: "session-14",
 				toolCallId: "task-call-14",
@@ -428,7 +464,7 @@ describe("task/hub 统一委派事件", () => {
 				workPackage: "实现 fixture",
 				toolEvidenceIds: ["tool-result:task-call-14"],
 			}),
-		]);
+		);
 	});
 
 	it("从 task abortReason 归一化 timed_out", () => {
@@ -436,15 +472,22 @@ describe("task/hub 统一委派事件", () => {
 		const details = taskDetails({
 			results: [singleResult({ id: "agent-timeout", aborted: true, abortReason: "Timed out waiting for model" })],
 		});
-		expect(normalizeDelegationEvents([{ call, result: storedResult(call.toolCallId, details) }])).toEqual([
-			expect.objectContaining({ delegationId: "agent-timeout", status: "timed_out" }),
-		]);
+		expect(normalizeDelegationEvents([{ call, result: storedResult(call.toolCallId, details) }]).at(-1)).toEqual(
+			expect.objectContaining({ delegationId: "task-timeout", agentId: "agent-timeout", status: "timed_out" }),
+		);
 	});
 
 	it.each(["running", "completed", "failed", "cancelled"] as const)(
 		"从真实 hub jobs[] 归一化 task job 的 %s 生命周期",
 		(status) => {
 			const call = storedCall("hub", `hub-${status}`, { op: "wait", ids: ["agent-hub-14"] });
+			const context = trustedHubContext({
+				delegationId: "delegation-hub-14",
+				transport: "hub",
+				originalToolCallId: "task-original-hub-14",
+				jobId: "agent-hub-14",
+				agentId: "agent-real-14",
+			});
 			const events = normalizeDelegationEvents([
 				{
 					call,
@@ -461,11 +504,11 @@ describe("task/hub 统一委派事件", () => {
 						],
 					}),
 				},
-			]);
+			], context);
 			expect(events).toEqual([
 				expect.objectContaining({
-					delegationId: "agent-hub-14",
-					agentId: "agent-hub-14",
+					delegationId: "delegation-hub-14",
+					agentId: "agent-real-14",
 					sessionId: "session-14",
 					toolCallId: `hub-${status}`,
 					transport: "hub",
@@ -486,6 +529,12 @@ describe("task/hub 统一委派事件", () => {
 
 	it("从 hub task job 的结构化 timeout error 归一化 timed_out", () => {
 		const call = storedCall("hub", "hub-timeout", { op: "wait", ids: ["agent-timeout"] });
+		const context = trustedHubContext({
+			delegationId: "delegation-timeout",
+			transport: "hub",
+			originalToolCallId: "task-original-timeout",
+			jobId: "agent-timeout",
+		});
 		expect(
 			normalizeDelegationEvents([
 				{
@@ -504,8 +553,8 @@ describe("task/hub 统一委派事件", () => {
 						],
 					}),
 				},
-			]),
-		).toEqual([expect.objectContaining({ delegationId: "agent-timeout", status: "timed_out" })]);
+			], context),
+		).toEqual([expect.objectContaining({ delegationId: "delegation-timeout", status: "timed_out" })]);
 	});
 
 	it("忽略 hub 中非 task job，task 缺失 result 只产生 queued 且没有工具证据", () => {
@@ -530,5 +579,168 @@ describe("task/hub 统一委派事件", () => {
 				toolEvidenceIds: [],
 			}),
 		]);
+	});
+});
+
+describe("task/hub 官方事件到 Completion Gate 的可信闭环", () => {
+	const evidenceRevision = `sha256:${"b".repeat(64)}` as const;
+	const taskContract = createLightweightTaskContract({
+		projectId: "123e4567-e89b-42d3-a456-426614174000",
+		gitHead: "a".repeat(40),
+		taskId: "task-14",
+		affectedFiles: ["src/owned.ts"],
+		scope: ["实现任务 14"],
+		acceptanceCriteria: ["通过完成门"],
+		verificationCommands: ["bun test"],
+		createdAt: "2026-07-18T10:00:00.000Z",
+		lowRisk: true,
+	});
+	const verifier = createDelegationEvidenceVerifier((revision) => ({
+		taskId: taskContract.taskId,
+		contractHash: taskContract.contractHash,
+		evidenceRevision: revision,
+	}));
+	const trusted = createTrustedDelegationContext({ taskContract, evidenceRevision }, verifier);
+
+	it("Collector -> Normalizer -> Supervisor 使用同一 delegationId 完成 task", () => {
+		const collector = new ToolEventCollector();
+		collector.recordCall(taskCall({ task: "实现任务 14" }, "task-call-14"));
+		collector.recordResult(taskResult("task-call-14", taskDetails({ results: [singleResult({ id: "agent-real" })] })));
+		const snapshot = collector.snapshot();
+		const context = createTrustedDelegationNormalizationContext(trusted, [{
+			delegationId: "delegation-14",
+			transport: "task",
+			originalToolCallId: "task-call-14",
+			agentId: "agent-real",
+			actualFiles: ["src/owned.ts"],
+		}]);
+		const events = normalizeDelegationEvents(snapshot.calls.map((call) => ({
+			call,
+			result: snapshot.results.find((result) => result.toolCallId === call.toolCallId),
+		})), context);
+		const queued = createDelegationRecord({
+			delegationId: "delegation-14",
+			agentId: "agent-real",
+			sessionId: "session-14",
+			toolCallId: "task-call-14",
+			transport: "task",
+			workPackage: "实现任务 14",
+			context: trusted,
+		});
+		const completed = applyNormalizedDelegationEvents(queued, events);
+
+		expect(events.map((event) => [event.delegationId, event.status])).toEqual([
+			["delegation-14", "running"],
+			["delegation-14", "completed"],
+		]);
+		expect(delegationSatisfiesGate(completed)).toBe(true);
+	});
+
+	it("call/result toolCallId 失配时 task 与 hub 都失败关闭", () => {
+		const task = storedCall("task", "task-expected", { task: "实现" });
+		const hub = storedCall("hub", "hub-expected", { op: "wait", ids: ["job-1"] });
+		const context = createTrustedDelegationNormalizationContext(trusted, [{
+			delegationId: "delegation-14",
+			transport: "hub",
+			originalToolCallId: "task-original",
+			jobId: "job-1",
+			agentId: "agent-real",
+			actualFiles: ["src/owned.ts"],
+		}]);
+		expect(normalizeDelegationEvents([{ call: task, result: storedResult("attacker", taskDetails()) }], context)).toEqual([]);
+		expect(normalizeDelegationEvents([{ call: hub, result: storedResult("attacker", { jobs: [] }) }], context)).toEqual([]);
+	});
+
+	it("Hub JobSnapshot 通过 jobId 显式绑定原始委派，轮询 toolCallId 不替换委派身份", () => {
+		const job = {
+			id: "job-14",
+			type: "task",
+			status: "completed",
+			label: "实现 hub 任务",
+			durationMs: 123,
+		} satisfies JobSnapshot;
+		const poll = storedCall("hub", "hub-poll-14", { op: "wait", ids: [job.id] });
+		const context = createTrustedDelegationNormalizationContext(trusted, [{
+			delegationId: "delegation-14",
+			transport: "hub",
+			originalToolCallId: "task-original-14",
+			jobId: job.id,
+			agentId: "agent-real",
+			actualFiles: ["src/owned.ts"],
+		}]);
+		const events = normalizeDelegationEvents([{ call: poll, result: storedResult(poll.toolCallId, { op: "wait", jobs: [job] }) }], context);
+		expect(events).toEqual([expect.objectContaining({
+			delegationId: "delegation-14",
+			jobId: "job-14",
+			agentId: "agent-real",
+			originToolCallId: "task-original-14",
+			resultToolCallId: "hub-poll-14",
+			status: "completed",
+		})]);
+	});
+
+	it("JobSnapshot 不含 agentId 时不得用 job.id 伪装，身份未知的 Gate 不通过", () => {
+		const job = {
+			id: "job-without-agent",
+			type: "task",
+			status: "completed",
+			label: "未知代理",
+			durationMs: 1,
+		} satisfies JobSnapshot;
+		const poll = storedCall("hub", "hub-poll", { op: "wait", ids: [job.id] });
+		const context = createTrustedDelegationNormalizationContext(trusted, [{
+			delegationId: "delegation-unknown",
+			transport: "hub",
+			originalToolCallId: "task-original",
+			jobId: job.id,
+			actualFiles: ["src/owned.ts"],
+		}]);
+		const events = normalizeDelegationEvents([{ call: poll, result: storedResult(poll.toolCallId, { jobs: [job] }) }], context);
+		expect(events[0]?.agentId).toBeUndefined();
+		expect(events[0]?.jobId).toBe(job.id);
+		const record = createDelegationRecord({
+			delegationId: "delegation-unknown",
+			sessionId: "session-14",
+			toolCallId: "task-original",
+			transport: "hub",
+			workPackage: "未知代理",
+			context: trusted,
+		});
+		expect(delegationSatisfiesGate(applyNormalizedDelegationEvents(record, events))).toBe(false);
+	});
+
+	it("无可信 actualFiles 绑定时 completed 保持 insufficient", () => {
+		const call = storedCall("task", "task-no-files", { task: "实现" });
+		const context = createTrustedDelegationNormalizationContext(trusted, [{
+			delegationId: "delegation-no-files",
+			transport: "task",
+			originalToolCallId: call.toolCallId,
+			agentId: "delegation-1",
+		}]);
+		const events = normalizeDelegationEvents([{ call, result: storedResult(call.toolCallId, taskDetails()) }], context);
+		const record = createDelegationRecord({
+			delegationId: "delegation-no-files",
+			agentId: "delegation-1",
+			sessionId: "session-14",
+			toolCallId: call.toolCallId,
+			transport: "task",
+			workPackage: "实现",
+			context: trusted,
+		});
+		expect(delegationSatisfiesGate(applyNormalizedDelegationEvents(record, events))).toBe(false);
+	});
+
+	it("Proxy、getter、非普通原型和超大数组不向外抛并失败关闭", () => {
+		const call = storedCall("task", "task-hostile", { task: "实现" });
+		const hostileValues: unknown[] = [
+			new Proxy({}, { get() { throw new Error("proxy trap"); } }),
+			Object.defineProperty({}, "results", { get() { throw new Error("getter"); } }),
+			Object.create({ results: [] }),
+			{ projectAgentsDir: null, totalDurationMs: 1, results: Array.from({ length: 513 }, () => singleResult()) },
+		];
+		for (const details of hostileValues) {
+			expect(() => normalizeDelegationEvents([{ call, result: storedResult(call.toolCallId, details as Record<string, unknown>) }])).not.toThrow();
+			expect(normalizeDelegationEvents([{ call, result: storedResult(call.toolCallId, details as Record<string, unknown>) }])).toEqual([]);
+		}
 	});
 });

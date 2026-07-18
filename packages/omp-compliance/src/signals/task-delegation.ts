@@ -1,34 +1,79 @@
-/**
- * Task Tool Delegation Evidence Normalizer.
- *
- * Recognizes "task" tool calls and extracts subagent delegation
- * evidence from paired tool_call / tool_result events.
- *
- * Only toolName === "task" is matched. Empty calls, missing results,
- * or error results produce "insufficient" status evidence.
- *
- * Fields extracted:
- *   - agent id from result details
- *   - task summary / assignment description
- *   - exit code and aborted indicator
- *   - duration in milliseconds
- *   - output artifact references
- *   - codebase references from the result
- */
+/** Normalize official v17 task and hub evidence into one supervised delegation lifecycle. */
 
+import { Buffer } from "node:buffer";
+import { types as utilTypes } from "node:util";
+import type { JobSnapshot } from "@oh-my-pi/pi-coding-agent/tools/hub/types";
+import {
+	applyDelegationEvent,
+	type DelegationRecord,
+	isTrustedDelegationContext,
+	type TrustedDelegationContext,
+} from "../delegation/delegation-supervisor";
 import type { TaskDelegationEvidence, ToolCallRecord, ToolResultRecord } from "./types";
 
 const TASK_TOOL_NAME = "task";
 const HUB_TOOL_NAME = "hub";
+const MAX_ITEMS = 512;
+const MAX_ID_BYTES = 256;
+const MAX_STRING_BYTES = 4096;
+
+export interface DelegationBinding {
+	readonly delegationId: string;
+	readonly transport: "task" | "hub";
+	readonly originalToolCallId: string;
+	readonly jobId?: string;
+	readonly agentId?: string;
+	readonly actualFiles?: readonly string[];
+}
+
+export interface TrustedDelegationNormalizationContext {
+	readonly delegation: TrustedDelegationContext;
+	readonly bindings: readonly DelegationBinding[];
+}
+
+const trustedNormalizationContexts = new WeakSet<object>();
+
+export function createTrustedDelegationNormalizationContext(
+	delegation: TrustedDelegationContext,
+	bindings: readonly DelegationBinding[],
+): TrustedDelegationNormalizationContext {
+	if (!isTrustedDelegationContext(delegation)) throw new TypeError("invalid_trusted_delegation_context");
+	if (!Array.isArray(bindings) || bindings.length > MAX_ITEMS) throw new TypeError("invalid_delegation_bindings");
+	const normalized = bindings.map((binding) => {
+		if (!isPlainRecord(binding)) throw new TypeError("invalid_delegation_binding");
+		if (binding.transport !== "task" && binding.transport !== "hub") {
+			throw new TypeError("invalid_delegation_binding_transport");
+		}
+		const transport = binding.transport as DelegationBinding["transport"];
+		const actualFiles = binding.actualFiles === undefined
+			? undefined
+			: boundedStringArray(binding.actualFiles, "binding_actual_files", 1024);
+		return {
+			delegationId: boundedString(binding.delegationId, "binding_delegation_id", MAX_ID_BYTES),
+			transport,
+			originalToolCallId: boundedString(binding.originalToolCallId, "binding_tool_call_id", MAX_ID_BYTES),
+			...(binding.jobId === undefined ? {} : { jobId: boundedString(binding.jobId, "binding_job_id", MAX_ID_BYTES) }),
+			...(binding.agentId === undefined ? {} : { agentId: boundedString(binding.agentId, "binding_agent_id", MAX_ID_BYTES) }),
+			...(actualFiles === undefined ? {} : { actualFiles }),
+		};
+	});
+	const context = deepFreeze({ delegation, bindings: normalized });
+	trustedNormalizationContexts.add(context);
+	return context;
+}
 
 export interface NormalizedDelegationEvent {
 	readonly delegationId: string;
 	readonly agentId?: string;
+	readonly jobId?: string;
 	readonly sessionId?: string;
 	readonly toolCallId: string;
+	readonly originToolCallId: string;
+	readonly resultToolCallId?: string;
 	readonly transport: "task" | "hub";
 	readonly status: "queued" | "running" | "completed" | "failed" | "cancelled" | "timed_out";
 	readonly workPackage?: string;
+	readonly actualFilesKnown: boolean;
 	readonly actualFiles: readonly string[];
 	readonly toolEvidenceIds: readonly string[];
 }
@@ -36,13 +81,58 @@ export interface NormalizedDelegationEvent {
 /** Normalize only official structured task/hub results into supervision events. */
 export function normalizeDelegationEvents(
 	paired: ReadonlyArray<{ call: ToolCallRecord; result?: ToolResultRecord }>,
+	context?: TrustedDelegationNormalizationContext,
 ): NormalizedDelegationEvent[] {
+	if (!Array.isArray(paired) || paired.length > MAX_ITEMS) return [];
+	if (context !== undefined && !trustedNormalizationContexts.has(context)) return [];
 	const events: NormalizedDelegationEvent[] = [];
-	for (const pair of paired) {
-		if (pair.call.toolName === TASK_TOOL_NAME) events.push(...normalizeTaskEvents(pair.call, pair.result));
-		if (pair.call.toolName === HUB_TOOL_NAME) events.push(...normalizeHubEvents(pair.call, pair.result));
+	for (const rawPair of paired) {
+		try {
+			if (!isPlainRecord(rawPair) || !isToolCallRecord(rawPair.call)) continue;
+			const pair = rawPair as { call: ToolCallRecord; result?: ToolResultRecord };
+			if (pair.result !== undefined && (!isToolResultRecord(pair.result) || pair.result.toolCallId !== pair.call.toolCallId)) {
+				continue;
+			}
+			if (pair.call.toolName === TASK_TOOL_NAME) {
+				events.push(...normalizeTaskEvents(pair.call, pair.result, context));
+			}
+			if (pair.call.toolName === HUB_TOOL_NAME) {
+				events.push(...normalizeHubEvents(pair.call, pair.result, context));
+			}
+		} catch {
+			continue;
+		}
 	}
-	return events;
+	return deepFreeze(events);
+}
+
+export function applyNormalizedDelegationEvents(
+	record: DelegationRecord,
+	events: readonly NormalizedDelegationEvent[],
+): DelegationRecord {
+	let current = record;
+	for (const event of events) {
+		if (event.delegationId !== current.delegationId) continue;
+		if (event.status === "queued") continue;
+		if (current.status === "queued") {
+			current = applyDelegationEvent(current, { delegationId: event.delegationId, type: "started" });
+		}
+		if (event.status === "running") continue;
+		if (event.status === "completed") {
+			current = applyDelegationEvent(current, {
+				delegationId: event.delegationId,
+				type: "completed",
+				originToolCallId: event.originToolCallId,
+				resultToolCallId: event.resultToolCallId ?? event.toolCallId,
+				actualFilesKnown: event.actualFilesKnown,
+				actualFiles: event.actualFiles,
+				toolEvidenceIds: event.toolEvidenceIds,
+			});
+		} else {
+			current = applyDelegationEvent(current, { delegationId: event.delegationId, type: event.status });
+		}
+	}
+	return current;
 }
 
 /**
@@ -151,86 +241,122 @@ export function normalizeTaskDelegation(
 	return results;
 }
 
-function normalizeTaskEvents(call: ToolCallRecord, result?: ToolResultRecord): NormalizedDelegationEvent[] {
+function normalizeTaskEvents(
+	call: ToolCallRecord,
+	result?: ToolResultRecord,
+	context?: TrustedDelegationNormalizationContext,
+): NormalizedDelegationEvent[] {
+	const callBindings = context?.bindings.filter(
+		(binding) => binding.transport === "task" && binding.originalToolCallId === call.toolCallId,
+	) ?? [];
 	if (!result) {
-		return [delegationEvent(call, call.toolCallId, "task", "queued", extractTaskSummary(call.params), [])];
+		const bindings = callBindings.length > 0 ? callBindings : [{
+			delegationId: call.toolCallId,
+			transport: "task" as const,
+			originalToolCallId: call.toolCallId,
+		}];
+		return bindings.map((binding) => delegationEvent(
+			call,
+			binding,
+			"queued",
+			extractTaskSummary(call.params),
+			[],
+		));
 	}
 	if (
+		!result.success ||
 		result.source !== "official" ||
 		result.detailsTruncated ||
 		!result.details ||
 		!isTaskToolDetails(result.details)
-	) {
-		return [];
-	}
+	) return [];
 
-	const evidenceIds = [`tool-result:${call.toolCallId}`];
+	const evidenceIds = [`tool-result:${result.toolCallId}`];
 	const events: NormalizedDelegationEvent[] = [];
-	for (const value of result.details.results) {
+	for (const [index, value] of result.details.results.entries()) {
 		const single = readRecord(value);
 		if (!single) continue;
-		const id = toOptionalString(single.id);
-		if (!id) continue;
-		events.push({
-			...delegationEvent(
-				call,
-				id,
-				"task",
-				taskResultStatus(single, result.success),
-				extractSingleResultSummary(single) ?? extractTaskSummary(call.params),
-				evidenceIds,
-			),
-			agentId: id,
-		});
+		const agentId = toOptionalString(single.id);
+		if (!agentId) continue;
+		const binding = callBindings.find((candidate) => candidate.agentId === agentId) ??
+			callBindings[index] ?? {
+				delegationId: result.details.results.length === 1 ? call.toolCallId : `${call.toolCallId}:${index}`,
+				transport: "task" as const,
+				originalToolCallId: call.toolCallId,
+				agentId,
+			};
+		const summary = extractSingleResultSummary(single) ?? extractTaskSummary(call.params);
+		events.push(delegationEvent(call, binding, "running", summary, []));
+		events.push(delegationEvent(call, binding, taskResultStatus(single, result.success), summary, evidenceIds));
 	}
 
 	const asyncDetails = readRecord(result.details.async);
 	const jobId = toOptionalString(asyncDetails?.jobId);
-	if (events.length === 0 && jobId && asyncDetails?.state === "running") {
-		events.push(delegationEvent(call, jobId, "task", "running", extractTaskSummary(call.params), evidenceIds));
-	}
-	if (events.length === 0 && jobId && asyncDetails?.state === "failed") {
-		events.push(delegationEvent(call, jobId, "task", "failed", extractTaskSummary(call.params), evidenceIds));
+	if (events.length === 0 && jobId && (asyncDetails?.state === "running" || asyncDetails?.state === "failed")) {
+		const binding = callBindings.find((candidate) => candidate.jobId === jobId) ?? callBindings[0] ?? {
+			delegationId: call.toolCallId,
+			transport: "task" as const,
+			originalToolCallId: call.toolCallId,
+			jobId,
+		};
+		events.push(delegationEvent(
+			call,
+			binding,
+			asyncDetails.state === "running" ? "running" : "failed",
+			extractTaskSummary(call.params),
+			evidenceIds,
+		));
 	}
 	return events;
 }
 
-function normalizeHubEvents(call: ToolCallRecord, result?: ToolResultRecord): NormalizedDelegationEvent[] {
+function normalizeHubEvents(
+	call: ToolCallRecord,
+	result: ToolResultRecord | undefined,
+	context: TrustedDelegationNormalizationContext | undefined,
+): NormalizedDelegationEvent[] {
 	if (
+		!context ||
 		!result?.success ||
 		result.source !== "official" ||
 		result.detailsTruncated ||
 		!result.details ||
 		!isHubJobDetails(result.details)
-	) {
-		return [];
-	}
+	) return [];
 
-	const evidenceIds = [`tool-result:${call.toolCallId}`];
-	return result.details.jobs
-		.filter((job) => job.type === "task")
-		.map((job) => ({
-			...delegationEvent(call, job.id, "hub", hubJobStatus(job), job.label, evidenceIds),
-			agentId: job.id,
-		}));
+	const evidenceIds = [`tool-result:${result.toolCallId}`];
+	const events: NormalizedDelegationEvent[] = [];
+	for (const job of result.details.jobs) {
+		if (job.type !== "task") continue;
+		const binding = context.bindings.find(
+			(candidate) => candidate.transport === "hub" && candidate.jobId === job.id,
+		);
+		if (!binding) continue;
+		events.push(delegationEvent(call, binding, hubJobStatus(job), job.label, evidenceIds));
+	}
+	return events;
 }
 
 function delegationEvent(
 	call: ToolCallRecord,
-	delegationId: string,
-	transport: "task" | "hub",
+	binding: DelegationBinding,
 	status: NormalizedDelegationEvent["status"],
 	workPackage: string | undefined,
 	toolEvidenceIds: readonly string[],
 ): NormalizedDelegationEvent {
 	return {
-		delegationId,
-		sessionId: call.sessionId,
+		delegationId: binding.delegationId,
+		...(binding.agentId === undefined ? {} : { agentId: binding.agentId }),
+		...(binding.jobId === undefined ? {} : { jobId: binding.jobId }),
+		...(call.sessionId === undefined ? {} : { sessionId: call.sessionId }),
 		toolCallId: call.toolCallId,
-		transport,
+		originToolCallId: binding.originalToolCallId,
+		...(status === "queued" || status === "running" ? {} : { resultToolCallId: call.toolCallId }),
+		transport: binding.transport,
 		status,
-		workPackage,
-		actualFiles: [],
+		...(workPackage === undefined ? {} : { workPackage }),
+		actualFilesKnown: binding.actualFiles !== undefined,
+		actualFiles: binding.actualFiles ?? [],
 		toolEvidenceIds,
 	};
 }
@@ -246,24 +372,15 @@ function taskResultStatus(
 	return reason.includes("cancel") ? "cancelled" : "failed";
 }
 
-interface HubTaskJob {
-	readonly id: string;
-	readonly type: "task" | "bash";
-	readonly status: "running" | "completed" | "failed" | "cancelled";
-	readonly label: string;
-	readonly durationMs: number;
-	readonly errorText?: string;
-}
-
-function hubJobStatus(job: HubTaskJob): NormalizedDelegationEvent["status"] {
+function hubJobStatus(job: JobSnapshot): NormalizedDelegationEvent["status"] {
 	if (job.status === "failed" && /timed?\s*out|timeout/i.test(job.errorText ?? "")) return "timed_out";
 	return job.status;
 }
 
 function isHubJobDetails(
 	details: Record<string, unknown>,
-): details is Record<string, unknown> & { jobs: HubTaskJob[] } {
-	if (!Array.isArray(details.jobs)) return false;
+): details is Record<string, unknown> & { jobs: JobSnapshot[] } {
+	if (!Array.isArray(details.jobs) || details.jobs.length > MAX_ITEMS) return false;
 	return details.jobs.every((value) => {
 		const job = readRecord(value);
 		return (
@@ -314,12 +431,13 @@ function collectOutputArtifacts(details: Record<string, unknown>): string[] {
 		details.branchName,
 	]) {
 		if (Array.isArray(value)) {
-			artifacts.push(...value.map(String));
+			if (value.length > MAX_ITEMS) return [];
+			artifacts.push(...value.filter((item): item is string => typeof item === "string").slice(0, MAX_ITEMS));
 		} else if (typeof value === "string") {
 			artifacts.push(value);
 		}
 	}
-	return [...new Set(artifacts)];
+	return [...new Set(artifacts.filter((value) => Buffer.byteLength(value) <= MAX_STRING_BYTES))].slice(0, MAX_ITEMS);
 }
 
 const AGENT_SOURCES = new Set(["bundled", "user", "project"]);
@@ -329,7 +447,7 @@ function isTaskToolDetails(
 ): details is Record<string, unknown> & { results: unknown[] } {
 	if (
 		!(details.projectAgentsDir === null || typeof details.projectAgentsDir === "string") ||
-		!Array.isArray(details.results) ||
+		!Array.isArray(details.results) || details.results.length > MAX_ITEMS ||
 		!isFiniteNumber(details.totalDurationMs)
 	) {
 		return false;
@@ -388,7 +506,9 @@ function isTaskAsyncDetails(value: unknown): boolean {
 }
 
 function isStringArray(value: unknown): value is string[] {
-	return Array.isArray(value) && value.every((item) => typeof item === "string");
+	return Array.isArray(value) && value.length <= MAX_ITEMS && value.every(
+		(item) => typeof item === "string" && Buffer.byteLength(item) <= MAX_STRING_BYTES,
+	);
 }
 
 function isStringOrStringArray(value: unknown): boolean {
@@ -404,9 +524,60 @@ function isFiniteNumber(value: unknown): value is number {
 }
 
 function readRecord(value: unknown): Record<string, unknown> | undefined {
-	return typeof value === "object" && value !== null && !Array.isArray(value)
-		? (value as Record<string, unknown>)
-		: undefined;
+	return isPlainRecord(value) ? value : undefined;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+	if (typeof value !== "object" || value === null || Array.isArray(value) || utilTypes.isProxy(value)) return false;
+	try {
+		return Object.getPrototypeOf(value) === Object.prototype &&
+			Object.values(Object.getOwnPropertyDescriptors(value)).every((descriptor) => "value" in descriptor);
+	} catch {
+		return false;
+	}
+}
+
+function isToolCallRecord(value: unknown): value is ToolCallRecord {
+	const record = readRecord(value);
+	return record !== undefined &&
+		isBoundedString(record.toolName, MAX_ID_BYTES) &&
+		isBoundedString(record.toolCallId, MAX_ID_BYTES) &&
+		isPlainRecord(record.params) &&
+		(record.sessionId === undefined || isBoundedString(record.sessionId, MAX_ID_BYTES)) &&
+		isBoundedString(record.timestamp, MAX_STRING_BYTES);
+}
+
+function isToolResultRecord(value: unknown): value is ToolResultRecord {
+	const record = readRecord(value);
+	return record !== undefined &&
+		isBoundedString(record.toolCallId, MAX_ID_BYTES) &&
+		typeof record.success === "boolean" &&
+		typeof record.resultRef === "string" && Buffer.byteLength(record.resultRef) <= MAX_STRING_BYTES &&
+		(record.source === undefined || record.source === "official" || record.source === "legacy") &&
+		(record.details === undefined || isPlainRecord(record.details)) &&
+		(record.detailsTruncated === undefined || typeof record.detailsTruncated === "boolean") &&
+		(record.detailsFailure === undefined || typeof record.detailsFailure === "boolean") &&
+		isBoundedString(record.timestamp, MAX_STRING_BYTES);
+}
+
+function boundedStringArray(values: unknown, label: string, maxBytes: number): string[] {
+	if (!Array.isArray(values) || values.length > MAX_ITEMS) throw new TypeError(`invalid_${label}`);
+	return [...new Set(values.map((value) => boundedString(value, label, maxBytes)))];
+}
+
+function boundedString(value: unknown, label: string, maxBytes: number): string {
+	if (!isBoundedString(value, maxBytes)) throw new TypeError(`invalid_${label}`);
+	return value;
+}
+
+function isBoundedString(value: unknown, maxBytes: number): value is string {
+	return typeof value === "string" && value.trim().length > 0 && Buffer.byteLength(value) <= maxBytes;
+}
+
+function deepFreeze<T>(value: T): T {
+	if (typeof value !== "object" || value === null || Object.isFrozen(value)) return value;
+	for (const nested of Object.values(value)) deepFreeze(nested);
+	return Object.freeze(value);
 }
 
 function toOptionalString(value: unknown): string | undefined {
