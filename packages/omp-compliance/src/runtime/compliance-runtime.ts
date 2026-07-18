@@ -197,7 +197,11 @@ export class ComplianceRuntime {
 	 * @returns taskId and initial status
 	 * @throws if a task is already active
 	 */
-	async start(tddPath: string): Promise<{ taskId: string; status: string }> {
+	start(tddPath: string): Promise<{ taskId: string; status: string }> {
+		return this.serializeRuntimeOperation(() => this.startExclusive(tddPath));
+	}
+
+	private async startExclusive(tddPath: string): Promise<{ taskId: string; status: string }> {
 		if (this.taskState && this.taskState.status !== "stalled") {
 			throw new Error("A compliance task is already active");
 		}
@@ -824,7 +828,11 @@ export class ComplianceRuntime {
 	 *
 	 * @returns the new status
 	 */
-	resumeAfterRemediation(): string {
+	resumeAfterRemediation(): Promise<string> {
+		return this.serializeRuntimeOperation(() => this.resumeAfterRemediationExclusive());
+	}
+
+	private async resumeAfterRemediationExclusive(): Promise<string> {
 		if (!this.taskState) {
 			throw new Error("No active compliance task");
 		}

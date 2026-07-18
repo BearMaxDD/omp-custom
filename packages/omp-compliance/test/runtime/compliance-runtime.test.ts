@@ -236,6 +236,16 @@ describe("ComplianceRuntime — start", () => {
 		await runtime.start("tdd.md");
 		expect(runtime.start("tdd.md")).rejects.toThrow("already active");
 	});
+
+	it("并发 start 只允许一个调用建立 active 任务", async () => {
+		const results = await Promise.allSettled([runtime.start("tdd.md"), runtime.start("tdd.md")]);
+		expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+		expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+		const taskId = runtime.currentTaskState?.taskId;
+		if (!taskId) throw new Error("missing active task");
+		const evidence = await store.readAll(taskId);
+		expect(evidence.filter((record) => record.event === "active")).toHaveLength(1);
+	});
 });
 
 // ─── Tests: Stop ────────────────────────────────────────────────────
@@ -877,7 +887,7 @@ describe("ComplianceRuntime — lifecycle 与严格 Verdict 绑定", () => {
 				findings: [finding("round-1", "fix round one", "apply fix")],
 			}),
 		);
-		runtime.resumeAfterRemediation();
+		await runtime.resumeAfterRemediation();
 		const second = await runtime.requestCompletion({ summary: "second" });
 
 		const recoveredDependencies = createStrictRuntimeDependencies({
@@ -1026,7 +1036,7 @@ describe("ComplianceRuntime — acceptVerdict (remediation)", () => {
 		expect(hasFixMessage).toBe(true);
 
 		// resumeAfterRemediation should return "active"
-		const status = runtime.resumeAfterRemediation();
+		const status = await runtime.resumeAfterRemediation();
 		expect(status).toBe("active");
 		const secondRound = await runtime.requestCompletion({ summary: "第二次" });
 		const request = mockRequestReviewCalls.at(-1);
@@ -1124,13 +1134,13 @@ describe("ComplianceRuntime — acceptVerdict (remediation)", () => {
 // ─── Tests: resumeAfterRemediation ──────────────────────────────────
 
 describe("ComplianceRuntime — resumeAfterRemediation", () => {
-	it("should throw when no task is active", () => {
-		expect(() => runtime.resumeAfterRemediation()).toThrow("No active compliance task");
+	it("should throw when no task is active", async () => {
+		await expect(runtime.resumeAfterRemediation()).rejects.toThrow("No active compliance task");
 	});
 
 	it("should throw when task is not remediation_required", async () => {
 		await runtime.start("tdd.md");
-		expect(() => runtime.resumeAfterRemediation()).toThrow("Cannot resume from status");
+		await expect(runtime.resumeAfterRemediation()).rejects.toThrow("Cannot resume from status");
 	});
 
 	it("should increment attempt on resume", async () => {
@@ -1144,7 +1154,7 @@ describe("ComplianceRuntime — resumeAfterRemediation", () => {
 		);
 
 		const attemptBefore = runtime.currentTaskState?.attempt;
-		runtime.resumeAfterRemediation();
+		await runtime.resumeAfterRemediation();
 		expect(runtime.currentTaskState?.attempt).toBe(attemptBefore + 1);
 	});
 });

@@ -611,7 +611,7 @@ describe("Verdict protocol through ComplianceRuntime", () => {
 		expect(runtime.currentTaskState?.status).toBe("remediation_required");
 
 		// Resume and re-complete
-		runtime.resumeAfterRemediation();
+		await runtime.resumeAfterRemediation();
 
 		await runtime.requestCompletion({ summary: "Round 2" });
 

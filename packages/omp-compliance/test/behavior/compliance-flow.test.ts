@@ -539,7 +539,7 @@ describe("End-to-end compliance flow — pass scenarios", () => {
 		const attempt1 = runtime.currentTaskState?.attempt;
 
 		// Resume after remediation
-		runtime.resumeAfterRemediation();
+		await runtime.resumeAfterRemediation();
 		expect(runtime.currentTaskState?.status).toBe("active");
 		expect(runtime.currentTaskState?.attempt).toBe(attempt1 + 1);
 
@@ -570,7 +570,7 @@ describe("End-to-end compliance flow — pass scenarios", () => {
 		const attempt2 = runtime.currentTaskState?.attempt;
 
 		// Resume again
-		runtime.resumeAfterRemediation();
+		await runtime.resumeAfterRemediation();
 		expect(runtime.currentTaskState?.status).toBe("active");
 		expect(runtime.currentTaskState?.attempt).toBe(attempt2 + 1);
 
@@ -622,7 +622,7 @@ describe("End-to-end compliance flow — stalled scenario", () => {
 		expect(runtime.currentTaskState?.status).toBe("remediation_required");
 
 		// Resume
-		runtime.resumeAfterRemediation();
+		await runtime.resumeAfterRemediation();
 
 		// Round 2: same remediation — still remediation_required
 		recordTrustedVerification(collector, { command: "bun test", exitCode: 1 });
@@ -641,7 +641,7 @@ describe("End-to-end compliance flow — stalled scenario", () => {
 		expect(runtime.currentTaskState?.status).toBe("remediation_required");
 
 		// Resume
-		runtime.resumeAfterRemediation();
+		await runtime.resumeAfterRemediation();
 
 		// Round 3: same remediation — still remediation_required because
 		// acceptVerdict issues "verdict" events (not "remediation" events),
