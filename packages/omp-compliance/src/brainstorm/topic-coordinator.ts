@@ -163,6 +163,7 @@ export class TopicCoordinator {
 		if (topic.status !== "advisor_reviewing") {
 			throw new Error(`Cannot prepare review: cannot transition from "${topic.status}"`);
 		}
+		if (topic.pendingReview) throw new Error("Cannot prepare review: a review journal is already pending");
 		topic.pendingReview = review;
 		await this.store.saveState(topic);
 	}

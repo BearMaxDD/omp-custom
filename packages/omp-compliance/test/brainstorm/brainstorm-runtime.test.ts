@@ -656,7 +656,7 @@ describe("BrainstormRuntime", () => {
 		});
 
 		expect(restarted.registry.get(submitted.reviewId)).toBeUndefined();
-		expect(restarted.runtime.restoreAdvisorEnvelope(submitted.reviewId)).toBe(true);
+		expect(await restarted.runtime.restoreAdvisorEnvelope(submitted.reviewId)).toBe(true);
 		expect(restarted.registry.get(submitted.reviewId)).toBeDefined();
 	});
 
@@ -695,7 +695,7 @@ describe("BrainstormRuntime", () => {
 			schedulerStore: first.schedulerStore,
 			requestAdvisorReview: async (request) => ({ status: "accepted", reviewId: request.reviewId }),
 		});
-		await restarted.runtime.retryDueReviews();
+		expect(await restarted.runtime.restoreAdvisorEnvelope(submitted.reviewId)).toBe(false);
 		expect(restarted.coordinator.current()?.status).toBe("awaiting_user_decision");
 		expect(restarted.coordinator.current()?.pendingReview).toBeUndefined();
 	});

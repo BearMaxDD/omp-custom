@@ -231,13 +231,13 @@ export default function activate(api: ComplianceExtensionHost): void {
 	};
 
 	// ── Single advisor_before_run handler (compliance first, then brainstorm) ──
-	api.on("advisor_before_run", (e) => {
+	api.on("advisor_before_run", async (e) => {
 		// Compliance hook first (no lazy init needed)
 		const complianceResult = createComplianceAdvisorHook(registry, runtime)(e);
 		if (complianceResult) return complianceResult;
 		// Brainstorm hook — only init when compliance didn't match
 		if (e.trigger === "brainstorm_review") {
-			getBrainstormRuntime().restoreAdvisorEnvelope(e.reviewId);
+			await getBrainstormRuntime().restoreAdvisorEnvelope(e.reviewId);
 			return createBrainstormAdvisorHook(
 				brainstormRegistry,
 				getBrainstormInfra().coordinator,

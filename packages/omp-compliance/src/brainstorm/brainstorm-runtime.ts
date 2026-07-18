@@ -380,12 +380,23 @@ export class BrainstormRuntime {
 		}
 	}
 
-	restoreAdvisorEnvelope(reviewId: string): boolean {
-		const envelope = this.config.coordinator.current()?.reviewEnvelope;
-		if (!envelope || envelope.reviewId !== reviewId) return false;
-		this.activeEnvelope = envelope;
-		this.config.registry.put(envelope);
-		return true;
+	restoreAdvisorEnvelope(reviewId: string): Promise<boolean> {
+		return this.serializeOperation(async () => {
+			await this.ensureSchedulerReady();
+			const topic = this.config.coordinator.current();
+			const envelope = topic?.reviewEnvelope;
+			if (!topic || !envelope || envelope.reviewId !== reviewId) return false;
+			this.activeEnvelope = envelope;
+			if (topic.status === "advisor_reviewing" && topic.pendingReview) {
+				const completed = await this.config.scheduler.completeReview(reviewId);
+				if (!completed) throw new Error("Prepared Brainstorm review has no matching Scheduler intent");
+				await this.config.coordinator.commitPreparedReview(topic.topicId);
+				await this.dispatchFollowingReviews();
+				return false;
+			}
+			this.config.registry.put(envelope);
+			return true;
+		});
 	}
 
 	private envelopeFromIntent(topic: BrainstormTopicState, intent: ReviewIntent) {
