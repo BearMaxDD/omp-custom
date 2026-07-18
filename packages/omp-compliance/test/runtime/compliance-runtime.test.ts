@@ -283,6 +283,41 @@ describe("ComplianceRuntime — start", () => {
 		await failingRuntime.start("tdd.md");
 		expect((await store.readAll(taskId)).filter((record) => record.event === "active")).toHaveLength(1);
 	});
+
+	it("active Evidence 写入失败时补偿已落盘状态并允许干净重试", async () => {
+		let failActiveEvidence = true;
+		let persisted: ComplianceRuntimePersistenceSnapshot | undefined;
+		const failingStore = new EvidenceStore(join(tmpDir, ".omp", "failing-active-evidence"));
+		const append = failingStore.append.bind(failingStore);
+		failingStore.append = async (record) => {
+			if (record.event === "active" && failActiveEvidence) {
+				failActiveEvidence = false;
+				throw new Error("active evidence disk unavailable");
+			}
+			await append(record);
+		};
+		const dependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store: failingStore,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		});
+		const failingRuntime = new ComplianceRuntime(() => failingStore, collector, api, tmpDir, reviewDeps, {
+			...dependencies,
+			persistRuntimeState: (_taskId, snapshot) => {
+				persisted = structuredClone(snapshot);
+			},
+		});
+
+		await expect(failingRuntime.start("tdd.md")).rejects.toThrow("active evidence disk unavailable");
+		expect(failingRuntime.currentTaskState).toBeNull();
+		expect(persisted?.taskState).toBeNull();
+		expect(api.sentMessages).toHaveLength(0);
+
+		const result = await failingRuntime.start("tdd.md");
+		expect(result.status).toBe("active");
+		expect(persisted?.taskState?.status).toBe("active");
+		expect((await failingStore.readAll(result.taskId)).filter((record) => record.event === "active")).toHaveLength(1);
+	});
 });
 
 describe("ComplianceRuntime — persisted recovery", () => {

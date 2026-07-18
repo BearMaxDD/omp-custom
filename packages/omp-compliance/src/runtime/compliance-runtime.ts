@@ -444,10 +444,21 @@ export class ComplianceRuntime {
 			throw error;
 		}
 
-		// Write active evidence record
-		await this.writeEvidenceRecord("active", {
-			signalDigest: "task-started",
-		});
+		// Active Evidence and the persisted task must either both commit or both roll back.
+		try {
+			await this.writeEvidenceRecord("active", {
+				signalDigest: "task-started",
+			});
+		} catch (error) {
+			this.taskState = null;
+			this.contract = null;
+			this.activeEnvelope = undefined;
+			this.activeAdvisorEnvelope = undefined;
+			this.skipNextFinalPersistence = false;
+			await this.persistCurrentRuntimeState(taskId);
+			this.skipNextFinalPersistence = true;
+			throw error;
+		}
 
 		// Send brief managed prompt to the main agent
 		this.api.sendMessage(
