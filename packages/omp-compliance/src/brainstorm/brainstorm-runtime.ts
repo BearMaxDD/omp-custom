@@ -13,6 +13,7 @@ import type {
 	AdvisorReviewReceipt,
 	AdvisorReviewRequest,
 } from "@oh-my-pi/pi-coding-agent/advisor/review-protocol";
+import type { ReviewIntent } from "../scheduler/review-intent";
 import type { ReviewScheduler } from "../scheduler/review-scheduler";
 import type { CollectorRuntime } from "../signals/collector-runtime";
 import { BRAINSTORM_REVIEW_RULES } from "./advisor-rules";
@@ -20,7 +21,7 @@ import { buildTopicCodebaseEvidence } from "./codebase-evidence";
 import type { BrainstormReviewRegistry } from "./review-registry";
 import type { TopicCoordinator } from "./topic-coordinator";
 import { buildTopicPacket, renderTopicPacket } from "./topic-packet";
-import type { BrainstormTopicReadyInput, BrainstormTopicState } from "./types";
+import type { BrainstormReview, BrainstormTopicReadyInput, BrainstormTopicState } from "./types";
 
 // ─── Configuration ─────────────────────────────────────────────────────
 
@@ -83,6 +84,7 @@ export interface BrainstormSubmitTopicResult {
 export class BrainstormRuntime {
 	private config: BrainstormRuntimeConfig;
 	private activeEnvelope: import("./review-registry").BrainstormReviewEnvelope | undefined;
+	private operationTail: Promise<void> = Promise.resolve();
 
 	constructor(config: BrainstormRuntimeConfig) {
 		this.config = config;
@@ -153,6 +155,9 @@ export class BrainstormRuntime {
 				topicId: topic.topicId,
 				inputHash: topic.inputHash,
 				codebaseRelevance: topic.input.codebase_relevance,
+				context,
+				rules,
+				requestedToolNames: toolNames,
 			},
 		});
 		const reviewAttempt = Math.max(1, enqueued.intent.attempt + 1);
@@ -174,7 +179,7 @@ export class BrainstormRuntime {
 
 		// 4a. Transition state before envelope registration
 		try {
-			await coordinator.markReviewRequested(topic.topicId, reviewId);
+			await coordinator.markReviewRequested(topic.topicId, reviewId, envelope);
 		} catch (error) {
 			await scheduler.abandonReview(enqueued.intent.reviewId);
 			throw error;
@@ -203,7 +208,11 @@ export class BrainstormRuntime {
 		}
 	}
 
-	async handleAdvisorLifecycle(event: AdvisorReviewLifecycleEvent): Promise<void> {
+	handleAdvisorLifecycle(event: AdvisorReviewLifecycleEvent): Promise<void> {
+		return this.serializeOperation(() => this.handleAdvisorLifecycleExclusive(event));
+	}
+
+	private async handleAdvisorLifecycleExclusive(event: AdvisorReviewLifecycleEvent): Promise<void> {
 		if (event.trigger !== "brainstorm_review") return;
 		await this.config.scheduler.handleLifecycle(event, false);
 		const topic = this.config.coordinator.current();
@@ -220,25 +229,61 @@ export class BrainstormRuntime {
 		}
 	}
 
-	async retryDueReviews(): Promise<void> {
+	retryDueReviews(): Promise<void> {
+		return this.serializeOperation(() => this.retryDueReviewsExclusive());
+	}
+
+	private async retryDueReviewsExclusive(): Promise<void> {
 		await this.ensureSchedulerReady();
-		const topic = this.config.coordinator.current();
+		let topic = this.config.coordinator.current();
+		const schedulerSnapshot = this.config.scheduler.snapshot();
+		const persistedIntent = topic
+			? schedulerSnapshot.queued.find(
+					(intent) => intent.taskId === `brainstorm-${topic?.topicId}` && intent.trigger === "brainstorm_review",
+				)
+			: undefined;
+		if (topic?.status === "ready_for_advisor_review" && persistedIntent) {
+			const envelope = this.envelopeFromIntent(topic, persistedIntent);
+			await this.config.coordinator.markReviewRequested(topic.topicId, envelope.reviewId, envelope);
+			this.config.registry.put(envelope);
+			this.activeEnvelope = envelope;
+			await this.config.scheduler.pump();
+			topic = this.config.coordinator.current();
+		}
+		if (topic?.reviewEnvelope && !this.activeEnvelope) {
+			this.activeEnvelope = topic.reviewEnvelope;
+			this.config.registry.put(topic.reviewEnvelope);
+		}
+		if (topic?.status === "advisor_reviewing" && this.activeEnvelope) {
+			const schedulerState = this.config.scheduler.snapshot();
+			if (schedulerState.inFlight?.reviewId === this.activeEnvelope.reviewId) return;
+			const queued = schedulerState.queued.find(
+				(intent) => intent.taskId === `brainstorm-${topic?.topicId}` && intent.trigger === "brainstorm_review",
+			);
+			if (!queued || queued.attempt === 0) return;
+			this.config.registry.consume(this.activeEnvelope.reviewId);
+			await this.config.coordinator.markReviewUnavailable(
+				topic.topicId,
+				"Advisor dispatch failed or was restored after interruption",
+			);
+			topic = this.config.coordinator.current();
+		}
 		if (!topic || topic.status !== "review_unavailable" || !this.activeEnvelope) return;
 		const queued = this.config.scheduler.nextDueIntent(`brainstorm-${topic.topicId}`, "brainstorm_review");
 		if (!queued) return;
 		const reviewId = reviewIdFor(queued.dedupeKey, queued.attempt + 1);
 		try {
 			await this.config.coordinator.markReady(topic.topicId);
-			await this.config.coordinator.markReviewRequested(topic.topicId, reviewId);
+			const envelope = Object.freeze({ ...this.activeEnvelope, reviewId, createdAt: new Date().toISOString() });
+			await this.config.coordinator.markReviewRequested(topic.topicId, reviewId, envelope);
+			this.config.registry.put(envelope);
+			this.activeEnvelope = envelope;
 		} catch (error) {
 			if (this.config.coordinator.current()?.status === "ready_for_advisor_review") {
 				await this.config.coordinator.markReviewUnavailable(topic.topicId, "Advisor retry state persistence failed");
 			}
 			throw error;
 		}
-		const envelope = Object.freeze({ ...this.activeEnvelope, reviewId, createdAt: new Date().toISOString() });
-		this.config.registry.put(envelope);
-		this.activeEnvelope = envelope;
 		try {
 			await this.config.scheduler.pump();
 		} catch {
@@ -256,8 +301,95 @@ export class BrainstormRuntime {
 		}
 	}
 
+	acceptReview(
+		envelope: import("./review-registry").BrainstormReviewEnvelope,
+		review: BrainstormReview,
+	): Promise<BrainstormTopicState> {
+		return this.serializeOperation(() => this.acceptReviewExclusive(envelope, review));
+	}
+
+	private async acceptReviewExclusive(
+		envelope: import("./review-registry").BrainstormReviewEnvelope,
+		review: BrainstormReview,
+	): Promise<BrainstormTopicState> {
+		const topic = this.config.coordinator.current();
+		if (
+			this.config.registry.get(envelope.reviewId) !== envelope ||
+			this.activeEnvelope?.reviewId !== envelope.reviewId ||
+			topic?.status !== "advisor_reviewing"
+		) {
+			throw new Error("Brainstorm review is stale or no longer active");
+		}
+		this.config.registry.consume(envelope.reviewId);
+		try {
+			await this.config.coordinator.acceptReview(review);
+		} catch (error) {
+			this.config.registry.put(envelope);
+			throw error;
+		}
+		await this.config.scheduler.handleLifecycle(
+			{
+				type: "advisor_run_completed",
+				reviewId: envelope.reviewId,
+				trigger: "brainstorm_review",
+				priority: 80,
+				primarySessionId: this.config.sessionId(),
+				advisorSessionId: "brainstorm-runtime",
+				timestamp: new Date().toISOString(),
+				verdictSubmitted: true,
+			},
+			false,
+		);
+		await this.dispatchFollowingReviews();
+		const accepted = this.config.coordinator.current();
+		if (!accepted) throw new Error("Brainstorm topic disappeared after review acceptance");
+		return accepted;
+	}
+
 	private async ensureSchedulerReady(): Promise<void> {
 		if (this.config.ensureSchedulerReady) await this.config.ensureSchedulerReady();
+	}
+
+	private serializeOperation<T>(operation: () => Promise<T>): Promise<T> {
+		const result = this.operationTail.then(operation, operation);
+		this.operationTail = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
+	}
+
+	private async dispatchFollowingReviews(): Promise<void> {
+		try {
+			await this.config.scheduler.pump();
+		} catch {
+			// The accepted review is already durable; a later turn retries queued work.
+		}
+	}
+
+	private envelopeFromIntent(topic: BrainstormTopicState, intent: ReviewIntent) {
+		const metadata = intent.metadata ?? {};
+		const requestedToolNames = Array.isArray(metadata.requestedToolNames)
+			? metadata.requestedToolNames.filter((name): name is string => typeof name === "string")
+			: [];
+		const snapshot = this.config.collector.collector.snapshot();
+		const context =
+			typeof metadata.context === "string" ? metadata.context : renderTopicPacket(buildTopicPacket(topic, snapshot));
+		const rules = typeof metadata.rules === "string" ? metadata.rules : BRAINSTORM_REVIEW_RULES;
+		return Object.freeze({
+			reviewId: reviewIdFor(intent.dedupeKey, intent.attempt + 1),
+			topicId: topic.topicId,
+			projectId: intent.projectId,
+			inputHash: topic.inputHash,
+			evidenceRevision: intent.evidenceRevision,
+			gitHead: intent.gitHead,
+			diffHash: intent.diffHash,
+			trigger: "brainstorm_review" as const,
+			context,
+			rules,
+			requestedToolNames: Object.freeze(requestedToolNames),
+			createdAt: new Date().toISOString(),
+		});
 	}
 }
 

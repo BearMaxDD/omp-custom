@@ -250,6 +250,9 @@ export interface BrainstormTopicState {
 	input: BrainstormTopicReadyInput;
 	/** The advisor's review, if one has been produced. */
 	review?: BrainstormReview;
+	/** Durable Envelope used to rebuild the Advisor hook after restart. */
+	reviewEnvelope?: BrainstormReviewEnvelope;
 	/** The user's decision, if one has been recorded. */
 	decision?: BrainstormDecision;
 }
+import type { BrainstormReviewEnvelope } from "./review-registry";

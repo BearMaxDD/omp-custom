@@ -241,6 +241,7 @@ export default function activate(api: ComplianceExtensionHost): void {
 				brainstormRegistry,
 				getBrainstormInfra().coordinator,
 				brainstormSendMessage,
+				(envelope, review) => getBrainstormRuntime().acceptReview(envelope, review),
 			)(e);
 		}
 		return undefined;

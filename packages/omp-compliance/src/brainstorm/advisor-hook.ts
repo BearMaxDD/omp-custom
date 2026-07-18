@@ -25,6 +25,7 @@ import type { BrainstormReviewRegistry } from "./review-registry";
 import type { BrainstormReviewEnvelope } from "./review-registry";
 import { parseBrainstormReview } from "./review-schema";
 import type { TopicCoordinator } from "./topic-coordinator";
+import type { BrainstormReview, BrainstormTopicState } from "./types";
 
 // ─── Public API ─────────────────────────────────────────────────────
 
@@ -39,6 +40,7 @@ export function createBrainstormAdvisorHook(
 		msg: { customType: string; content: string; display: boolean; attribution: "agent" | "user"; details?: unknown },
 		options?: { deliverAs?: string; triggerTurn?: boolean },
 	) => void,
+	acceptReview?: (envelope: BrainstormReviewEnvelope, review: BrainstormReview) => Promise<BrainstormTopicState>,
 ): (event: AdvisorBeforeRunEvent) => AdvisorRunAugmentation | undefined {
 	return (event: AdvisorBeforeRunEvent): AdvisorRunAugmentation | undefined => {
 		if (event.trigger !== "brainstorm_review") {
@@ -54,7 +56,7 @@ export function createBrainstormAdvisorHook(
 
 		return {
 			additionalSystemContext: `${envelope.rules}\n\n${envelope.context}`,
-			additionalTools: [createBrainstormReviewTool(envelope, coordinator, registry, sendMessage)],
+			additionalTools: [createBrainstormReviewTool(envelope, coordinator, registry, sendMessage, acceptReview)],
 			requestedToolNames: [...envelope.requestedToolNames],
 			verdictToolNames: ["brainstorm_review"],
 			metadata: Object.freeze({ brainstormReviewId: envelope.reviewId }),
@@ -83,6 +85,7 @@ export function createBrainstormReviewTool(
 		msg: { customType: string; content: string; display: boolean; attribution: "agent" | "user"; details?: unknown },
 		options?: { deliverAs?: string; triggerTurn?: boolean },
 	) => void,
+	acceptReview?: (envelope: BrainstormReviewEnvelope, review: BrainstormReview) => Promise<BrainstormTopicState>,
 ): ToolDefinition {
 	return {
 		name: "brainstorm_review",
@@ -143,13 +146,20 @@ export function createBrainstormReviewTool(
 			],
 		},
 		execute: async (_toolCallId: string, params: Record<string, unknown>) => {
+			if (registry.get(envelope.reviewId) !== envelope) {
+				throw new Error("Brainstorm review is stale or no longer active");
+			}
 			const review = parseBrainstormReview(params, {
 				topicId: envelope.topicId,
 				inputHash: envelope.inputHash,
 			});
-			await coordinator.acceptReview(review);
-			registry.consume(envelope.reviewId);
-			const topic = coordinator.current();
+			const topic = acceptReview
+				? await acceptReview(envelope, review)
+				: await (async () => {
+						await coordinator.acceptReview(review);
+						registry.consume(envelope.reviewId);
+						return coordinator.current();
+					})();
 			if (topic) {
 				sendMessage(
 					{

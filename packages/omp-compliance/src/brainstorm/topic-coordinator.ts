@@ -12,6 +12,7 @@
 
 import { randomUUID } from "node:crypto";
 import type { EvidenceSnapshot } from "../signals/types";
+import type { BrainstormReviewEnvelope } from "./review-registry";
 import { computeTopicFingerprint, normalizeTopicInput } from "./topic-fingerprint";
 import type { TopicEventRecord, TopicStore } from "./topic-store";
 import type { BrainstormDecision, BrainstormReview, BrainstormTopicReadyInput, BrainstormTopicState } from "./types";
@@ -109,9 +110,14 @@ export class TopicCoordinator {
 	 * Mark the topic as being reviewed by the advisor.
 	 * Transitions: ready_for_advisor_review -> advisor_reviewing
 	 */
-	async markReviewRequested(topicId: string, reviewId: string): Promise<void> {
+	async markReviewRequested(
+		topicId: string,
+		reviewId: string,
+		reviewEnvelope?: BrainstormReviewEnvelope,
+	): Promise<void> {
 		await this.transition(topicId, "advisor_reviewing", {
 			reviewId,
+			reviewEnvelope,
 		});
 		await this.store.appendEvent(topicId, "review_requested", { reviewId });
 	}
@@ -273,7 +279,7 @@ export class TopicCoordinator {
 	private async transition(
 		topicId: string,
 		target: BrainstormTopicStatus,
-		_extra: Record<string, unknown> = {},
+		extra: { reviewId?: string; reviewEnvelope?: BrainstormReviewEnvelope; reason?: string } = {},
 	): Promise<void> {
 		const topic = this.getCurrentOrThrow();
 		this.assertTopicId(topic, topicId);
@@ -284,6 +290,7 @@ export class TopicCoordinator {
 		}
 
 		topic.status = target;
+		if (extra.reviewEnvelope) topic.reviewEnvelope = extra.reviewEnvelope;
 		await this.store.saveState(topic);
 	}
 }
