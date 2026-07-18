@@ -3,15 +3,19 @@
 import { Buffer } from "node:buffer";
 import { types as utilTypes } from "node:util";
 import type { JobSnapshot } from "@oh-my-pi/pi-coding-agent/tools/hub/types";
+import type { TaskContract } from "../contract/types";
 import {
 	type DelegationRecord,
 	type TrustedDelegationContext,
 	applyDelegationEvent,
 	createDelegationCompletionAttestation,
+	createDelegationEvidenceVerifier,
+	createDelegationRecord,
+	createTrustedDelegationContext,
 	getTrustedDelegationActualFiles,
 	isTrustedDelegationContext,
 } from "../delegation/delegation-supervisor";
-import type { TaskDelegationEvidence, ToolCallRecord, ToolResultRecord } from "./types";
+import type { EvidenceSnapshot, TaskDelegationEvidence, ToolCallRecord, ToolResultRecord } from "./types";
 
 const TASK_TOOL_NAME = "task";
 const HUB_TOOL_NAME = "hub";
@@ -162,6 +166,90 @@ export function applyNormalizedDelegationEvents(
 		}
 	}
 	return current;
+}
+
+/** Build strict DelegationRecord values only from official Collector task/hub results. */
+export function buildTrustedDelegationRecords(
+	snapshot: EvidenceSnapshot,
+	taskContract: TaskContract,
+	evidenceRevision: `sha256:${string}`,
+): DelegationRecord[] {
+	const results = new Map(snapshot.results.map((result) => [result.toolCallId, result]));
+	const pairs = snapshot.calls.map((call) => ({ call, result: results.get(call.toolCallId) }));
+	const discovered = new Map<
+		string,
+		{
+			binding: DelegationBinding;
+			workPackage: string;
+			actualFiles?: readonly string[];
+			toolEvidenceIds: readonly string[];
+		}
+	>();
+
+	for (const pair of pairs) {
+		const taskEvidence = pair.call.toolName === TASK_TOOL_NAME ? normalizeTaskDelegation([pair]) : [];
+		for (const event of normalizeDelegationEvents([pair])) {
+			if (!event.sessionId || !event.workPackage) continue;
+			const evidence = taskEvidence.find((candidate) => candidate.agentId === event.agentId) ?? taskEvidence[0];
+			const actualFiles =
+				event.transport === "task" && evidence?.status === "completed" && evidence.codebaseRefs.length > 0
+					? [...new Set(evidence.codebaseRefs)].sort()
+					: undefined;
+			const previous = discovered.get(event.delegationId);
+			discovered.set(event.delegationId, {
+				binding: {
+					delegationId: event.delegationId,
+					transport: event.transport,
+					originalToolCallId: event.originToolCallId,
+					...(event.jobId === undefined ? {} : { jobId: event.jobId }),
+					...(event.agentId === undefined ? {} : { agentId: event.agentId }),
+					sessionId: event.sessionId,
+					...(actualFiles === undefined ? {} : { actualFiles }),
+				},
+				workPackage: event.workPackage,
+				actualFiles: actualFiles ?? previous?.actualFiles,
+				toolEvidenceIds: event.toolEvidenceIds.length > 0 ? event.toolEvidenceIds : (previous?.toolEvidenceIds ?? []),
+			});
+		}
+	}
+
+	if (discovered.size === 0) return [];
+	const entries = [...discovered.values()];
+	const verifier = createDelegationEvidenceVerifier((revision) => ({
+		taskId: taskContract.taskId,
+		contractHash: taskContract.contractHash,
+		evidenceRevision: revision,
+		delegations: entries.flatMap((entry) =>
+			entry.actualFiles === undefined
+				? []
+				: [
+						{
+							delegationId: entry.binding.delegationId,
+							actualFiles: entry.actualFiles,
+							toolEvidenceIds: entry.toolEvidenceIds,
+						},
+					],
+		),
+	}));
+	const delegation = createTrustedDelegationContext({ taskContract, evidenceRevision }, verifier);
+	const normalization = createTrustedDelegationNormalizationContext(
+		delegation,
+		entries.map((entry) => entry.binding),
+	);
+	const events = normalizeDelegationEvents(pairs, normalization);
+
+	return entries.map((entry) => {
+		const record = createDelegationRecord({
+			delegationId: entry.binding.delegationId,
+			...(entry.binding.agentId === undefined ? {} : { agentId: entry.binding.agentId }),
+			sessionId: entry.binding.sessionId ?? "",
+			toolCallId: entry.binding.originalToolCallId,
+			transport: entry.binding.transport,
+			workPackage: entry.workPackage,
+			context: delegation,
+		});
+		return applyNormalizedDelegationEvents(record, events);
+	});
 }
 
 /**
@@ -374,7 +462,6 @@ function normalizeHubEvents(
 	context: TrustedDelegationNormalizationContext | undefined,
 ): NormalizedDelegationEvent[] {
 	if (
-		!context ||
 		!result?.success ||
 		result.source !== "official" ||
 		result.detailsTruncated ||
@@ -387,9 +474,17 @@ function normalizeHubEvents(
 	const events: NormalizedDelegationEvent[] = [];
 	for (const job of result.details.jobs) {
 		if (job.type !== "task") continue;
-		const binding = context.bindings.find((candidate) => candidate.transport === "hub" && candidate.jobId === job.id);
-		if (!binding) continue;
-		events.push(delegationEvent(call, binding, hubJobStatus(job), job.label, evidenceIds, context.delegation));
+		const binding = context?.bindings.find(
+			(candidate) => candidate.transport === "hub" && candidate.jobId === job.id,
+		) ?? {
+			delegationId: job.id,
+			transport: "hub" as const,
+			originalToolCallId: call.toolCallId,
+			jobId: job.id,
+			agentId: job.id,
+			...(call.sessionId === undefined ? {} : { sessionId: call.sessionId }),
+		};
+		events.push(delegationEvent(call, binding, hubJobStatus(job), job.label, evidenceIds, context?.delegation));
 	}
 	return events;
 }

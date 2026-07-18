@@ -27,6 +27,7 @@ export function createComplianceAdvisorHook(
 	runtime: {
 		acceptVerdict: (verdict: Record<string, unknown>) => Promise<{ accepted: boolean; reason?: string }>;
 	},
+	requestedToolNames: readonly string[] = [],
 ): (event: AdvisorBeforeRunEvent) => AdvisorRunAugmentation | undefined {
 	return (event: AdvisorBeforeRunEvent): AdvisorRunAugmentation | undefined => {
 		if (event.trigger !== "compliance_review") {
@@ -54,6 +55,8 @@ export function createComplianceAdvisorHook(
 		return {
 			additionalSystemContext: `${envelope.rules}\n\n${envelope.context}\n\nBound verdict identity:\n${verdictIdentity}`,
 			additionalTools: [createComplianceVerdictTool(envelope, runtime, registry)],
+			requestedToolNames: [...requestedToolNames],
+			verdictToolNames: ["compliance_verdict"],
 			metadata: Object.freeze({ complianceReviewId: envelope.reviewId }),
 		};
 	};

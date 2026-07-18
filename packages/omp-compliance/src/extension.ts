@@ -67,10 +67,11 @@ import {
 	validateCodebasePack,
 } from "./signals/codebase-memory";
 import { type CollectorRuntime, createControlledCollectorRuntime } from "./signals/collector-runtime";
+import { buildTrustedDelegationRecords } from "./signals/task-delegation";
 import { registerComplianceCompleteTool } from "./tools/compliance-complete-tool";
-import { READONLY_CODEBASE_TOOLS } from "./xdev/codebase-tool-policy";
+import { READONLY_CODEBASE_TOOLS, isAdvisorCodebaseToolAllowed } from "./xdev/codebase-tool-policy";
 import { unwrapToolCallEvent } from "./xdev/event-unwrapper";
-import { canonicalArgsFingerprint } from "./xdev/tool-identity";
+import { canonicalArgsFingerprint, canonicalizeToolIdentity } from "./xdev/tool-identity";
 
 const DEFAULT_COMPLIANCE_DIR = ".omp/compliance";
 const UNBOUND_EVIDENCE_REVISION = `sha256:${createHash("sha256").update("unbound").digest("hex")}` as const;
@@ -107,6 +108,13 @@ function repositoryRoot(cwd: string): string {
 
 function codebaseProjectForRoot(root: string): string {
 	return root.replace(/^\/+/, "").replaceAll("/", "-");
+}
+
+export function selectAdvisorReadOnlyToolNames(toolNames: readonly string[]): string[] {
+	return toolNames.filter((toolName) => {
+		const identity = canonicalizeToolIdentity({ toolName, args: {} });
+		return identity?.transport === "mcp" && isAdvisorCodebaseToolAllowed(identity);
+	});
 }
 
 function tddFileEntry(value: string): string {
@@ -373,7 +381,11 @@ function createRuntimeBundle(
 			taskContract: preparedTaskContract,
 			codebaseContext,
 			codebasePack,
-			delegations: [],
+			delegations: buildTrustedDelegationRecords(
+				collector.collector.snapshot(),
+				preparedTaskContract,
+				codebasePack.evidenceRevision,
+			),
 		};
 	};
 	const prepareTask = (tddPath: string): TaskContract => {
@@ -695,7 +707,11 @@ export default function activate(api: ComplianceExtensionHost): void {
 	);
 	api.on("advisor_before_run", async (event) => {
 		const current = bundleForSession(event.primarySessionId);
-		const complianceResult = createComplianceAdvisorHook(current.registry, current.runtime)(event);
+		const complianceResult = createComplianceAdvisorHook(
+			current.registry,
+			current.runtime,
+			selectAdvisorReadOnlyToolNames(api.getAllTools()),
+		)(event);
 		if (complianceResult) return complianceResult;
 		if (event.trigger !== "brainstorm_review") return undefined;
 		await current.getBrainstormRuntime().restoreAdvisorEnvelope(event.reviewId);

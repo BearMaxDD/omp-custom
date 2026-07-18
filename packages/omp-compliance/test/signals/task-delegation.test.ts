@@ -11,6 +11,7 @@ import {
 } from "../../src/delegation/delegation-supervisor";
 import {
 	applyNormalizedDelegationEvents,
+	buildTrustedDelegationRecords,
 	createTrustedDelegationNormalizationContext,
 	normalizeDelegationEvents,
 	normalizeTaskDelegation,
@@ -460,6 +461,62 @@ function trustedHubContext(binding: Parameters<typeof createTrustedDelegationNor
 }
 
 describe("task/hub 统一委派事件", () => {
+	it("从 Collector 官方结果构建生产可信 task/hub DelegationRecord", () => {
+		const taskContract = createLightweightTaskContract({
+			projectId: "123e4567-e89b-42d3-a456-426614174000",
+			gitHead: "a".repeat(40),
+			taskId: "task-production-delegation",
+			affectedFiles: ["src/owned.ts"],
+			scope: ["实现生产委派接线"],
+			acceptanceCriteria: ["task 证据满足完成门，hub 缺少文件证据时保持不足"],
+			verificationCommands: ["bun test"],
+			createdAt: "2026-07-18T10:00:00.000Z",
+			lowRisk: true,
+		});
+		const task = storedCall("task", "task-production-call", { task: "实现生产委派接线" });
+		const hub = storedCall("hub", "hub-production-call", { op: "wait", ids: ["hub-agent-1"] });
+		const taskOutput = taskDetails({
+			results: [singleResult({ id: "task-agent-1", output: "Updated src/owned.ts" })],
+		});
+		const snapshot = {
+			calls: [task, hub],
+			results: [
+				storedResult(task.toolCallId, taskOutput),
+				storedResult(hub.toolCallId, {
+					op: "wait",
+					jobs: [{ id: "hub-agent-1", type: "task", status: "completed", label: "监管子任务", durationMs: 1 }],
+				}),
+			],
+			codebaseMemory: { indexReady: true, queries: [], references: [] },
+			subagentDelegations: [],
+			verifications: [],
+		};
+
+		const records = buildTrustedDelegationRecords(snapshot, taskContract, `sha256:${"b".repeat(64)}`);
+		const taskRecord = records.find((record) => record.transport === "task");
+		const hubRecord = records.find((record) => record.transport === "hub");
+
+		expect(taskRecord).toEqual(
+			expect.objectContaining({
+				agentId: "task-agent-1",
+				status: "completed",
+				actualFiles: ["src/owned.ts"],
+				toolEvidenceIds: ["tool-result:task-production-call"],
+				gateStatus: "sufficient",
+			}),
+		);
+		expect(taskRecord && delegationSatisfiesGate(taskRecord)).toBe(true);
+		expect(hubRecord).toEqual(
+			expect.objectContaining({
+				agentId: "hub-agent-1",
+				status: "completed",
+				actualFilesKnown: false,
+				gateStatus: "insufficient",
+			}),
+		);
+		expect(hubRecord && delegationSatisfiesGate(hubRecord)).toBe(false);
+	});
+
 	it("从真实 task details 产生 completed 事件和工具 Evidence ID", () => {
 		const call = storedCall("task", "task-call-14", { task: "实现任务 14" });
 		const events = normalizeDelegationEvents([{ call, result: storedResult(call.toolCallId, taskDetails()) }]);

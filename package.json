@@ -49,6 +49,7 @@
   "scripts": {
     "check": "./packages/omp-compliance/node_modules/.bin/biome check --apply packages/",
     "build": "bun --cwd=packages/omp-compliance run build",
-    "test": "bun --cwd=packages/omp-compliance test"
+    "test": "bun --cwd=packages/omp-compliance test",
+    "test:v17-integration": "bash scripts/test-v17-integration.sh"
   }
 }

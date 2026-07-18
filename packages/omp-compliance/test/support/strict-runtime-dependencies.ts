@@ -27,6 +27,13 @@ function projectIdFor(root: string): string {
 	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
+function tddFileEntry(value: string): string {
+	return value
+		.replace(/^\s*(?:[-*+]\s+|\d+[.)]\s+)/, "")
+		.replace(/^`|`$/g, "")
+		.trim();
+}
+
 function recordCodebaseEvidence(project: string, affectedFile: string) {
 	const controlled = createControlledCollectorRuntime();
 	const queriedAt = new Date(Date.now() + 60_000).toISOString();
@@ -93,12 +100,14 @@ export function createStrictRuntimeDependencies(input: {
 	requestAdvisorReview: (request: AdvisorReviewRequest) => Promise<AdvisorReviewReceipt>;
 	now?: () => number;
 	schedulerStore?: ReviewSchedulerStore;
+	delegationTransports?: readonly ("task" | "hub")[];
 }): ComplianceRuntimeDependencies {
 	const tddPath = input.tddPath ?? "tdd.md";
 	const absoluteTddPath = join(input.repoRoot, tddPath);
 	const complianceContract = loadComplianceContract(absoluteTddPath, input.repoRoot);
 	const currentGit = readAuthoritativeGitContext(input.repoRoot);
-	const affectedFiles = complianceContract.summary.files.length > 0 ? complianceContract.summary.files : [tddPath];
+	const declaredFiles = complianceContract.summary.files.map(tddFileEntry).filter(Boolean);
+	const affectedFiles = declaredFiles.length > 0 ? declaredFiles : [tddPath];
 	const taskContract = loadTaskContractFromTdd(absoluteTddPath, input.repoRoot, {
 		projectId: projectIdFor(input.repoRoot),
 		gitHead: currentGit.gitHead,
@@ -120,39 +129,48 @@ export function createStrictRuntimeDependencies(input: {
 			requiredSymbols: ["strict.runtime.symbol"],
 		});
 		const codebasePack = createCodebaseEvidencePack(codebaseContext);
-		const delegationId = "strict-delegation";
-		const toolCallId = "strict-task-tool-call";
-		const toolEvidenceId = `tool-result:${toolCallId}`;
+		const transports = input.delegationTransports ?? ["task"];
+		const attestations = transports.map((transport, index) => ({
+			delegationId: `strict-delegation-${transport}-${index}`,
+			toolCallId: `strict-${transport}-tool-call-${index}`,
+			transport,
+		}));
 		const verifier = createDelegationEvidenceVerifier((evidenceRevision) => ({
 			taskId: taskContract.taskId,
 			contractHash: taskContract.contractHash,
 			evidenceRevision,
-			delegations: [{ delegationId, actualFiles: [affectedFiles[0]], toolEvidenceIds: [toolEvidenceId] }],
+			delegations: attestations.map(({ delegationId, toolCallId }) => ({
+				delegationId,
+				actualFiles: [affectedFiles[0]],
+				toolEvidenceIds: [`tool-result:${toolCallId}`],
+			})),
 		}));
 		const delegationContext = createTrustedDelegationContext(
 			{ taskContract, evidenceRevision: codebasePack.evidenceRevision },
 			verifier,
 		);
-		const queued = createDelegationRecord({
-			delegationId,
-			agentId: "strict-agent",
-			sessionId: "strict-session",
-			toolCallId,
-			transport: "task",
-			workPackage: "Execute the strict runtime test task",
-			context: delegationContext,
-		});
-		const running = applyDelegationEvent(queued, { delegationId, type: "started" });
-		const completed = applyDelegationEvent(
-			running,
-			createDelegationCompletionAttestation(delegationContext, {
+		const delegations = attestations.map(({ delegationId, toolCallId, transport }) => {
+			const queued = createDelegationRecord({
 				delegationId,
-				originToolCallId: toolCallId,
-				resultToolCallId: toolCallId,
-				toolEvidenceIds: [toolEvidenceId],
-			}),
-		);
-		return { taskContract, codebasePack, codebaseContext, delegations: [completed] };
+				agentId: `strict-${transport}-agent`,
+				sessionId: "strict-session",
+				toolCallId,
+				transport,
+				workPackage: `Execute the strict runtime test through ${transport}`,
+				context: delegationContext,
+			});
+			const running = applyDelegationEvent(queued, { delegationId, type: "started" });
+			return applyDelegationEvent(
+				running,
+				createDelegationCompletionAttestation(delegationContext, {
+					delegationId,
+					originToolCallId: toolCallId,
+					resultToolCallId: toolCallId,
+					toolEvidenceIds: [`tool-result:${toolCallId}`],
+				}),
+			);
+		});
+		return { taskContract, codebasePack, codebaseContext, delegations };
 	};
 	const receipts = new Map<string, AdvisorReviewReceipt>();
 	const scheduler = new ReviewScheduler({

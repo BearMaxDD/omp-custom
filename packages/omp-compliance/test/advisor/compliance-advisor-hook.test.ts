@@ -61,7 +61,14 @@ function makeTurnEndEvent(): AdvisorBeforeRunEvent {
 	};
 }
 
-function setupFixture(overrides: Partial<{ runtime: ComplianceRuntime; sessionId: string; taskId: string }> = {}) {
+function setupFixture(
+	overrides: Partial<{
+		runtime: ComplianceRuntime;
+		sessionId: string;
+		taskId: string;
+		requestedToolNames: readonly string[];
+	}> = {},
+) {
 	const registry = new ComplianceReviewRegistry();
 	const runtime = overrides.runtime ?? makeMockRuntime();
 	const env = createEnvelope({
@@ -78,7 +85,7 @@ function setupFixture(overrides: Partial<{ runtime: ComplianceRuntime; sessionId
 		rules: "test-rules",
 	});
 	registry.put(env);
-	const hook = createComplianceAdvisorHook(registry, runtime);
+	const hook = createComplianceAdvisorHook(registry, runtime, overrides.requestedToolNames);
 	return { registry, runtime, env, hook };
 }
 
@@ -111,7 +118,8 @@ describe("createComplianceAdvisorHook", () => {
 	});
 
 	it("returns additionalSystemContext and a single tool when matched", () => {
-		const { hook, env } = setupFixture();
+		const requestedToolNames = ["mcp__codebase_memory_mcp_search_graph"];
+		const { hook, env } = setupFixture({ requestedToolNames });
 		const event = makeComplianceEvent({
 			reviewId: env.reviewId,
 			metadata: {
@@ -130,12 +138,26 @@ describe("createComplianceAdvisorHook", () => {
 		expect(result?.additionalTools?.[0]?.name).toBe("compliance_verdict");
 		expect(result?.additionalTools?.[0]?.label).toBe("Compliance Verdict");
 		expect(typeof result?.additionalTools?.[0]?.execute).toBe("function");
+		expect(result?.requestedToolNames).toEqual(requestedToolNames);
+		expect(result?.verdictToolNames).toEqual(["compliance_verdict"]);
 		const required = result?.additionalTools?.[0]?.parameters.required as string[];
 		expect(required).toEqual(
 			expect.arrayContaining(["review_id", "project_id", "evidence_revision", "git_head", "diff_hash", "trigger"]),
 		);
 		expect(result?.metadata).toEqual({ complianceReviewId: env.reviewId });
 		expect(Object.isFrozen(result?.metadata)).toBe(true);
+	});
+
+	it("defaults to no requested tools when discovery was not supplied", () => {
+		const { hook, env } = setupFixture();
+		const result = hook(
+			makeComplianceEvent({
+				reviewId: env.reviewId,
+				metadata: { reviewId: env.reviewId, taskId: TASK_ID, contractHash: HASH, attempt: 1 },
+			}),
+		);
+
+		expect(result?.requestedToolNames).toEqual([]);
 	});
 
 	it("the compliance_verdict tool calls runtime.acceptVerdict on valid submission", async () => {
