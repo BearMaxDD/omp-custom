@@ -1,6 +1,7 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { isAdvisorCodebaseToolAllowed } from "../../src/xdev/codebase-tool-policy";
 import {
+	CANONICAL_ARGS_MAX_BYTES,
 	type CanonicalToolIdentity,
 	canonicalArgsFingerprint,
 	canonicalJson,
@@ -94,6 +95,63 @@ describe("canonicalizeToolIdentity", () => {
 			expect(canonicalJson(value)).toBeNull();
 			expect(canonicalArgsFingerprint(value)).toBeNull();
 		}
+	});
+
+	it("超大字符串在 JSON.stringify 完整分配前按 UTF-8 预算拒绝", () => {
+		const huge = "超".repeat(CANONICAL_ARGS_MAX_BYTES);
+		const stringify = spyOn(JSON, "stringify");
+		try {
+			expect(canonicalJson({ value: huge })).toBeNull();
+			expect(stringify.mock.calls.some(([value]) => value === huge)).toBe(false);
+		} finally {
+			stringify.mockRestore();
+		}
+	});
+
+	it("超长数组先检查长度，不进入 Object.keys 或元素遍历", () => {
+		let reads = 0;
+		const huge = Array.from({ length: 40_000 }, () =>
+			Object.defineProperty({}, "value", {
+				enumerable: true,
+				get: () => {
+					reads++;
+					return 1;
+				},
+			}),
+		);
+		const keys = spyOn(Object, "keys");
+		try {
+			expect(canonicalJson(huge)).toBeNull();
+			expect(keys.mock.calls.some(([value]) => value === huge)).toBe(false);
+			expect(reads).toBe(0);
+		} finally {
+			keys.mockRestore();
+		}
+	});
+
+	it("超宽对象按键预算拒绝，不先完整 Object.keys 或排序", () => {
+		const wide = Object.fromEntries(Array.from({ length: 20_000 }, (_, index) => [`key-${index}`, index]));
+		const keys = spyOn(Object, "keys");
+		const sort = spyOn(Array.prototype, "sort");
+		try {
+			expect(canonicalJson(wide)).toBeNull();
+			expect(keys.mock.calls.some(([value]) => value === wide)).toBe(false);
+			expect(sort).not.toHaveBeenCalled();
+		} finally {
+			keys.mockRestore();
+			sort.mockRestore();
+		}
+	});
+
+	it("总节点数和嵌套深度超过预算时 fail closed", () => {
+		const tooManyNodes = Array.from({ length: 256 }, () => Array.from({ length: 32 }, () => null));
+		let tooDeep: Record<string, unknown> = { leaf: true };
+		for (let depth = 0; depth < 40; depth++) tooDeep = { child: tooDeep };
+
+		expect(canonicalJson(tooManyNodes)).toBeNull();
+		expect(canonicalArgsFingerprint(tooManyNodes)).toBeNull();
+		expect(canonicalJson(tooDeep)).toBeNull();
+		expect(canonicalArgsFingerprint(tooDeep)).toBeNull();
 	});
 
 	it("规范化 xd 外层 write", () => {

@@ -25,51 +25,141 @@ export interface ToolIdentityInput {
 
 const HELP_CONTENT_RE = /^(?:|\?|help|describe)$/i;
 export const CANONICAL_ARGS_MAX_BYTES = 64 * 1024;
+const CANONICAL_ARGS_MAX_DEPTH = 32;
+const CANONICAL_ARGS_MAX_NODES = 4096;
+const CANONICAL_ARGS_MAX_KEYS = 4096;
+const CANONICAL_ARGS_MAX_OBJECT_KEYS = 1024;
+const CANONICAL_ARGS_MAX_ARRAY_LENGTH = 1024;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function canonicalizeJsonValue(value: unknown, ancestors: Set<object>): string | null {
-	if (value === null) return "null";
-	if (typeof value === "string" || typeof value === "boolean") {
-		const serialized = JSON.stringify(value);
-		return Buffer.byteLength(serialized, "utf8") <= CANONICAL_ARGS_MAX_BYTES ? serialized : null;
+interface CanonicalizeState {
+	remainingNodes: number;
+	remainingKeys: number;
+}
+
+function boundedJsonStringBytes(value: string, maxBytes: number): number | null {
+	let bytes = 2;
+	for (let index = 0; index < value.length; index++) {
+		const code = value.charCodeAt(index);
+		if (
+			code === 0x22 ||
+			code === 0x5c ||
+			code === 0x08 ||
+			code === 0x0c ||
+			code === 0x0a ||
+			code === 0x0d ||
+			code === 0x09
+		) {
+			bytes += 2;
+		} else if (code <= 0x1f || (code >= 0xd800 && code <= 0xdfff)) {
+			if (code >= 0xd800 && code <= 0xdbff && index + 1 < value.length) {
+				const next = value.charCodeAt(index + 1);
+				if (next >= 0xdc00 && next <= 0xdfff) {
+					bytes += 4;
+					index++;
+				} else {
+					bytes += 6;
+				}
+			} else {
+				bytes += 6;
+			}
+		} else if (code <= 0x7f) {
+			bytes += 1;
+		} else if (code <= 0x7ff) {
+			bytes += 2;
+		} else {
+			bytes += 3;
+		}
+		if (bytes > maxBytes) return null;
 	}
-	if (typeof value === "number") return Number.isFinite(value) ? JSON.stringify(value) : null;
+	return bytes;
+}
+
+function boundedJsonString(value: string, maxBytes: number): string | null {
+	return boundedJsonStringBytes(value, maxBytes) === null ? null : JSON.stringify(value);
+}
+
+function consumeKey(state: CanonicalizeState): boolean {
+	if (state.remainingKeys <= 0) return false;
+	state.remainingKeys--;
+	return true;
+}
+
+function canonicalizeJsonValue(
+	value: unknown,
+	ancestors: Set<object>,
+	state: CanonicalizeState,
+	depth: number,
+	maxBytes: number,
+): string | null {
+	if (depth > CANONICAL_ARGS_MAX_DEPTH || state.remainingNodes <= 0 || maxBytes <= 0) return null;
+	state.remainingNodes--;
+	if (value === null) return "null";
+	if (typeof value === "string") return boundedJsonString(value, maxBytes);
+	if (typeof value === "boolean") return maxBytes >= 4 + Number(value) ? String(value) : null;
+	if (typeof value === "number") {
+		if (!Number.isFinite(value)) return null;
+		const serialized = String(value);
+		return Buffer.byteLength(serialized, "utf8") <= maxBytes ? serialized : null;
+	}
 	if (typeof value !== "object") return null;
 	if (ancestors.has(value)) return null;
 	ancestors.add(value);
 	try {
 		if (Array.isArray(value)) {
-			if (Object.keys(value).some((key, index) => key !== String(index))) return null;
-			if (value.length > CANONICAL_ARGS_MAX_BYTES / 2) return null;
+			if (value.length > CANONICAL_ARGS_MAX_ARRAY_LENGTH) return null;
+			let expectedIndex = 0;
+			for (const key in value) {
+				if (!consumeKey(state) || !Object.hasOwn(value, key) || key !== String(expectedIndex)) return null;
+				expectedIndex++;
+			}
+			if (expectedIndex !== value.length) return null;
 			const items: string[] = [];
 			let bytes = 2;
 			for (const item of value) {
-				const canonical = canonicalizeJsonValue(item, ancestors);
+				const separatorBytes = items.length === 0 ? 0 : 1;
+				const canonical = canonicalizeJsonValue(item, ancestors, state, depth + 1, maxBytes - bytes - separatorBytes);
 				if (canonical === null) return null;
-				bytes += Buffer.byteLength(canonical, "utf8") + (items.length === 0 ? 0 : 1);
-				if (bytes > CANONICAL_ARGS_MAX_BYTES) return null;
+				bytes += Buffer.byteLength(canonical, "utf8") + separatorBytes;
+				if (bytes > maxBytes) return null;
 				items.push(canonical);
 			}
 			return `[${items.join(",")}]`;
 		}
 		const prototype = Object.getPrototypeOf(value);
 		if (prototype !== Object.prototype && prototype !== null) return null;
-		if (Object.getOwnPropertySymbols(value).length > 0) return null;
-		const keys = Object.keys(value);
-		if (keys.length > CANONICAL_ARGS_MAX_BYTES / 4) return null;
+		const keys: string[] = [];
+		let serializedKeyBytes = 2;
+		for (const key in value) {
+			if (!consumeKey(state) || !Object.hasOwn(value, key)) return null;
+			if (keys.length >= CANONICAL_ARGS_MAX_OBJECT_KEYS) return null;
+			const keyBytes = boundedJsonStringBytes(key, maxBytes - serializedKeyBytes);
+			if (keyBytes === null) return null;
+			serializedKeyBytes += keyBytes + (keys.length === 0 ? 0 : 1);
+			keys.push(key);
+		}
+		keys.sort();
 		const fields: string[] = [];
 		let bytes = 2;
-		for (const key of keys.sort()) {
-			if (Buffer.byteLength(key, "utf8") > CANONICAL_ARGS_MAX_BYTES) return null;
-			const keyJson = JSON.stringify(key);
-			const canonical = canonicalizeJsonValue((value as Record<string, unknown>)[key], ancestors);
+		for (const key of keys) {
+			const separatorBytes = fields.length === 0 ? 0 : 1;
+			const keyJson = boundedJsonString(key, maxBytes - bytes - separatorBytes);
+			if (keyJson === null) return null;
+			const overhead = separatorBytes + Buffer.byteLength(keyJson, "utf8") + 1;
+			const canonical = canonicalizeJsonValue(
+				(value as Record<string, unknown>)[key],
+				ancestors,
+				state,
+				depth + 1,
+				maxBytes - bytes - overhead,
+			);
 			if (canonical === null) return null;
 			const field = `${keyJson}:${canonical}`;
-			bytes += Buffer.byteLength(field, "utf8") + (fields.length === 0 ? 0 : 1);
-			if (bytes > CANONICAL_ARGS_MAX_BYTES) return null;
+			bytes += Buffer.byteLength(field, "utf8") + separatorBytes;
+			if (bytes > maxBytes) return null;
 			fields.push(field);
 		}
 		return `{${fields.join(",")}}`;
@@ -81,7 +171,13 @@ function canonicalizeJsonValue(value: unknown, ancestors: Set<object>): string |
 }
 
 export function canonicalJson(value: unknown): string | null {
-	return canonicalizeJsonValue(value, new Set());
+	return canonicalizeJsonValue(
+		value,
+		new Set(),
+		{ remainingNodes: CANONICAL_ARGS_MAX_NODES, remainingKeys: CANONICAL_ARGS_MAX_KEYS },
+		0,
+		CANONICAL_ARGS_MAX_BYTES,
+	);
 }
 
 export function canonicalArgsFingerprint(value: unknown): `sha256:${string}` | null {
