@@ -861,7 +861,10 @@ describe("ComplianceRuntime — lifecycle 与严格 Verdict 绑定", () => {
 				(record) => record.event === "verdict_commit_prepared",
 			)?.signalDigest,
 		);
-		expect(second.reviewId).toBeDefined();
+		const schedulerState = recoveredDependencies.scheduler.snapshot();
+		expect(schedulerState.inFlight?.reviewId).not.toBe(second.reviewId);
+		expect(schedulerState.queued.some((intent) => intent.reviewId === second.reviewId)).toBe(false);
+		expect(schedulerState.completed.some((intent) => intent.reviewId === second.reviewId)).toBe(false);
 	});
 
 	it("工作区 Git 上下文变化后不得恢复旧 pass", async () => {
