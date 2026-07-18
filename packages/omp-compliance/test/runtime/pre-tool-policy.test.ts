@@ -436,7 +436,7 @@ describe("PreToolPolicy canonical Codebase identities", () => {
 		["relative repository", { repo_path: "Users/mima1234/Code/super" }],
 		["parent traversal", { repo_path: `${PROJECT_ROOT}/../omp-custom-v17-adapter` }],
 		["non-canonical slash", { repo_path: `${PROJECT_ROOT}/` }],
-		["cross-repo mode", { repo_path: PROJECT_ROOT, cross_repo: true }],
+		["cross-repo mode", { repo_path: PROJECT_ROOT, mode: "cross-repo-intelligence" }],
 		["foreign target_projects", { repo_path: PROJECT_ROOT, target_projects: ["other-project"] }],
 	] as const)("blocks index_repository for %s", (_label, args) => {
 		const decision = new PreToolPolicy(recorder().sink).evaluate(
@@ -463,6 +463,69 @@ describe("PreToolPolicy canonical Codebase identities", () => {
 			}),
 		).toEqual({ allow: false, reason: "project_identity_mismatch" });
 	});
+
+	it.each([
+		["main read", "main", "search_graph"],
+		["Advisor read", "advisor", "search_graph"],
+		["main index", "main", "index_repository"],
+	] as const)("binds %s to the active trusted task", (_label, actor, toolName) => {
+		const valid = trustedEvidence();
+		const { records, sink } = recorder();
+		const decision = new PreToolPolicy(sink).evaluate(
+			{
+				...codebaseCall(toolName, actor),
+				taskId: "other-task",
+				evidenceRevision: valid.evidenceRevision,
+			},
+			valid,
+		);
+
+		expect(decision).toEqual({ allow: false, reason: "task_identity_mismatch" });
+		expect(records[0]).toMatchObject({
+			contractRevision: valid.contract.revision,
+			packEvidenceRevision: valid.codebasePack.evidenceRevision,
+			contextEvidenceRevision: valid.evidenceRevision,
+			reason: "task_identity_mismatch",
+		});
+	});
+
+	it("allows current-project index rebuild with only a valid active contract while binding its task", () => {
+		const activeContract = contract();
+		const policy = new PreToolPolicy(recorder().sink);
+		const context = {
+			evidenceRevision: REVISION,
+			projectContext: PROJECT_CONTEXT,
+			contract: activeContract,
+		};
+		expect(policy.evaluate(codebaseCall("index_repository"), context)).toEqual({
+			allow: true,
+			invalidatesEvidence: true,
+		});
+		expect(policy.evaluate({ ...codebaseCall("index_repository"), taskId: "other-task" }, context)).toEqual({
+			allow: false,
+			reason: "task_identity_mismatch",
+		});
+
+		const forgedContract = { ...activeContract, revision: REVISION, contractHash: REVISION };
+		expect(policy.evaluate(codebaseCall("index_repository"), { ...context, contract: forgedContract })).toEqual({
+			allow: false,
+			reason: "invalid_codebase_evidence",
+		});
+	});
+
+	it.each(["search_graph", "index_status"])(
+		"requires complete trusted evidence for active-task read tool %s",
+		(toolName) => {
+			const activeContract = contract();
+			const decision = new PreToolPolicy(recorder().sink).evaluate(codebaseCall(toolName), {
+				evidenceRevision: REVISION,
+				projectContext: PROJECT_CONTEXT,
+				contract: activeContract,
+			});
+
+			expect(decision).toEqual({ allow: false, reason: "missing_codebase_evidence" });
+		},
+	);
 
 	it.each([
 		["untrusted short name", "index_repository", undefined],
@@ -714,6 +777,40 @@ describe("PreToolPolicy fail-closed input and Evidence handling", () => {
 			reason: "scope_violation",
 			remediationAction: "Restrict mutation targets to the trusted contract and Codebase evidence scope.",
 		});
+	});
+
+	it("records revisions only after their Contract and Pack validations succeed", () => {
+		const valid = trustedEvidence();
+		const forgedContractRevision = `sha256:${"c".repeat(64)}` as const;
+		const forgedPackRevision = `sha256:${"d".repeat(64)}` as const;
+
+		const invalidContract = {
+			...valid.contract,
+			revision: forgedContractRevision,
+			contractHash: forgedContractRevision,
+		};
+		const invalidContractEvidence = recorder();
+		const invalidContractDecision = new PreToolPolicy(invalidContractEvidence.sink).evaluate(
+			builtinCall("write", { path: "src/existing.ts" }, { evidenceRevision: valid.evidenceRevision }),
+			{ ...valid, contract: invalidContract },
+		);
+		expect(invalidContractDecision).toEqual({ allow: false, reason: "invalid_codebase_evidence" });
+		expect(invalidContractEvidence.records[0].contractRevision).toBeUndefined();
+		expect(invalidContractEvidence.records[0].packEvidenceRevision).toBeUndefined();
+		expect(invalidContractEvidence.records[0].contextEvidenceRevision).toBeUndefined();
+		expect(JSON.stringify(invalidContractEvidence.records[0])).not.toContain(forgedContractRevision);
+
+		const invalidPack = { ...valid.codebasePack, evidenceRevision: forgedPackRevision };
+		const invalidPackEvidence = recorder();
+		const invalidPackDecision = new PreToolPolicy(invalidPackEvidence.sink).evaluate(
+			builtinCall("write", { path: "src/existing.ts" }, { evidenceRevision: valid.evidenceRevision }),
+			{ ...valid, codebasePack: invalidPack },
+		);
+		expect(invalidPackDecision).toEqual({ allow: false, reason: "invalid_codebase_evidence" });
+		expect(invalidPackEvidence.records[0].contractRevision).toBe(valid.contract.revision);
+		expect(invalidPackEvidence.records[0].packEvidenceRevision).toBeUndefined();
+		expect(invalidPackEvidence.records[0].contextEvidenceRevision).toBeUndefined();
+		expect(JSON.stringify(invalidPackEvidence.records[0])).not.toContain(forgedPackRevision);
 	});
 
 	it("uses safe Evidence placeholders without invoking invalid accessors", () => {

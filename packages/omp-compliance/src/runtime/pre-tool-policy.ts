@@ -119,6 +119,12 @@ interface ValidatedContext {
 	trustedCodebaseContext?: TrustedCodebaseValidationContext;
 }
 
+interface ValidatedEvidenceRevisions {
+	contractRevision?: string;
+	packEvidenceRevision?: string;
+	contextEvidenceRevision?: string;
+}
+
 type ShellClassification = { kind: "read" } | { kind: "write"; targets: readonly string[] | null };
 
 const REMEDIATION_HINT = "A pre-tool policy requirement was not satisfied.";
@@ -175,14 +181,8 @@ function safeAuditValue(value: string, fallback: string): string {
 
 function blockedEvidenceMetadata(
 	call: ValidatedCall | null,
-	context: ValidatedContext | null,
+	revisions: ValidatedEvidenceRevisions,
 ): Omit<PreToolBlockedEvidence, "event" | "task" | "call" | "reason" | "remediationHint" | "remediationAction"> {
-	const contractRevision = context?.contract
-		? dataProperty(context.contract as unknown as Record<string, unknown>, "revision")
-		: undefined;
-	const packEvidenceRevision = context?.codebasePack
-		? dataProperty(context.codebasePack as unknown as Record<string, unknown>, "evidenceRevision")
-		: undefined;
 	return {
 		actor: call?.actor ?? "unknown",
 		canonicalServer: call ? safeAuditValue(call.identity.serverId, "<invalid-server>") : "<invalid-server>",
@@ -192,9 +192,9 @@ function blockedEvidenceMetadata(
 			: "<invalid-qualified-name>",
 		argsFingerprint: call?.identity.argsFingerprint ?? "<invalid-args-fingerprint>",
 		callEvidenceRevision: call?.evidenceRevision ?? "<invalid-call-evidence-revision>",
-		...(context ? { contextEvidenceRevision: context.evidenceRevision } : {}),
-		...(validRevision(packEvidenceRevision) ? { packEvidenceRevision } : {}),
-		...(validRevision(contractRevision) ? { contractRevision } : {}),
+		...(revisions.contextEvidenceRevision ? { contextEvidenceRevision: revisions.contextEvidenceRevision } : {}),
+		...(revisions.packEvidenceRevision ? { packEvidenceRevision: revisions.packEvidenceRevision } : {}),
+		...(revisions.contractRevision ? { contractRevision: revisions.contractRevision } : {}),
 	};
 }
 
@@ -350,6 +350,7 @@ function codebaseCallMatchesProject(call: ValidatedCall, project: CurrentProject
 	if (call.identity.toolName !== "index_repository") return false;
 	const repoPath = canonicalAbsolutePath(dataProperty(args, "repo_path"));
 	if (!repoPath || repoPath !== project.root) return false;
+	if (dataProperty(args, "mode") === "cross-repo-intelligence") return false;
 	for (const key of ["cross_repo", "crossRepo", "cross_repo_mode", "crossRepoMode"]) {
 		if (dataProperty(args, key) !== undefined) return false;
 	}
@@ -376,6 +377,20 @@ function trustedProjectMatches(context: ValidatedContext): boolean {
 	return (
 		dataProperty(pack, "projectId") === project.projectId &&
 		dataProperty(pack, "codebaseProjectId") === project.codebaseProject
+	);
+}
+
+function trustedEvidenceMatchesContract(context: ValidatedContext, contract: TaskContract): boolean {
+	if (!context.codebasePack || !context.trustedCodebaseContext) return false;
+	const trustedContract = context.trustedCodebaseContext.taskContract;
+	return (
+		contract.revision === trustedContract.revision &&
+		contract.taskId === trustedContract.taskId &&
+		contract.projectId === trustedContract.projectId &&
+		contract.gitHead === trustedContract.gitHead &&
+		contract.revision === context.codebasePack.taskContractRevision &&
+		contract.projectId === context.codebasePack.projectId &&
+		contract.gitHead === context.codebasePack.gitHead
 	);
 }
 
@@ -476,14 +491,14 @@ export class PreToolPolicy {
 		const validatedContext = validateContext(contextInput);
 		const task = validatedCall ? safeAuditValue(validatedCall.taskId, "<invalid-task>") : "<invalid-task>";
 		const callId = validatedCall ? safeAuditValue(validatedCall.callId, "<invalid-call>") : "<invalid-call>";
-		const evidenceMetadata = blockedEvidenceMetadata(validatedCall, validatedContext);
+		const evidenceRevisions: ValidatedEvidenceRevisions = {};
 		const deny = (reason: PreToolDenyReason): PreToolDecision => {
 			try {
 				this.evidence.append({
 					event: "tool_call_blocked",
 					task,
 					call: callId,
-					...evidenceMetadata,
+					...blockedEvidenceMetadata(validatedCall, evidenceRevisions),
 					reason,
 					remediationHint: REMEDIATION_HINT,
 					remediationAction: REMEDIATION_ACTIONS[reason],
@@ -497,6 +512,28 @@ export class PreToolPolicy {
 		const call = validatedCall;
 		const context = validatedContext;
 		if (!call || !context) return deny("invalid_input");
+		const validateContract = (): TaskContract | null => {
+			if (!context.contract) return null;
+			try {
+				const contract = validateTaskContractIntegrity(context.contract);
+				evidenceRevisions.contractRevision = contract.revision;
+				return contract;
+			} catch {
+				return null;
+			}
+		};
+		const validatePack = (): boolean => {
+			if (!context.codebasePack || !context.trustedCodebaseContext) return false;
+			try {
+				const errors = validateCodebasePack(context.codebasePack, context.trustedCodebaseContext);
+				if (errors.length > 0) return false;
+				evidenceRevisions.packEvidenceRevision = context.codebasePack.evidenceRevision;
+				evidenceRevisions.contextEvidenceRevision = context.evidenceRevision;
+				return true;
+			} catch {
+				return false;
+			}
+		};
 
 		if (call.actor === "advisor" && !call.isCodebase) {
 			return deny("advisor_tool_forbidden");
@@ -506,13 +543,43 @@ export class PreToolPolicy {
 			if (!codebaseCallMatchesProject(call, context.projectContext)) {
 				return deny("project_identity_mismatch");
 			}
-			if (context.trustedCodebaseContext && !trustedProjectMatches(context)) {
-				return deny("project_identity_mismatch");
+			if (call.actor === "advisor" && !isAdvisorCodebaseToolAllowed(call.identity)) {
+				return deny("advisor_tool_forbidden");
 			}
-			if (call.actor === "advisor") {
-				if (!isAdvisorCodebaseToolAllowed(call.identity)) return deny("advisor_tool_forbidden");
-				return { allow: true };
+			const hasActiveTask = Boolean(context.contract || context.codebasePack || context.trustedCodebaseContext);
+			if (hasActiveTask) {
+				if (!context.contract) return deny("missing_contract");
+				const contract = validateContract();
+				if (!contract) return deny("invalid_codebase_evidence");
+				if (context.projectContext?.projectId !== contract.projectId) {
+					return deny("project_identity_mismatch");
+				}
+				const contractOnlyIndex =
+					call.actor === "main" &&
+					call.identity.toolName === "index_repository" &&
+					!context.codebasePack &&
+					!context.trustedCodebaseContext;
+				if (contractOnlyIndex) {
+					if (call.taskId !== contract.taskId) return deny("task_identity_mismatch");
+					return { allow: true, invalidatesEvidence: true };
+				}
+				if (!context.codebasePack || !context.trustedCodebaseContext) {
+					return deny("missing_codebase_evidence");
+				}
+				if (!validatePack()) return deny("invalid_codebase_evidence");
+				if (!trustedProjectMatches(context)) return deny("project_identity_mismatch");
+				if (!trustedEvidenceMatchesContract(context, contract)) return deny("invalid_codebase_evidence");
+				if (call.taskId !== contract.taskId || call.taskId !== context.trustedCodebaseContext.taskContract.taskId) {
+					return deny("task_identity_mismatch");
+				}
+				if (
+					call.evidenceRevision !== context.evidenceRevision ||
+					call.evidenceRevision !== context.codebasePack.evidenceRevision
+				) {
+					return deny("stale_evidence");
+				}
 			}
+			if (call.actor === "advisor") return { allow: true };
 			if (call.identity.access === "read") return { allow: true };
 			if (call.identity.toolName === "index_repository") return { allow: true, invalidatesEvidence: true };
 			return deny("unknown_tool");
@@ -529,30 +596,13 @@ export class PreToolPolicy {
 		}
 
 		if (!context.contract) return deny("missing_contract");
-		let validatedContract: TaskContract;
-		try {
-			validatedContract = validateTaskContractIntegrity(context.contract);
-		} catch {
-			return deny("invalid_codebase_evidence");
-		}
+		const validatedContract = validateContract();
+		if (!validatedContract) return deny("invalid_codebase_evidence");
 		if (!context.codebasePack || !context.trustedCodebaseContext) return deny("missing_codebase_evidence");
-		try {
-			const packErrors = validateCodebasePack(context.codebasePack, context.trustedCodebaseContext);
-			if (packErrors.length > 0) return deny("invalid_codebase_evidence");
-		} catch {
-			return deny("invalid_codebase_evidence");
-		}
+		if (!validatePack()) return deny("invalid_codebase_evidence");
 		if (!trustedProjectMatches(context)) return deny("project_identity_mismatch");
 		const trustedContract = context.trustedCodebaseContext.taskContract;
-		if (
-			validatedContract.revision !== trustedContract.revision ||
-			validatedContract.taskId !== trustedContract.taskId ||
-			validatedContract.projectId !== trustedContract.projectId ||
-			validatedContract.gitHead !== trustedContract.gitHead ||
-			validatedContract.revision !== context.codebasePack.taskContractRevision ||
-			validatedContract.projectId !== context.codebasePack.projectId ||
-			validatedContract.gitHead !== context.codebasePack.gitHead
-		) {
+		if (!trustedEvidenceMatchesContract(context, validatedContract)) {
 			return deny("invalid_codebase_evidence");
 		}
 		if (call.taskId !== validatedContract.taskId || call.taskId !== trustedContract.taskId) {
