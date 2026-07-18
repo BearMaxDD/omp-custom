@@ -63,7 +63,8 @@ export function createDelegationException(
 			evidence.eventType !== "delegation_exception_approved" ||
 			evidence.taskId !== taskId ||
 			evidence.reason !== request.reason
-		) return null;
+		)
+			return null;
 		return deepFreeze({
 			taskId,
 			reason: request.reason as DelegationExceptionReason,
@@ -79,18 +80,24 @@ export function createDelegationException(
 
 function isApprovalEvidence(value: unknown): value is DelegationApprovalEvidence {
 	if (!isPlainObject(value) || !isPlainObject(value.operator)) return false;
-	return value.eventType === "delegation_exception_approved" &&
+	return (
+		value.eventType === "delegation_exception_approved" &&
 		REASONS.has(String(value.reason)) &&
 		(value.operator.kind === "user" || value.operator.kind === "advisor") &&
-		hasBoundedId(value.id) && hasBoundedId(value.taskId) && hasBoundedId(value.operator.id) &&
-		isIsoTimestamp(value.approvedAt);
+		hasBoundedId(value.id) &&
+		hasBoundedId(value.taskId) &&
+		hasBoundedId(value.operator.id) &&
+		isIsoTimestamp(value.approvedAt)
+	);
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
 	if (typeof value !== "object" || value === null || utilTypes.isProxy(value)) return false;
 	try {
-		return Object.getPrototypeOf(value) === Object.prototype &&
-			Object.values(Object.getOwnPropertyDescriptors(value)).every((descriptor) => "value" in descriptor);
+		return (
+			Object.getPrototypeOf(value) === Object.prototype &&
+			Object.values(Object.getOwnPropertyDescriptors(value)).every((descriptor) => "value" in descriptor)
+		);
 	} catch {
 		return false;
 	}
@@ -106,9 +113,11 @@ function hasBoundedId(value: unknown): value is string {
 }
 
 function isIsoTimestamp(value: unknown): value is string {
-	return typeof value === "string" &&
+	return (
+		typeof value === "string" &&
 		/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value) &&
-		Number.isFinite(Date.parse(value));
+		Number.isFinite(Date.parse(value))
+	);
 }
 
 function deepFreeze<T>(value: T): T {

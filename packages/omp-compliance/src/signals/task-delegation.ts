@@ -4,12 +4,12 @@ import { Buffer } from "node:buffer";
 import { types as utilTypes } from "node:util";
 import type { JobSnapshot } from "@oh-my-pi/pi-coding-agent/tools/hub/types";
 import {
+	type DelegationRecord,
+	type TrustedDelegationContext,
 	applyDelegationEvent,
 	createDelegationCompletionAttestation,
-	type DelegationRecord,
 	getTrustedDelegationActualFiles,
 	isTrustedDelegationContext,
-	type TrustedDelegationContext,
 } from "../delegation/delegation-supervisor";
 import type { TaskDelegationEvidence, ToolCallRecord, ToolResultRecord } from "./types";
 
@@ -48,9 +48,10 @@ export function createTrustedDelegationNormalizationContext(
 			throw new TypeError("invalid_delegation_binding_transport");
 		}
 		const transport = binding.transport as DelegationBinding["transport"];
-		const actualFiles = binding.actualFiles === undefined
-			? undefined
-			: boundedStringArray(binding.actualFiles, "binding_actual_files", 1024);
+		const actualFiles =
+			binding.actualFiles === undefined
+				? undefined
+				: boundedStringArray(binding.actualFiles, "binding_actual_files", 1024);
 		const attestedActualFiles = getTrustedDelegationActualFiles(delegation, String(binding.delegationId));
 		if (actualFiles !== undefined && !sameStrings(actualFiles, attestedActualFiles)) {
 			throw new TypeError("untrusted_delegation_actual_files");
@@ -60,8 +61,12 @@ export function createTrustedDelegationNormalizationContext(
 			transport,
 			originalToolCallId: boundedString(binding.originalToolCallId, "binding_tool_call_id", MAX_ID_BYTES),
 			...(binding.jobId === undefined ? {} : { jobId: boundedString(binding.jobId, "binding_job_id", MAX_ID_BYTES) }),
-			...(binding.agentId === undefined ? {} : { agentId: boundedString(binding.agentId, "binding_agent_id", MAX_ID_BYTES) }),
-			...(binding.sessionId === undefined ? {} : { sessionId: boundedString(binding.sessionId, "binding_session_id", MAX_ID_BYTES) }),
+			...(binding.agentId === undefined
+				? {}
+				: { agentId: boundedString(binding.agentId, "binding_agent_id", MAX_ID_BYTES) }),
+			...(binding.sessionId === undefined
+				? {}
+				: { sessionId: boundedString(binding.sessionId, "binding_session_id", MAX_ID_BYTES) }),
 			...(attestedActualFiles === undefined ? {} : { actualFiles: attestedActualFiles }),
 		};
 	});
@@ -98,20 +103,21 @@ export function normalizeDelegationEvents(
 		const events: NormalizedDelegationEvent[] = [];
 		for (const rawPair of pairs) {
 			try {
-			if (!isPlainRecord(rawPair) || !isToolCallRecord(rawPair.call)) continue;
-			const pair = rawPair as { call: ToolCallRecord; result?: ToolResultRecord };
-			if (pair.result !== undefined && (!isToolResultRecord(pair.result) || pair.result.toolCallId !== pair.call.toolCallId)) {
-				continue;
-			}
-			if (pair.call.toolName === TASK_TOOL_NAME) {
-				events.push(...normalizeTaskEvents(pair.call, pair.result, context));
-			}
-			if (pair.call.toolName === HUB_TOOL_NAME) {
-				events.push(...normalizeHubEvents(pair.call, pair.result, context));
-			}
-			} catch {
-				continue;
-			}
+				if (!isPlainRecord(rawPair) || !isToolCallRecord(rawPair.call)) continue;
+				const pair = rawPair as { call: ToolCallRecord; result?: ToolResultRecord };
+				if (
+					pair.result !== undefined &&
+					(!isToolResultRecord(pair.result) || pair.result.toolCallId !== pair.call.toolCallId)
+				) {
+					continue;
+				}
+				if (pair.call.toolName === TASK_TOOL_NAME) {
+					events.push(...normalizeTaskEvents(pair.call, pair.result, context));
+				}
+				if (pair.call.toolName === HUB_TOOL_NAME) {
+					events.push(...normalizeHubEvents(pair.call, pair.result, context));
+				}
+			} catch {}
 		}
 		return deepFreeze(events);
 	} catch {
@@ -139,20 +145,17 @@ export function applyNormalizedDelegationEvents(
 			event.sessionId !== current.sessionId ||
 			event.transport !== current.transport ||
 			event.originToolCallId !== current.toolCallId
-		) continue;
+		)
+			continue;
 		if (event.status === "queued") continue;
-		if (
-			event.status !== "running" &&
-			(!event.resultToolCallId || event.resultToolCallId !== event.toolCallId)
-		) continue;
+		if (event.status !== "running" && (!event.resultToolCallId || event.resultToolCallId !== event.toolCallId))
+			continue;
 		if (current.status === "queued") {
 			current = applyDelegationEvent(current, { delegationId: event.delegationId, type: "started" });
 		}
 		if (event.status === "running") continue;
 		if (event.status === "completed") {
-			if (
-				!event.completionAttestation
-			) continue;
+			if (!event.completionAttestation) continue;
 			current = applyDelegationEvent(current, event.completionAttestation);
 		} else {
 			current = applyDelegationEvent(current, { delegationId: event.delegationId, type: event.status });
@@ -188,95 +191,93 @@ export function normalizeTaskDelegation(
 			if (result !== undefined && result.toolCallId !== call.toolCallId) continue;
 			if (call.toolName !== TASK_TOOL_NAME) continue;
 
-		if (!result) {
-			// Call with no result → insufficient evidence
-			results.push({
-				status: "insufficient",
-				taskSummary: extractTaskSummary(call.params),
-				outputArtifacts: [],
-				codebaseRefs: [],
-			});
-			continue;
-		}
-
-		if (!result.success) {
-			// Error result → insufficient evidence
-			results.push({
-				status: "insufficient",
-				taskSummary: extractTaskSummary(call.params),
-				outputArtifacts: [],
-				codebaseRefs: [],
-			});
-			continue;
-		}
-
-		if (result.detailsTruncated || (result.source === "official" && !isTaskToolDetails(result.details ?? {}))) {
-			results.push(emptyEvidence(call, result.detailsFailure ? "aborted" : "insufficient"));
-			continue;
-		}
-
-		// Official v17 Task evidence is structured-only. Text fallback is legacy-fixture compatibility.
-		const details =
-			result.source === "official"
-				? (result.details ?? {})
-				: { ...parseResultDetails(result.resultRef), ...result.details };
-		if (isTaskToolDetails(details)) {
-			const asyncDetails = readRecord(details.async);
-			if (details.results.length === 0) {
-				results.push(asyncEvidence(call, asyncDetails));
+			if (!result) {
+				// Call with no result → insufficient evidence
+				results.push({
+					status: "insufficient",
+					taskSummary: extractTaskSummary(call.params),
+					outputArtifacts: [],
+					codebaseRefs: [],
+				});
 				continue;
 			}
 
-			const evidenceCount = results.length;
-			for (const value of details.results) {
-				const single = readRecord(value);
-				if (!single) continue;
-				const exitCode = toFiniteNumber(single.exitCode);
-				const aborted = single.aborted === true || hasNonEmptyString(single.error);
-				const outputArtifacts = collectOutputArtifacts(single);
-				const codebaseRefs = extractCodebaseRefs(`${outputArtifacts.join(" ")} ${safeStringify(single)}`);
-
+			if (!result.success) {
+				// Error result → insufficient evidence
 				results.push({
-					agentId: toOptionalString(single.id),
-					agent: toOptionalString(single.agent),
-					taskSummary: extractSingleResultSummary(single) ?? extractTaskSummary(call.params),
-					status: !aborted && exitCode === 0 ? "completed" : "aborted",
-					durationMs: toFiniteNumber(single.durationMs),
-					exitCode,
-					outputArtifacts,
-					codebaseRefs,
+					status: "insufficient",
+					taskSummary: extractTaskSummary(call.params),
+					outputArtifacts: [],
+					codebaseRefs: [],
 				});
+				continue;
 			}
-			if (results.length === evidenceCount) results.push(emptyEvidence(call, "insufficient"));
-			if (asyncDetails?.state === "running" || asyncDetails?.state === "failed") {
-				results.push(asyncEvidence(call, asyncDetails));
+
+			if (result.detailsTruncated || (result.source === "official" && !isTaskToolDetails(result.details ?? {}))) {
+				results.push(emptyEvidence(call, result.detailsFailure ? "aborted" : "insufficient"));
+				continue;
 			}
-			continue;
-		}
 
-		const agentId = details.agentId ?? details.agent ?? call.params.agent ?? call.params.name;
-		const exitCode = details.exitCode ?? details.exit ?? details.code;
-		const aborted = details.aborted ?? details.cancelled ?? false;
-		const durationMs = details.durationMs ?? details.duration;
-		const outputArtifacts = collectOutputArtifacts(details);
+			// Official v17 Task evidence is structured-only. Text fallback is legacy-fixture compatibility.
+			const details =
+				result.source === "official"
+					? (result.details ?? {})
+					: { ...parseResultDetails(result.resultRef), ...result.details };
+			if (isTaskToolDetails(details)) {
+				const asyncDetails = readRecord(details.async);
+				if (details.results.length === 0) {
+					results.push(asyncEvidence(call, asyncDetails));
+					continue;
+				}
 
-		// Extract codebase references from output text
-		const codebaseRefs = extractCodebaseRefs(
-			`${outputArtifacts.join(" ")} ${JSON.stringify(details)} ${result.resultRef}`,
-		);
+				const evidenceCount = results.length;
+				for (const value of details.results) {
+					const single = readRecord(value);
+					if (!single) continue;
+					const exitCode = toFiniteNumber(single.exitCode);
+					const aborted = single.aborted === true || hasNonEmptyString(single.error);
+					const outputArtifacts = collectOutputArtifacts(single);
+					const codebaseRefs = extractCodebaseRefs(`${outputArtifacts.join(" ")} ${safeStringify(single)}`);
+
+					results.push({
+						agentId: toOptionalString(single.id),
+						agent: toOptionalString(single.agent),
+						taskSummary: extractSingleResultSummary(single) ?? extractTaskSummary(call.params),
+						status: !aborted && exitCode === 0 ? "completed" : "aborted",
+						durationMs: toFiniteNumber(single.durationMs),
+						exitCode,
+						outputArtifacts,
+						codebaseRefs,
+					});
+				}
+				if (results.length === evidenceCount) results.push(emptyEvidence(call, "insufficient"));
+				if (asyncDetails?.state === "running" || asyncDetails?.state === "failed") {
+					results.push(asyncEvidence(call, asyncDetails));
+				}
+				continue;
+			}
+
+			const agentId = details.agentId ?? details.agent ?? call.params.agent ?? call.params.name;
+			const exitCode = details.exitCode ?? details.exit ?? details.code;
+			const aborted = details.aborted ?? details.cancelled ?? false;
+			const durationMs = details.durationMs ?? details.duration;
+			const outputArtifacts = collectOutputArtifacts(details);
+
+			// Extract codebase references from output text
+			const codebaseRefs = extractCodebaseRefs(
+				`${outputArtifacts.join(" ")} ${JSON.stringify(details)} ${result.resultRef}`,
+			);
 
 			results.push({
-			agentId: agentId != null ? String(agentId) : undefined,
-			taskSummary: extractTaskSummary(call.params),
-			status: aborted ? "aborted" : exitCode === 0 ? "completed" : "aborted",
-			durationMs: durationMs != null ? Number(durationMs) : undefined,
-			exitCode: exitCode != null ? Number(exitCode) : undefined,
-			outputArtifacts,
-			codebaseRefs,
+				agentId: agentId != null ? String(agentId) : undefined,
+				taskSummary: extractTaskSummary(call.params),
+				status: aborted ? "aborted" : exitCode === 0 ? "completed" : "aborted",
+				durationMs: durationMs != null ? Number(durationMs) : undefined,
+				exitCode: exitCode != null ? Number(exitCode) : undefined,
+				outputArtifacts,
+				codebaseRefs,
 			});
-		} catch {
-			continue;
-		}
+		} catch {}
 	}
 
 	return results;
@@ -287,23 +288,24 @@ function normalizeTaskEvents(
 	result?: ToolResultRecord,
 	context?: TrustedDelegationNormalizationContext,
 ): NormalizedDelegationEvent[] {
-	const callBindings = context?.bindings.filter(
-		(binding) => binding.transport === "task" && binding.originalToolCallId === call.toolCallId,
-	) ?? [];
+	const callBindings =
+		context?.bindings.filter(
+			(binding) => binding.transport === "task" && binding.originalToolCallId === call.toolCallId,
+		) ?? [];
 	if (!result) {
-		const bindings = callBindings.length > 0 ? callBindings : [{
-			delegationId: call.toolCallId,
-			transport: "task" as const,
-			originalToolCallId: call.toolCallId,
-		}];
-			return bindings.map((binding) => delegationEvent(
-			call,
-			binding,
-			"queued",
-			extractTaskSummary(call.params),
-				[],
-				context?.delegation,
-			));
+		const bindings =
+			callBindings.length > 0
+				? callBindings
+				: [
+						{
+							delegationId: call.toolCallId,
+							transport: "task" as const,
+							originalToolCallId: call.toolCallId,
+						},
+					];
+		return bindings.map((binding) =>
+			delegationEvent(call, binding, "queued", extractTaskSummary(call.params), [], context?.delegation),
+		);
 	}
 	if (
 		!result.success ||
@@ -311,7 +313,8 @@ function normalizeTaskEvents(
 		result.detailsTruncated ||
 		!result.details ||
 		!isTaskToolDetails(result.details)
-	) return [];
+	)
+		return [];
 
 	const evidenceIds = [`tool-result:${result.toolCallId}`];
 	const events: NormalizedDelegationEvent[] = [];
@@ -329,26 +332,38 @@ function normalizeTaskEvents(
 			};
 		const summary = extractSingleResultSummary(single) ?? extractTaskSummary(call.params);
 		events.push(delegationEvent(call, binding, "running", summary, [], context?.delegation));
-		events.push(delegationEvent(call, binding, taskResultStatus(single, result.success), summary, evidenceIds, context?.delegation));
+		events.push(
+			delegationEvent(
+				call,
+				binding,
+				taskResultStatus(single, result.success),
+				summary,
+				evidenceIds,
+				context?.delegation,
+			),
+		);
 	}
 
 	const asyncDetails = readRecord(result.details.async);
 	const jobId = toOptionalString(asyncDetails?.jobId);
 	if (events.length === 0 && jobId && (asyncDetails?.state === "running" || asyncDetails?.state === "failed")) {
-		const binding = callBindings.find((candidate) => candidate.jobId === jobId) ?? callBindings[0] ?? {
-			delegationId: call.toolCallId,
-			transport: "task" as const,
-			originalToolCallId: call.toolCallId,
-			jobId,
-		};
-		events.push(delegationEvent(
-			call,
-			binding,
-			asyncDetails.state === "running" ? "running" : "failed",
-			extractTaskSummary(call.params),
+		const binding = callBindings.find((candidate) => candidate.jobId === jobId) ??
+			callBindings[0] ?? {
+				delegationId: call.toolCallId,
+				transport: "task" as const,
+				originalToolCallId: call.toolCallId,
+				jobId,
+			};
+		events.push(
+			delegationEvent(
+				call,
+				binding,
+				asyncDetails.state === "running" ? "running" : "failed",
+				extractTaskSummary(call.params),
 				evidenceIds,
 				context?.delegation,
-			));
+			),
+		);
 	}
 	return events;
 }
@@ -365,15 +380,14 @@ function normalizeHubEvents(
 		result.detailsTruncated ||
 		!result.details ||
 		!isHubJobDetails(result.details)
-	) return [];
+	)
+		return [];
 
 	const evidenceIds = [`tool-result:${result.toolCallId}`];
 	const events: NormalizedDelegationEvent[] = [];
 	for (const job of result.details.jobs) {
 		if (job.type !== "task") continue;
-		const binding = context.bindings.find(
-			(candidate) => candidate.transport === "hub" && candidate.jobId === job.id,
-		);
+		const binding = context.bindings.find((candidate) => candidate.transport === "hub" && candidate.jobId === job.id);
 		if (!binding) continue;
 		events.push(delegationEvent(call, binding, hubJobStatus(job), job.label, evidenceIds, context.delegation));
 	}
@@ -389,14 +403,15 @@ function delegationEvent(
 	context?: TrustedDelegationContext,
 ): NormalizedDelegationEvent {
 	const resultToolCallId = status === "queued" || status === "running" ? undefined : call.toolCallId;
-	const completionAttestation = status === "completed" && context
-		? createDelegationCompletionAttestation(context, {
-			delegationId: binding.delegationId,
-			originToolCallId: binding.originalToolCallId,
-			resultToolCallId: call.toolCallId,
-			toolEvidenceIds,
-		})
-		: undefined;
+	const completionAttestation =
+		status === "completed" && context
+			? createDelegationCompletionAttestation(context, {
+					delegationId: binding.delegationId,
+					originToolCallId: binding.originalToolCallId,
+					resultToolCallId: call.toolCallId,
+					toolEvidenceIds,
+				})
+			: undefined;
 	const event = deepFreeze({
 		delegationId: binding.delegationId,
 		...(binding.agentId === undefined ? {} : { agentId: binding.agentId }),
@@ -407,7 +422,9 @@ function delegationEvent(
 		...(resultToolCallId === undefined ? {} : { resultToolCallId }),
 		transport: binding.transport,
 		status,
-		...(workPackage === undefined ? {} : { workPackage: boundedString(workPackage, "delegation_work_package", MAX_STRING_BYTES) }),
+		...(workPackage === undefined
+			? {}
+			: { workPackage: boundedString(workPackage, "delegation_work_package", MAX_STRING_BYTES) }),
 		actualFilesKnown: completionAttestation?.actualFilesKnown ?? false,
 		actualFiles: completionAttestation?.actualFiles ?? [],
 		toolEvidenceIds: boundedStringArray(toolEvidenceIds, "delegation_tool_evidence", MAX_STRING_BYTES),
@@ -503,7 +520,8 @@ function isTaskToolDetails(
 ): details is Record<string, unknown> & { results: unknown[] } {
 	if (
 		!(details.projectAgentsDir === null || typeof details.projectAgentsDir === "string") ||
-		!Array.isArray(details.results) || details.results.length > MAX_ITEMS ||
+		!Array.isArray(details.results) ||
+		details.results.length > MAX_ITEMS ||
 		!isFiniteNumber(details.totalDurationMs)
 	) {
 		return false;
@@ -521,10 +539,10 @@ function isSingleResult(value: unknown): value is Record<string, unknown> {
 		!isBoundedString(result.id, MAX_ID_BYTES) ||
 		!isBoundedString(result.agent, MAX_ID_BYTES) ||
 		!AGENT_SOURCES.has(String(result.agentSource)) ||
-			!isBoundedString(result.task, MAX_STRING_BYTES) ||
-			!isFiniteNumber(result.exitCode) ||
-			!isStringWithinLimit(result.output, MAX_STRING_BYTES) ||
-			!isStringWithinLimit(result.stderr, MAX_STRING_BYTES) ||
+		!isBoundedString(result.task, MAX_STRING_BYTES) ||
+		!isFiniteNumber(result.exitCode) ||
+		!isStringWithinLimit(result.output, MAX_STRING_BYTES) ||
+		!isStringWithinLimit(result.stderr, MAX_STRING_BYTES) ||
 		typeof result.truncated !== "boolean" ||
 		!isFiniteNumber(result.durationMs) ||
 		!isFiniteNumber(result.tokens) ||
@@ -562,8 +580,10 @@ function isTaskAsyncDetails(value: unknown): boolean {
 }
 
 function isStringArray(value: unknown): value is string[] {
-	return Array.isArray(value) && value.length <= MAX_ITEMS && value.every(
-		(item) => typeof item === "string" && Buffer.byteLength(item) <= MAX_STRING_BYTES,
+	return (
+		Array.isArray(value) &&
+		value.length <= MAX_ITEMS &&
+		value.every((item) => typeof item === "string" && Buffer.byteLength(item) <= MAX_STRING_BYTES)
 	);
 }
 
@@ -590,8 +610,10 @@ function readRecord(value: unknown): Record<string, unknown> | undefined {
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
 	if (typeof value !== "object" || value === null || Array.isArray(value) || utilTypes.isProxy(value)) return false;
 	try {
-		return Object.getPrototypeOf(value) === Object.prototype &&
-			Object.values(Object.getOwnPropertyDescriptors(value)).every((descriptor) => "value" in descriptor);
+		return (
+			Object.getPrototypeOf(value) === Object.prototype &&
+			Object.values(Object.getOwnPropertyDescriptors(value)).every((descriptor) => "value" in descriptor)
+		);
 	} catch {
 		return false;
 	}
@@ -599,25 +621,30 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 
 function isToolCallRecord(value: unknown): value is ToolCallRecord {
 	const record = readRecord(value);
-	return record !== undefined &&
+	return (
+		record !== undefined &&
 		isBoundedString(record.toolName, MAX_ID_BYTES) &&
 		isBoundedString(record.toolCallId, MAX_ID_BYTES) &&
 		isPlainRecord(record.params) &&
 		(record.sessionId === undefined || isBoundedString(record.sessionId, MAX_ID_BYTES)) &&
-		isBoundedString(record.timestamp, MAX_STRING_BYTES);
+		isBoundedString(record.timestamp, MAX_STRING_BYTES)
+	);
 }
 
 function isToolResultRecord(value: unknown): value is ToolResultRecord {
 	const record = readRecord(value);
-	return record !== undefined &&
+	return (
+		record !== undefined &&
 		isBoundedString(record.toolCallId, MAX_ID_BYTES) &&
 		typeof record.success === "boolean" &&
-		typeof record.resultRef === "string" && Buffer.byteLength(record.resultRef) <= MAX_STRING_BYTES &&
+		typeof record.resultRef === "string" &&
+		Buffer.byteLength(record.resultRef) <= MAX_STRING_BYTES &&
 		(record.source === undefined || record.source === "official" || record.source === "legacy") &&
 		(record.details === undefined || isPlainRecord(record.details)) &&
 		(record.detailsTruncated === undefined || typeof record.detailsTruncated === "boolean") &&
 		(record.detailsFailure === undefined || typeof record.detailsFailure === "boolean") &&
-		isBoundedString(record.timestamp, MAX_STRING_BYTES);
+		isBoundedString(record.timestamp, MAX_STRING_BYTES)
+	);
 }
 
 function boundedStringArray(values: unknown, label: string, maxBytes: number): string[] {
