@@ -3,20 +3,20 @@ import type { ComplianceVerdict, VerdictContext } from "../../src/advisor/verdic
 import { acceptVerdict, hasPassed } from "../../src/advisor/verdict-sink";
 import type { VerdictStore } from "../../src/advisor/verdict-sink";
 import type { SHA256Hash } from "../../src/contract/types";
+import { strictVerdictContext, strictVerdictFields } from "../support/strict-verdict";
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
 const DEFAULT_HASH = "sha256:abc123def456" as SHA256Hash;
 
-const defaultContext: VerdictContext = {
-	taskId: "code-task",
-	contractHash: DEFAULT_HASH,
-	attempt: 1,
-};
+const defaultContext: VerdictContext = strictVerdictContext("code-task", DEFAULT_HASH);
 
 function validVerdict(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
 	return {
 		schema_version: 1,
+		...strictVerdictFields(
+			strictVerdictContext("code-task", DEFAULT_HASH, Number(overrides.attempt ?? defaultContext.attempt)),
+		),
 		task_id: "code-task",
 		contract_hash: DEFAULT_HASH,
 		attempt: 1,
@@ -88,7 +88,7 @@ describe("acceptVerdict", () => {
 		expect(acceptVerdict(verdictA, defaultContext, store).status).toBe("accepted");
 
 		// Different attempt → different verdict → accepted
-		const ctxB: VerdictContext = { taskId: "code-task", contractHash: DEFAULT_HASH, attempt: 2 };
+		const ctxB = strictVerdictContext("code-task", DEFAULT_HASH, 2);
 		expect(acceptVerdict(verdictB, ctxB, store).status).toBe("accepted");
 
 		// Repeat of attempt 1 → now stale (pass at attempt 2 has advanced beyond attempt 1)
@@ -101,7 +101,7 @@ describe("acceptVerdict", () => {
 		const store = freshStore();
 
 		// Accept attempt 2 pass first
-		const ctx2: VerdictContext = { taskId: "code-task", contractHash: DEFAULT_HASH, attempt: 2 };
+		const ctx2 = strictVerdictContext("code-task", DEFAULT_HASH, 2);
 		const pass2 = acceptVerdict(validVerdict({ attempt: 2 }), ctx2, store);
 		expect(pass2.status).toBe("accepted");
 
@@ -132,7 +132,7 @@ describe("acceptVerdict", () => {
 		const store = freshStore();
 
 		// Accept remediate at attempt 1
-		const ctx1: VerdictContext = { taskId: "code-task", contractHash: DEFAULT_HASH, attempt: 1 };
+		const ctx1 = strictVerdictContext("code-task", DEFAULT_HASH);
 		const r1 = acceptVerdict(
 			validVerdict({ status: "remediate", findings: [{ id: "f1", reason: "Fix", required_fix: "fix" }] }),
 			ctx1,
@@ -141,7 +141,7 @@ describe("acceptVerdict", () => {
 		expect(r1.status).toBe("accepted");
 
 		// Accept remediate at attempt 2 (pass never happened)
-		const ctx2: VerdictContext = { taskId: "code-task", contractHash: DEFAULT_HASH, attempt: 2 };
+		const ctx2 = strictVerdictContext("code-task", DEFAULT_HASH, 2);
 		const r2 = acceptVerdict(
 			validVerdict({ attempt: 2, status: "remediate", findings: [{ id: "f1", reason: "Fix", required_fix: "fix" }] }),
 			ctx2,
@@ -162,8 +162,14 @@ describe("acceptVerdict", () => {
 		const store = freshStore();
 		const parsed = {
 			schema_version: 1 as const,
+			review_id: defaultContext.reviewId,
 			task_id: "code-task",
+			project_id: defaultContext.projectId,
 			contract_hash: DEFAULT_HASH,
+			evidence_revision: defaultContext.evidenceRevision as SHA256Hash,
+			git_head: defaultContext.gitHead,
+			diff_hash: defaultContext.diffHash as SHA256Hash,
+			trigger: "compliance_review" as const,
 			attempt: 1,
 			status: "pass" as const,
 			findings: [],
@@ -188,7 +194,7 @@ describe("hasPassed", () => {
 
 	it("returns false after only remediate verdicts", () => {
 		const store = freshStore();
-		const ctx: VerdictContext = { taskId: "code-task", contractHash: DEFAULT_HASH, attempt: 1 };
+		const ctx = strictVerdictContext("code-task", DEFAULT_HASH);
 		acceptVerdict(
 			validVerdict({ status: "remediate", findings: [{ id: "f1", reason: "Fix", required_fix: "fix" }] }),
 			ctx,

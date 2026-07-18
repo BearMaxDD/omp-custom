@@ -29,7 +29,10 @@ export interface ReviewEnvelopeInput {
 	readonly createdAt: string;
 }
 
-export interface ReviewEnvelope extends ReviewEnvelopeInput {
+export interface ReviewEnvelope extends Omit<ReviewEnvelopeInput, "contractHash" | "evidenceRevision" | "diffHash"> {
+	readonly contractHash: `sha256:${string}`;
+	readonly evidenceRevision: `sha256:${string}`;
+	readonly diffHash: `sha256:${string}`;
 	readonly reviewId: string;
 	readonly envelopeHash: `sha256:${string}`;
 }
@@ -115,6 +118,9 @@ export function createReviewEnvelope(input: ReviewEnvelopeInput, reviewAttempt =
 	});
 	return Object.freeze({
 		...normalized,
+		contractHash: normalized.contractHash as `sha256:${string}`,
+		evidenceRevision: normalized.evidenceRevision as `sha256:${string}`,
+		diffHash: normalized.diffHash as `sha256:${string}`,
 		reviewId: `review:${dedupeKey.slice("sha256:".length)}:${reviewAttempt}`,
 		envelopeHash: `sha256:${digest}`,
 	});

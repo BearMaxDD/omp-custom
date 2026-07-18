@@ -80,13 +80,13 @@ export type TaskEvent =
 	| { type: "retry"; reviewId: string }
 	| { type: "override"; reason: string; actor: "user" }
 	| { type: "advisor_silent" }
-	| { type: "verdict"; status: "pass"; summary?: string; schemaValid?: boolean }
+	| { type: "verdict"; status: "pass"; summary?: string; schemaValid: boolean }
 	| {
 			type: "verdict";
 			status: "remediation_required";
 			summary?: string;
 			requiredFixes: string[];
-			schemaValid?: boolean;
+			schemaValid: boolean;
 	  }
 	| { type: "remediation"; fingerprint: string }
 	| { type: "protocol_error"; error: string };

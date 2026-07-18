@@ -689,6 +689,20 @@ describe("ReviewScheduler", () => {
 		expect(requests.map((request) => request.metadata?.taskId)).toEqual(["first", "second"]);
 	});
 
+	it("restores a completed review to in-flight for a downstream commit compensation", async () => {
+		const { scheduler } = harness();
+		await scheduler.enqueue(intent({ trigger: "compliance_review", priority: 100 }));
+		await scheduler.pump();
+		const reviewId = defined(scheduler.snapshot().inFlight).reviewId;
+
+		await scheduler.handleLifecycle(terminal(reviewId, "advisor_run_completed"), false);
+		expect(scheduler.snapshot().completed.map((item) => item.reviewId)).toContain(reviewId);
+
+		await scheduler.restoreCompleted(reviewId);
+		expect(scheduler.snapshot().completed.map((item) => item.reviewId)).not.toContain(reviewId);
+		expect(scheduler.snapshot().inFlight?.reviewId).toBe(reviewId);
+	});
+
 	it("saturates the retry counter without ever stopping retries", async () => {
 		const store = new MemoryStore();
 		const seeded = harness({ store });

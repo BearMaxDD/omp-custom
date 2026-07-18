@@ -87,6 +87,7 @@ export function createStrictRuntimeDependencies(input: {
 	tddPath?: string;
 	store: EvidenceStore;
 	requestAdvisorReview: (request: AdvisorReviewRequest) => Promise<AdvisorReviewReceipt>;
+	now?: () => number;
 }): ComplianceRuntimeDependencies {
 	const tddPath = input.tddPath ?? "tdd.md";
 	const absoluteTddPath = join(input.repoRoot, tddPath);
@@ -150,7 +151,7 @@ export function createStrictRuntimeDependencies(input: {
 	};
 	const receipts = new Map<string, AdvisorReviewReceipt>();
 	const scheduler = new ReviewScheduler({
-		clock: { now: () => Date.now() },
+		clock: { now: input.now ?? (() => Date.now()) },
 		random: () => 0,
 		store: new JsonFileReviewSchedulerStore(join(input.repoRoot, ".omp", "compliance", "review-scheduler.json")),
 		requester: async (request) => {

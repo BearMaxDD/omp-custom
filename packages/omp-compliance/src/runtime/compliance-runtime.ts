@@ -129,6 +129,7 @@ export class ComplianceRuntime {
 	private readonly receiptFor: (reviewId: string) => AdvisorReviewReceipt | undefined;
 	private activeEnvelope: ReviewEnvelope | undefined;
 	private schedulerRestored = false;
+	private verdictCommitInProgress = false;
 
 	constructor(
 		private readonly getEvidenceStore: () => EvidenceStore,
@@ -386,7 +387,12 @@ export class ComplianceRuntime {
 			reviewId: strictEnvelope.reviewId,
 			sessionId,
 			taskId: strictEnvelope.taskId,
+			projectId: strictEnvelope.projectId,
 			contractHash: strictEnvelope.contractHash as `sha256:${string}`,
+			evidenceRevision: strictEnvelope.evidenceRevision,
+			gitHead: strictEnvelope.gitHead,
+			diffHash: strictEnvelope.diffHash,
+			trigger: strictEnvelope.trigger,
 			attempt: strictEnvelope.attempt,
 			context,
 			rules,
@@ -462,6 +468,20 @@ export class ComplianceRuntime {
 	 * @param verdict — raw advisor verdict (schema_version, task_id, ...)
 	 */
 	async acceptVerdict(verdict: Record<string, unknown>): Promise<{ accepted: boolean; reason?: string }> {
+		if (this.verdictCommitInProgress) {
+			return { accepted: false, reason: "A verdict commit is already in progress" };
+		}
+		this.verdictCommitInProgress = true;
+		try {
+			return await this.acceptVerdictExclusive(verdict);
+		} finally {
+			this.verdictCommitInProgress = false;
+		}
+	}
+
+	private async acceptVerdictExclusive(
+		verdict: Record<string, unknown>,
+	): Promise<{ accepted: boolean; reason?: string }> {
 		if (!this.taskState) {
 			return { accepted: false, reason: "No active compliance task" };
 		}
@@ -472,7 +492,6 @@ export class ComplianceRuntime {
 		) {
 			return { accepted: false, reason: "No matching active Advisor review" };
 		}
-
 		// Schema and identity are always strict in v17.
 		const ctx = {
 			taskId: this.taskState.taskId,
@@ -485,6 +504,24 @@ export class ComplianceRuntime {
 			diffHash: this.taskState.diffHash,
 			trigger: "compliance_review" as const,
 		};
+		if (this.taskState.status !== "advisor_reviewing") {
+			if (this.taskState.status === "completed" || this.taskState.status === "remediation_required") {
+				try {
+					const parsedTerminalVerdict = parseVerdict(verdict, ctx);
+					const terminal = prepareVerdict(verdict, ctx, this.verdictStore, parsedTerminalVerdict);
+					return {
+						accepted: false,
+						reason: terminal.status === "rejected" ? terminal.reason : "Advisor review is already finalized",
+					};
+				} catch (error) {
+					return {
+						accepted: false,
+						reason: error instanceof Error ? error.message : "Advisor review is already finalized",
+					};
+				}
+			}
+			return { accepted: false, reason: "No matching active Advisor review" };
+		}
 		let parsed: ComplianceVerdict;
 		try {
 			parsed = parseVerdict(verdict, ctx);
@@ -511,10 +548,6 @@ export class ComplianceRuntime {
 			}
 			return { accepted: false, reason: prepared.reason };
 		}
-		if (this.taskState.status !== "advisor_reviewing") {
-			return { accepted: false, reason: "No matching active Advisor review" };
-		}
-
 		// Step 3: Map parsed verdict to state machine transitions
 		const isPass = parsed.status === "pass";
 		const findings = parsed.findings as ComplianceFinding[];
@@ -549,11 +582,7 @@ export class ComplianceRuntime {
 			const delegationPassed =
 				!this.contract?.policy.requiresSubagentDelegation || strictEvidence.delegations.some(delegationSatisfiesGate);
 			const persistedEnvelope = await this.authoritativeEnvelope(this.taskState.taskId, this.taskState.activeReviewId);
-			const envelopePersisted =
-				persistedEnvelope !== undefined &&
-				this.activeEnvelope !== undefined &&
-				persistedEnvelope.reviewId === this.activeEnvelope.reviewId &&
-				persistedEnvelope.envelopeHash === this.activeEnvelope.envelopeHash;
+			const envelopePersisted = this.persistedEnvelopeMatches(persistedEnvelope, this.activeEnvelope);
 			if (
 				currentGit.gitHead !== this.taskState.gitHead ||
 				currentGit.diffHash !== this.taskState.diffHash ||
@@ -570,14 +599,21 @@ export class ComplianceRuntime {
 				summary: findings.length > 0 ? findings[0].reason : undefined,
 				schemaValid: true,
 			});
-			await this.commitAdvisorLifecycle();
-			await this.writeEvidenceRecord("completed", {
-				signalDigest: "advisor-pass",
-				verdictSummary: findings.length > 0 ? findings[0].reason : undefined,
-			});
 			const committed = prepared.commit();
 			if (committed.status !== "accepted") return { accepted: false, reason: committed.reason };
-			this.taskState = nextState;
+			try {
+				await this.commitAdvisorLifecycle();
+				await this.writeEvidenceRecord("completed", {
+					signalDigest: "advisor-pass",
+					verdictSummary: findings.length > 0 ? findings[0].reason : undefined,
+				});
+				this.taskState = nextState;
+			} catch (error) {
+				prepared.rollback();
+				await this.compensateAdvisorLifecycle();
+				throw error;
+			}
+			await this.scheduler.pump();
 			return { accepted: true };
 		}
 
@@ -594,14 +630,21 @@ export class ComplianceRuntime {
 			schemaValid: true,
 		});
 
-		await this.commitAdvisorLifecycle();
-		await this.writeEvidenceRecord("remediation_required", {
-			signalDigest: "advisor-remediate",
-			verdictSummary: findings.length > 0 ? findings[0].reason : undefined,
-		});
 		const committed = prepared.commit();
 		if (committed.status !== "accepted") return { accepted: false, reason: committed.reason };
-		this.taskState = nextState;
+		try {
+			await this.commitAdvisorLifecycle();
+			await this.writeEvidenceRecord("remediation_required", {
+				signalDigest: "advisor-remediate",
+				verdictSummary: findings.length > 0 ? findings[0].reason : undefined,
+			});
+			this.taskState = nextState;
+		} catch (error) {
+			prepared.rollback();
+			await this.compensateAdvisorLifecycle();
+			throw error;
+		}
+		await this.scheduler.pump();
 
 		// Only inject if not stalled
 		if (this.taskState.status !== "stalled") {
@@ -638,15 +681,10 @@ export class ComplianceRuntime {
 	}
 
 	async retryDueReviews(): Promise<void> {
-		await this.scheduler.pump();
 		if (this.taskState?.status !== "stalled" || !this.activeEnvelope) return;
-		const inFlight = this.scheduler.snapshot().inFlight;
-		if (
-			!inFlight ||
-			inFlight.taskId !== this.activeEnvelope.taskId ||
-			inFlight.reviewId === this.activeEnvelope.reviewId
-		)
-			return;
+		const queued = this.scheduler.nextDueIntent(this.activeEnvelope.taskId, "compliance_review");
+		if (!queued) return;
+		const reviewAttempt = Math.min(queued.attempt + 1, Number.MAX_SAFE_INTEGER);
 		const retryEnvelope = createReviewEnvelope(
 			{
 				taskId: this.activeEnvelope.taskId,
@@ -659,9 +697,10 @@ export class ComplianceRuntime {
 				trigger: "compliance_review",
 				createdAt: new Date().toISOString(),
 			},
-			inFlight.attempt,
+			reviewAttempt,
 		);
-		if (retryEnvelope.reviewId !== inFlight.reviewId) throw new Error("Scheduler retry identity mismatch");
+		const expectedReviewId = `review:${queued.dedupeKey.slice("sha256:".length)}:${reviewAttempt}`;
+		if (retryEnvelope.reviewId !== expectedReviewId) throw new Error("Scheduler retry identity mismatch");
 		await this.writeEvidenceRecord("completion_retry", {
 			signalDigest: retryEnvelope.envelopeHash,
 			reviewEnvelope: retryEnvelope,
@@ -669,13 +708,23 @@ export class ComplianceRuntime {
 		const previousReviewId = this.activeEnvelope.reviewId;
 		this.activeEnvelope = retryEnvelope;
 		this.taskState = transition(this.taskState, { type: "retry", reviewId: retryEnvelope.reviewId });
-		this.taskState = transition(this.taskState, { type: "advisor_accepted", reviewId: retryEnvelope.reviewId });
 		const previous = this.reviewDeps.registry.get(previousReviewId);
 		if (previous) {
 			this.reviewDeps.registry.put(
 				Object.freeze({ ...previous, reviewId: retryEnvelope.reviewId, createdAt: retryEnvelope.createdAt }),
 			);
 		}
+		await this.scheduler.pump();
+		const receipt = this.receiptFor(retryEnvelope.reviewId);
+		if (receipt?.status !== "accepted" || this.scheduler.snapshot().inFlight?.reviewId !== retryEnvelope.reviewId) {
+			this.taskState = transition(this.taskState, {
+				type: "review_failed",
+				reviewId: retryEnvelope.reviewId,
+				reason: receipt?.reason ?? "Scheduler did not dispatch the prepared retry Envelope",
+			});
+			return;
+		}
+		this.taskState = transition(this.taskState, { type: "advisor_accepted", reviewId: retryEnvelope.reviewId });
 	}
 
 	overrideCompletion(reason: string): TaskState {
@@ -779,18 +828,59 @@ export class ComplianceRuntime {
 		);
 	}
 
+	private persistedEnvelopeMatches(persisted: ReviewEnvelope | undefined, active: ReviewEnvelope | undefined): boolean {
+		if (!persisted || !active) return false;
+		const reviewAttempt = Number(persisted.reviewId.slice(persisted.reviewId.lastIndexOf(":") + 1));
+		try {
+			const reconstructed = createReviewEnvelope(
+				{
+					taskId: persisted.taskId,
+					projectId: persisted.projectId,
+					contractHash: persisted.contractHash,
+					evidenceRevision: persisted.evidenceRevision,
+					gitHead: persisted.gitHead,
+					diffHash: persisted.diffHash,
+					attempt: persisted.attempt,
+					trigger: persisted.trigger,
+					createdAt: persisted.createdAt,
+				},
+				reviewAttempt,
+			);
+			return (
+				reconstructed.reviewId === persisted.reviewId &&
+				reconstructed.envelopeHash === persisted.envelopeHash &&
+				persisted.reviewId === active.reviewId &&
+				persisted.envelopeHash === active.envelopeHash
+			);
+		} catch {
+			return false;
+		}
+	}
+
 	private async commitAdvisorLifecycle(): Promise<void> {
 		if (!this.taskState?.activeReviewId) throw new Error("No active review to commit");
-		await this.scheduler.handleLifecycle({
-			type: "advisor_run_completed",
-			reviewId: this.taskState.activeReviewId,
-			trigger: "compliance_review",
-			priority: 100,
-			primarySessionId: this.reviewDeps.sessionId(),
-			advisorSessionId: "advisor",
-			timestamp: new Date().toISOString(),
-			verdictSubmitted: true,
-		});
+		await this.scheduler.handleLifecycle(
+			{
+				type: "advisor_run_completed",
+				reviewId: this.taskState.activeReviewId,
+				trigger: "compliance_review",
+				priority: 100,
+				primarySessionId: this.reviewDeps.sessionId(),
+				advisorSessionId: "advisor",
+				timestamp: new Date().toISOString(),
+				verdictSubmitted: true,
+			},
+			false,
+		);
+	}
+
+	private async compensateAdvisorLifecycle(): Promise<void> {
+		const reviewId = this.taskState?.activeReviewId;
+		if (!reviewId) return;
+		const schedulerState = this.scheduler.snapshot();
+		if (schedulerState.completed.some((intent) => intent.reviewId === reviewId)) {
+			await this.scheduler.restoreCompleted(reviewId);
+		}
 	}
 
 	private async writeEvidenceRecord(

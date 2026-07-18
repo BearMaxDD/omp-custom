@@ -30,6 +30,7 @@ import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
 import { FakeAdvisor } from "../support/fake-advisor";
 import { createStrictRuntimeDependencies } from "../support/strict-runtime-dependencies";
+import { strictVerdictContext, strictVerdictFields } from "../support/strict-verdict";
 
 // ─── Test Helper Types ──────────────────────────────────────────────
 
@@ -60,11 +61,11 @@ class MinimalTestAPI {
 
 const DEFAULT_HASH: SHA256Hash = "sha256:abc123def456" as SHA256Hash;
 
-const defaultContext: VerdictContext = {
-	taskId: "protocol-test",
-	contractHash: DEFAULT_HASH,
-	attempt: 1,
-};
+const defaultContext = strictVerdictContext("protocol-test", DEFAULT_HASH);
+
+function strictFields(taskId: string, attempt = 1, contractHash = DEFAULT_HASH): Record<string, unknown> {
+	return strictVerdictFields(strictVerdictContext(taskId, contractHash, attempt));
+}
 
 function freshStore(): VerdictStore {
 	return { records: [], lastPass: {}, acceptedKeys: new Set() };
@@ -151,6 +152,7 @@ describe("Verdict schema validation", () => {
 	it("valid pass verdict parses successfully", () => {
 		const verdict = {
 			schema_version: 1,
+			...strictFields("my-task"),
 			task_id: "my-task",
 			contract_hash: DEFAULT_HASH,
 			attempt: 1,
@@ -158,11 +160,7 @@ describe("Verdict schema validation", () => {
 			findings: [],
 		};
 
-		const parsed = parseVerdict(verdict, {
-			taskId: "my-task",
-			contractHash: DEFAULT_HASH,
-			attempt: 1,
-		});
+		const parsed = parseVerdict(verdict, strictVerdictContext("my-task", DEFAULT_HASH));
 
 		expect(parsed.status).toBe("pass");
 		expect(parsed.schema_version).toBe(1);
@@ -171,6 +169,7 @@ describe("Verdict schema validation", () => {
 	it("valid remediate verdict with required_fix parses successfully", () => {
 		const verdict = {
 			schema_version: 1,
+			...strictFields("my-task"),
 			task_id: "my-task",
 			contract_hash: DEFAULT_HASH,
 			attempt: 1,
@@ -184,11 +183,7 @@ describe("Verdict schema validation", () => {
 			],
 		};
 
-		const parsed = parseVerdict(verdict, {
-			taskId: "my-task",
-			contractHash: DEFAULT_HASH,
-			attempt: 1,
-		});
+		const parsed = parseVerdict(verdict, strictVerdictContext("my-task", DEFAULT_HASH));
 
 		expect(parsed.status).toBe("remediate");
 		expect(parsed.findings).toHaveLength(1);
@@ -198,6 +193,7 @@ describe("Verdict schema validation", () => {
 	it("remediate verdict without required_fix rejects", () => {
 		const verdict = {
 			schema_version: 1,
+			...strictFields("my-task"),
 			task_id: "my-task",
 			contract_hash: DEFAULT_HASH,
 			attempt: 1,
@@ -211,18 +207,13 @@ describe("Verdict schema validation", () => {
 			],
 		};
 
-		expect(() =>
-			parseVerdict(verdict, {
-				taskId: "my-task",
-				contractHash: DEFAULT_HASH,
-				attempt: 1,
-			}),
-		).toThrow(VerdictValidationError);
+		expect(() => parseVerdict(verdict, strictVerdictContext("my-task", DEFAULT_HASH))).toThrow(VerdictValidationError);
 	});
 
 	it("mismatched task_id in context rejects", () => {
 		const verdict = {
 			schema_version: 1,
+			...strictFields("task-a"),
 			task_id: "task-a",
 			contract_hash: DEFAULT_HASH,
 			attempt: 1,
@@ -230,18 +221,13 @@ describe("Verdict schema validation", () => {
 			findings: [],
 		};
 
-		expect(() =>
-			parseVerdict(verdict, {
-				taskId: "task-b", // mismatched
-				contractHash: DEFAULT_HASH,
-				attempt: 1,
-			}),
-		).toThrow(VerdictValidationError);
+		expect(() => parseVerdict(verdict, strictVerdictContext("task-b", DEFAULT_HASH))).toThrow(VerdictValidationError);
 	});
 
 	it("mismatched contract_hash in context rejects", () => {
 		const verdict = {
 			schema_version: 1,
+			...strictFields("my-task"),
 			task_id: "my-task",
 			contract_hash: "sha256:abc",
 			attempt: 1,
@@ -249,18 +235,15 @@ describe("Verdict schema validation", () => {
 			findings: [],
 		};
 
-		expect(() =>
-			parseVerdict(verdict, {
-				taskId: "my-task",
-				contractHash: "sha256:xyz" as SHA256Hash, // mismatched
-				attempt: 1,
-			}),
-		).toThrow(VerdictValidationError);
+		expect(() => parseVerdict(verdict, strictVerdictContext("my-task", "sha256:xyz" as SHA256Hash))).toThrow(
+			VerdictValidationError,
+		);
 	});
 
 	it("mismatched attempt in context rejects", () => {
 		const verdict = {
 			schema_version: 1,
+			...strictFields("my-task", 2),
 			task_id: "my-task",
 			contract_hash: DEFAULT_HASH,
 			attempt: 2, // mismatched with context
@@ -268,18 +251,13 @@ describe("Verdict schema validation", () => {
 			findings: [],
 		};
 
-		expect(() =>
-			parseVerdict(verdict, {
-				taskId: "my-task",
-				contractHash: DEFAULT_HASH,
-				attempt: 1,
-			}),
-		).toThrow(VerdictValidationError);
+		expect(() => parseVerdict(verdict, strictVerdictContext("my-task", DEFAULT_HASH))).toThrow(VerdictValidationError);
 	});
 
 	it("unknown status value rejects", () => {
 		const verdict = {
 			schema_version: 1,
+			...strictFields("my-task"),
 			task_id: "my-task",
 			contract_hash: DEFAULT_HASH,
 			attempt: 1,
@@ -287,13 +265,7 @@ describe("Verdict schema validation", () => {
 			findings: [],
 		};
 
-		expect(() =>
-			parseVerdict(verdict, {
-				taskId: "my-task",
-				contractHash: DEFAULT_HASH,
-				attempt: 1,
-			}),
-		).toThrow(VerdictValidationError);
+		expect(() => parseVerdict(verdict, strictVerdictContext("my-task", DEFAULT_HASH))).toThrow(VerdictValidationError);
 	});
 });
 
@@ -304,6 +276,7 @@ describe("Verdict sink — acceptVerdict protocol rules", () => {
 		const store = freshStore();
 		const verdict = {
 			schema_version: 1,
+			...strictVerdictFields(defaultContext),
 			task_id: "protocol-test",
 			contract_hash: DEFAULT_HASH,
 			attempt: 1,
@@ -321,6 +294,7 @@ describe("Verdict sink — acceptVerdict protocol rules", () => {
 		const store = freshStore();
 		const verdict = {
 			schema_version: 1,
+			...strictVerdictFields(defaultContext),
 			task_id: "protocol-test",
 			contract_hash: DEFAULT_HASH,
 			attempt: 1,
@@ -338,6 +312,7 @@ describe("Verdict sink — acceptVerdict protocol rules", () => {
 		const store = freshStore();
 		const verdict = {
 			schema_version: 1,
+			...strictVerdictFields(defaultContext),
 			task_id: "protocol-test",
 			contract_hash: DEFAULT_HASH,
 			attempt: 1,
@@ -355,6 +330,7 @@ describe("Verdict sink — acceptVerdict protocol rules", () => {
 		const store = freshStore();
 		const verdict = {
 			schema_version: 1,
+			...strictVerdictFields(defaultContext),
 			task_id: "protocol-test",
 			contract_hash: DEFAULT_HASH,
 			attempt: 1,
@@ -374,6 +350,7 @@ describe("Verdict sink — acceptVerdict protocol rules", () => {
 		const store = freshStore();
 		const passVerdict = {
 			schema_version: 1,
+			...strictFields("protocol-test", 3),
 			task_id: "protocol-test",
 			contract_hash: DEFAULT_HASH,
 			attempt: 3,
@@ -381,11 +358,12 @@ describe("Verdict sink — acceptVerdict protocol rules", () => {
 			findings: [],
 		};
 
-		acceptVerdict(passVerdict, { ...defaultContext, attempt: 3 }, store);
+		acceptVerdict(passVerdict, strictVerdictContext("protocol-test", DEFAULT_HASH, 3), store);
 
 		// Stale verdict with attempt 1 (less than last pass at 3)
 		const staleVerdict = {
 			schema_version: 1,
+			...strictVerdictFields(defaultContext),
 			task_id: "protocol-test",
 			contract_hash: DEFAULT_HASH,
 			attempt: 1,
@@ -393,7 +371,7 @@ describe("Verdict sink — acceptVerdict protocol rules", () => {
 			findings: [],
 		};
 
-		const result = acceptVerdict(staleVerdict, { ...defaultContext, attempt: 1 }, store);
+		const result = acceptVerdict(staleVerdict, defaultContext, store);
 
 		expect(result.status).toBe("rejected");
 		expect(result.protocolError).toBe(true);
@@ -405,6 +383,7 @@ describe("Verdict sink — acceptVerdict protocol rules", () => {
 		const store = freshStore();
 		const passVerdict = {
 			schema_version: 1,
+			...strictVerdictFields(defaultContext),
 			task_id: "protocol-test",
 			contract_hash: DEFAULT_HASH,
 			attempt: 1,
@@ -417,6 +396,7 @@ describe("Verdict sink — acceptVerdict protocol rules", () => {
 		// Attempt remediate after pass at same attempt
 		const remediateVerdict = {
 			schema_version: 1,
+			...strictVerdictFields(defaultContext),
 			task_id: "protocol-test",
 			contract_hash: DEFAULT_HASH,
 			attempt: 1,
@@ -435,6 +415,7 @@ describe("Verdict sink — acceptVerdict protocol rules", () => {
 		const store = freshStore();
 		const r1 = {
 			schema_version: 1,
+			...strictVerdictFields(defaultContext),
 			task_id: "protocol-test",
 			contract_hash: DEFAULT_HASH,
 			attempt: 1,
@@ -448,6 +429,7 @@ describe("Verdict sink — acceptVerdict protocol rules", () => {
 		// Second remediate at attempt 2 (different key, allowed)
 		const r2 = {
 			schema_version: 1,
+			...strictFields("protocol-test", 2),
 			task_id: "protocol-test",
 			contract_hash: DEFAULT_HASH,
 			attempt: 2,
@@ -455,7 +437,7 @@ describe("Verdict sink — acceptVerdict protocol rules", () => {
 			findings: [{ id: "f2", reason: "Fix 2", required_fix: "Do fix 2" }],
 		};
 
-		const result = acceptVerdict(r2, { ...defaultContext, attempt: 2 }, store);
+		const result = acceptVerdict(r2, strictVerdictContext("protocol-test", DEFAULT_HASH, 2), store);
 		expect(result.status).toBe("accepted");
 		expect(store.records).toHaveLength(2);
 	});
@@ -473,6 +455,7 @@ describe("hasPassed — pass state tracking", () => {
 		const store = freshStore();
 		const verdict = {
 			schema_version: 1,
+			...strictVerdictFields(defaultContext),
 			task_id: "protocol-test",
 			contract_hash: DEFAULT_HASH,
 			attempt: 1,
@@ -488,6 +471,7 @@ describe("hasPassed — pass state tracking", () => {
 		const store = freshStore();
 		const verdict = {
 			schema_version: 1,
+			...strictVerdictFields(defaultContext),
 			task_id: "protocol-test",
 			contract_hash: DEFAULT_HASH,
 			attempt: 1,
@@ -507,13 +491,14 @@ describe("hasPassed — pass state tracking", () => {
 		acceptVerdict(
 			{
 				schema_version: 1,
+				...strictFields("task-A", 1, hashA),
 				task_id: "task-A",
 				contract_hash: hashA,
 				attempt: 1,
 				status: "pass",
 				findings: [],
 			},
-			{ taskId: "task-A", contractHash: hashA, attempt: 1 },
+			strictVerdictContext("task-A", hashA),
 			store,
 		);
 
@@ -599,11 +584,7 @@ describe("Verdict protocol through ComplianceRuntime", () => {
 
 	it("FakeAdvisor produces verdicts that pass parseVerdict validation", () => {
 		const advisor = new FakeAdvisor();
-		const context: VerdictContext = {
-			taskId: "validate-me",
-			contractHash: "sha256:verify-hash" as SHA256Hash,
-			attempt: 1,
-		};
+		const context = strictVerdictContext("validate-me", "sha256:verify-hash" as SHA256Hash);
 
 		const passV = advisor.passVerdict(context);
 		const parsed = parseVerdict(passV, context);

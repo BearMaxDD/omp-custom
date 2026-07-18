@@ -34,7 +34,12 @@ export type VerdictAcceptResult =
 
 export type PreparedVerdict =
 	| { status: "rejected"; reason: string; protocolError?: boolean }
-	| { status: "prepared"; verdict: ComplianceVerdict; commit(): VerdictAcceptResult };
+	| {
+			status: "prepared";
+			verdict: ComplianceVerdict;
+			commit(): VerdictAcceptResult;
+			rollback(): void;
+	  };
 
 /** A persisted verdict record in the sink store. */
 export interface VerdictRecord {
@@ -192,6 +197,15 @@ export function prepareVerdict(
 			if (status === "pass") store.lastPass[passKey] = attempt;
 			committed = true;
 			return { status: "accepted", verdict: resolved };
+		},
+		rollback(): void {
+			if (!committed) return;
+			const index = store.records.lastIndexOf(record);
+			if (index >= 0) store.records.splice(index, 1);
+			store.acceptedKeys.delete(verdictKey);
+			if (store.acceptedDigests) delete store.acceptedDigests[verdictKey];
+			if (status === "pass" && store.lastPass[passKey] === attempt) delete store.lastPass[passKey];
+			committed = false;
 		},
 	};
 }

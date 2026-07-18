@@ -9,6 +9,7 @@ import { createReviewEnvelope } from "../../src/contracts/review-envelope";
 import { EvidenceStore } from "../../src/evidence/evidence-store";
 import { buildCompletionSnapshot } from "../../src/runtime/completion-gate";
 import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
+import type { ComplianceRuntimeDependencies } from "../../src/runtime/compliance-runtime";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
 import { createStrictRuntimeDependencies } from "../support/strict-runtime-dependencies";
 
@@ -43,6 +44,10 @@ let api: MinimalAPI;
 let store: EvidenceStore;
 let collector: CollectorRuntime;
 let runtime: ComplianceRuntime;
+let runtimeDependencies: ComplianceRuntimeDependencies;
+let envelopeOverride:
+	| ((taskId: string, reviewId: string) => ReturnType<ComplianceRuntimeDependencies["readEnvelope"]>)
+	| undefined;
 let verificationSequence = 0;
 
 function recordTrustedVerification(
@@ -168,18 +173,19 @@ beforeEach(() => {
 			return Promise.resolve(mockRequestReviewReturn);
 		},
 	};
-	runtime = new ComplianceRuntime(
-		() => store,
-		collector,
-		api,
-		tmpDir,
-		reviewDeps,
-		createStrictRuntimeDependencies({
-			repoRoot: tmpDir,
-			store,
-			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
-		}),
-	);
+	runtimeDependencies = createStrictRuntimeDependencies({
+		repoRoot: tmpDir,
+		store,
+		requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+	});
+	const authoritativeEnvelope = runtimeDependencies.readEnvelope;
+	envelopeOverride = undefined;
+	runtimeDependencies = {
+		...runtimeDependencies,
+		readEnvelope: (taskId, reviewId) =>
+			envelopeOverride ? envelopeOverride(taskId, reviewId) : authoritativeEnvelope(taskId, reviewId),
+	};
+	runtime = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps, runtimeDependencies);
 	recordTrustedVerification(collector, { command: "bun test", exitCode: 0 });
 });
 
@@ -389,6 +395,40 @@ describe("ComplianceRuntime — requestCompletion advisor review path", () => {
 });
 
 describe("ComplianceRuntime — lifecycle 与严格 Verdict 绑定", () => {
+	it("重试在 Host requester 运行前持久化并注册新的 Envelope", async () => {
+		let now = Date.now();
+		let firstRequest = true;
+		let retryObserved = false;
+		reviewDeps.requestAdvisorReview = async (request) => {
+			if (firstRequest) {
+				firstRequest = false;
+				throw new Error("temporary unavailable");
+			}
+			const taskId = String(request.metadata?.taskId);
+			const records = await store.readAll(taskId);
+			expect(records.some((record) => record.event === "completion_retry" && record.signalDigest)).toBe(true);
+			expect(reviewDeps.registry.get(request.reviewId)).toBeDefined();
+			retryObserved = true;
+			return { status: "accepted", reviewId: request.reviewId };
+		};
+		runtimeDependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			now: () => now,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		});
+		runtime = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps, runtimeDependencies);
+
+		await runtime.start("tdd.md");
+		const initial = await runtime.requestCompletion({ summary: "Done" });
+		expect(initial.status).toBe("stalled");
+		now += 5_000;
+		await runtime.retryDueReviews();
+
+		expect(retryObserved).toBe(true);
+		expect(runtime.currentTaskState?.status).toBe("advisor_reviewing");
+	});
+
 	it("宿主完成但没有 Verdict 时进入 stalled", async () => {
 		await runtime.start("tdd.md");
 		await runtime.requestCompletion({ summary: "Done" });
@@ -471,6 +511,24 @@ describe("ComplianceRuntime — lifecycle 与严格 Verdict 绑定", () => {
 		expect(runtime.currentTaskState?.status).toBe("completed");
 	});
 
+	it("Envelope 内容被篡改时即使沿用 reviewId 与 envelopeHash 也拒绝", async () => {
+		await runtime.start("tdd.md");
+		await runtime.requestCompletion({ summary: "Done" });
+		const verdict = advisorVerdict(runtime, { status: "pass" });
+		const original = runtimeDependencies.readEnvelope;
+		const persisted = await original(
+			String(runtime.currentTaskState?.taskId),
+			String(runtime.currentTaskState?.activeReviewId),
+		);
+		if (!persisted) throw new Error("missing persisted envelope");
+		const tampered = { ...persisted, projectId: "tampered-project" };
+		envelopeOverride = async () => tampered;
+		expect((await runtime.acceptVerdict(verdict)).accepted).toBe(false);
+		expect(runtime.currentTaskState?.status).toBe("advisor_reviewing");
+		envelopeOverride = undefined;
+		expect((await runtime.acceptVerdict(verdict)).accepted).toBe(true);
+	});
+
 	it("completed Evidence 写入失败时不得进入 completed", async () => {
 		await runtime.start("tdd.md");
 		await runtime.requestCompletion({ summary: "Done" });
@@ -483,9 +541,21 @@ describe("ComplianceRuntime — lifecycle 与严格 Verdict 绑定", () => {
 
 		await expect(runtime.acceptVerdict(verdict)).rejects.toThrow("evidence disk full");
 		expect(runtime.currentTaskState?.status).toBe("advisor_reviewing");
+		expect(runtimeDependencies.scheduler.snapshot().inFlight?.reviewId).toBe(runtime.currentTaskState?.activeReviewId);
 		store.append = original;
 		expect((await runtime.acceptVerdict(verdict)).accepted).toBe(true);
 		expect(runtime.currentTaskState?.status).toBe("completed");
+	});
+
+	it("并发冲突 Verdict 只允许一个提交并只写一条终态 Evidence", async () => {
+		const { taskId } = await runtime.start("tdd.md");
+		await runtime.requestCompletion({ summary: "Done" });
+		const first = advisorVerdict(runtime, { status: "pass" });
+		const second = { ...first, findings: [finding("conflict", "different")] };
+		const [left, right] = await Promise.all([runtime.acceptVerdict(first), runtime.acceptVerdict(second)]);
+		expect([left.accepted, right.accepted].filter(Boolean)).toHaveLength(1);
+		const evidence = await store.readAll(taskId);
+		expect(evidence.filter((record) => record.event === "completed")).toHaveLength(1);
 	});
 
 	it("缺任一严格 Verdict 字段均拒绝", async () => {

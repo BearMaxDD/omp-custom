@@ -5,20 +5,18 @@ import type { SHA256Hash } from "../../src/contract/types";
 import invalidLegacyFixture from "../fixtures/verdict/invalid-legacy.json";
 import passFixture from "../fixtures/verdict/pass.json";
 import remediateFixture from "../fixtures/verdict/remediate.json";
+import { strictVerdictContext, strictVerdictFields } from "../support/strict-verdict";
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
 const DEFAULT_HASH = "sha256:abc123def456" as SHA256Hash;
 
-const defaultContext: VerdictContext = {
-	taskId: "code-task",
-	contractHash: DEFAULT_HASH,
-	attempt: 1,
-};
+const defaultContext: VerdictContext = strictVerdictContext("code-task", DEFAULT_HASH);
 
 function validVerdict(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
 	return {
 		schema_version: 1,
+		...strictVerdictFields(defaultContext),
 		task_id: "code-task",
 		contract_hash: DEFAULT_HASH,
 		attempt: 1,
@@ -193,11 +191,10 @@ describe("parseVerdict", () => {
 	// ─── Fixture-based tests ──────────────────────────────────────
 
 	it("canonical fixtures pass and legacy bridge shape fails", () => {
-		const fixtureContext: VerdictContext = {
-			taskId: "task-9",
-			contractHash: "sha256:a00000000000000000000000000000000000000000000000000000000000000" as SHA256Hash,
-			attempt: 1,
-		};
+		const fixtureContext = strictVerdictContext(
+			"task-9",
+			"sha256:a00000000000000000000000000000000000000000000000000000000000000" as SHA256Hash,
+		);
 
 		expect(parseVerdict(passFixture, fixtureContext).status).toBe("pass");
 		expect(parseVerdict(remediateFixture, fixtureContext).findings[0]?.required_fix).toBeTruthy();
@@ -205,11 +202,10 @@ describe("parseVerdict", () => {
 	});
 
 	it("remediate verdict with empty findings is rejected", () => {
-		const fixtureContext: VerdictContext = {
-			taskId: "task-9",
-			contractHash: "sha256:a00000000000000000000000000000000000000000000000000000000000000" as SHA256Hash,
-			attempt: 1,
-		};
+		const fixtureContext = strictVerdictContext(
+			"task-9",
+			"sha256:a00000000000000000000000000000000000000000000000000000000000000" as SHA256Hash,
+		);
 		expect(() => parseVerdict({ ...remediateFixture, findings: [] }, fixtureContext)).toThrow("required_fix");
 	});
 

@@ -380,7 +380,7 @@ export class ReviewScheduler {
 		return this.#pumping;
 	}
 
-	async handleLifecycle(event: AdvisorReviewLifecycleEvent): Promise<void> {
+	async handleLifecycle(event: AdvisorReviewLifecycleEvent, dispatchNext = true): Promise<void> {
 		const transitioned = await this.#serialize(async () => {
 			if (!isTerminal(event) || event.reviewId !== this.#inFlight?.reviewId) return;
 			const active = this.#inFlight;
@@ -403,11 +403,37 @@ export class ReviewScheduler {
 			this.#lifecycleWaiters.get(event.reviewId)?.();
 			return true;
 		});
-		if (transitioned) await this.pump();
+		if (transitioned && dispatchNext) await this.pump();
+	}
+
+	/** Restore a just-completed review when a downstream commit must be compensated. */
+	restoreCompleted(reviewId: string): Promise<void> {
+		return this.#serialize(async () => {
+			if (this.#inFlight) throw new Error("cannot restore a completed review while another review is in flight");
+			const index = this.#completed.findIndex((intent) => intent.reviewId === reviewId);
+			if (index < 0) throw new Error(`completed review not found: ${reviewId}`);
+			await this.#transaction(() => {
+				const completed = this.#completed[index];
+				this.#completed = this.#completed.filter((_, completedIndex) => completedIndex !== index);
+				this.#inFlight = Object.freeze({
+					...completed,
+					status: "in_flight" as const,
+					updatedAt: safeNow(this.#clock),
+				});
+			});
+		});
 	}
 
 	snapshot(): ReviewSchedulerState {
 		return frozenClone(this.#state());
+	}
+
+	nextDueIntent(taskId: string, trigger: ReviewIntent["trigger"]): ReviewIntent | undefined {
+		const now = safeNow(this.#clock);
+		const due = this.#queued
+			.filter((intent) => intent.taskId === taskId && intent.trigger === trigger && intent.notBefore <= now)
+			.sort(queueOrder)[0];
+		return due ? frozenClone(due) : undefined;
 	}
 
 	async #pumpUntilBlocked(): Promise<void> {

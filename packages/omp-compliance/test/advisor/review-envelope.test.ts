@@ -7,7 +7,12 @@ const HASH = "sha256:abc123def456" as const;
 const DEFAULT_INPUTS = {
 	sessionId: "session-1",
 	taskId: "task-9",
+	projectId: "123e4567-e89b-42d3-a456-426614174000",
 	contractHash: HASH,
+	evidenceRevision: `sha256:${"b".repeat(64)}` as `sha256:${string}`,
+	gitHead: "c".repeat(40),
+	diffHash: `sha256:${"d".repeat(64)}` as `sha256:${string}`,
+	trigger: "compliance_review",
 	attempt: 1,
 	context: "evidence-context",
 	rules: "compliance-rules",

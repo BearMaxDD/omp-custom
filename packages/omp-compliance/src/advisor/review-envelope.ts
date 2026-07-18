@@ -18,7 +18,12 @@ import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "@oh-my-pi/pi-co
 export interface EnvelopeInput {
 	readonly sessionId: string;
 	readonly taskId: string;
+	readonly projectId: string;
 	readonly contractHash: `sha256:${string}`;
+	readonly evidenceRevision: `sha256:${string}`;
+	readonly gitHead: string;
+	readonly diffHash: `sha256:${string}`;
+	readonly trigger: "compliance_review";
 	readonly attempt: number;
 	readonly context: string;
 	readonly rules: string;
@@ -30,7 +35,12 @@ export interface ComplianceReviewEnvelope {
 	readonly reviewId: string;
 	readonly sessionId: string;
 	readonly taskId: string;
+	readonly projectId: string;
 	readonly contractHash: `sha256:${string}`;
+	readonly evidenceRevision: `sha256:${string}`;
+	readonly gitHead: string;
+	readonly diffHash: `sha256:${string}`;
+	readonly trigger: "compliance_review";
 	readonly attempt: number;
 	readonly context: string;
 	readonly rules: string;

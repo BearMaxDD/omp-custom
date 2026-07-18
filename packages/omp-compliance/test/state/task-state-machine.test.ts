@@ -163,6 +163,13 @@ describe("TaskStateMachine — 无 verdict 或协议错误失败关闭", () => {
 		expect(next.error).toBeDefined();
 	});
 
+	it("verdict missing schemaValid fails closed", () => {
+		const state = minimalState("advisor_reviewing");
+		const next = transition(state, { type: "verdict", status: "pass" } as never);
+		expect(next.status).toBe("advisor_reviewing");
+		expect(next.error).toContain("Schema validation failed");
+	});
+
 	it("pass verdict with task/hash mismatch stays in advisor_reviewing", () => {
 		const state = minimalState("advisor_reviewing");
 		// Verdict with summary but schema invalid — simulation of mismatch

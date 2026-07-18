@@ -282,7 +282,12 @@ describe("upstream API contract — REAL shapes", () => {
 		const envelope = createEnvelope({
 			sessionId: "s1",
 			taskId: "task-1",
+			projectId: "123e4567-e89b-42d3-a456-426614174000",
 			contractHash: "sha256:abc" as const,
+			evidenceRevision: "sha256:evidence" as const,
+			gitHead: "abc123",
+			diffHash: "sha256:diff" as const,
+			trigger: "compliance_review",
 			attempt: 1,
 			context: "<c/>",
 			rules: "r",

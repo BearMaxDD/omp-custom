@@ -58,14 +58,14 @@ export interface ComplianceVerdict {
 
 /** Expected context for verdict validation. */
 export interface VerdictContext {
-	reviewId?: string;
+	reviewId: string;
 	taskId: string;
-	projectId?: string;
+	projectId: string;
 	contractHash: SHA256Hash;
-	evidenceRevision?: string;
-	gitHead?: string;
-	diffHash?: string;
-	trigger?: "compliance_review";
+	evidenceRevision: string;
+	gitHead: string;
+	diffHash: string;
+	trigger: "compliance_review";
 	attempt: number;
 }
 
@@ -170,19 +170,17 @@ export function parseVerdict(input: Record<string, unknown>, expectedContext: Ve
 		"findings",
 	]);
 	for (const key of Object.keys(raw)) if (!allowed.has(key)) errors.push({ field: key, message: "unknown field" });
-	if (expectedContext.reviewId !== undefined) {
-		for (const [field, expected] of [
-			["review_id", expectedContext.reviewId],
-			["project_id", expectedContext.projectId],
-			["evidence_revision", expectedContext.evidenceRevision],
-			["git_head", expectedContext.gitHead],
-			["diff_hash", expectedContext.diffHash],
-			["trigger", expectedContext.trigger],
-		] as const) {
-			const value = raw[field];
-			if (typeof value !== "string" || value.length === 0 || value.length > 256 || value !== expected) {
-				errors.push({ field, message: `expected ${JSON.stringify(expected)}` });
-			}
+	for (const [field, expected] of [
+		["review_id", expectedContext.reviewId],
+		["project_id", expectedContext.projectId],
+		["evidence_revision", expectedContext.evidenceRevision],
+		["git_head", expectedContext.gitHead],
+		["diff_hash", expectedContext.diffHash],
+		["trigger", expectedContext.trigger],
+	] as const) {
+		const value = raw[field];
+		if (typeof value !== "string" || value.length === 0 || value.length > 256 || value !== expected) {
+			errors.push({ field, message: `expected ${JSON.stringify(expected)}` });
 		}
 	}
 

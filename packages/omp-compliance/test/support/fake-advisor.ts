@@ -48,16 +48,14 @@ export interface ScenarioContext {
 }
 
 function strictFields(context: VerdictContext): Record<string, unknown> {
-	return context.reviewId === undefined
-		? {}
-		: {
-				review_id: context.reviewId,
-				project_id: context.projectId,
-				evidence_revision: context.evidenceRevision,
-				git_head: context.gitHead,
-				diff_hash: context.diffHash,
-				trigger: context.trigger,
-			};
+	return {
+		review_id: context.reviewId,
+		project_id: context.projectId,
+		evidence_revision: context.evidenceRevision,
+		git_head: context.gitHead,
+		diff_hash: context.diffHash,
+		trigger: context.trigger,
+	};
 }
 
 export class FakeAdvisor {
@@ -134,6 +132,9 @@ export class FakeAdvisor {
 		const state = runtime.currentTaskState;
 		if (!state) {
 			throw new Error("No active task state available for context extraction");
+		}
+		if (!state.activeReviewId) {
+			throw new Error("No active Advisor review available for context extraction");
 		}
 		return {
 			taskId: state.taskId,

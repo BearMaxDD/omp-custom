@@ -13,6 +13,10 @@ import type { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
 const HASH = "sha256:abc123def456" as const;
 const SESSION_ID = "session-1";
 const TASK_ID = "task-9";
+const PROJECT_ID = "123e4567-e89b-42d3-a456-426614174000";
+const EVIDENCE_REVISION = `sha256:${"b".repeat(64)}`;
+const GIT_HEAD = "c".repeat(40);
+const DIFF_HASH = `sha256:${"d".repeat(64)}`;
 
 function makeMockRuntime(): ComplianceRuntime {
 	// We only need acceptVerdict — create a proxy or minimal mock
@@ -21,7 +25,7 @@ function makeMockRuntime(): ComplianceRuntime {
 }
 
 function makeComplianceEvent(overrides: Partial<AdvisorBeforeRunEvent> = {}): AdvisorBeforeRunEvent {
-	return {
+	const base: AdvisorBeforeRunEvent = {
 		type: "advisor_before_run",
 		reviewId: `compliance:${"0".repeat(64)}`,
 		trigger: "compliance_review",
@@ -31,10 +35,18 @@ function makeComplianceEvent(overrides: Partial<AdvisorBeforeRunEvent> = {}): Ad
 			taskId: TASK_ID,
 			contractHash: HASH,
 			attempt: 1,
+			projectId: PROJECT_ID,
+			evidenceRevision: EVIDENCE_REVISION,
+			gitHead: GIT_HEAD,
+			diffHash: DIFF_HASH,
 		},
 		primarySessionId: SESSION_ID,
 		advisorSessionId: "default",
+	};
+	return {
+		...base,
 		...overrides,
+		metadata: overrides.metadata ? { ...base.metadata, ...overrides.metadata } : base.metadata,
 	};
 }
 
@@ -55,7 +67,12 @@ function setupFixture(overrides: Partial<{ runtime: ComplianceRuntime; sessionId
 	const env = createEnvelope({
 		sessionId: overrides.sessionId ?? SESSION_ID,
 		taskId: overrides.taskId ?? TASK_ID,
+		projectId: PROJECT_ID,
 		contractHash: HASH,
+		evidenceRevision: EVIDENCE_REVISION as `sha256:${string}`,
+		gitHead: GIT_HEAD,
+		diffHash: DIFF_HASH as `sha256:${string}`,
+		trigger: "compliance_review",
 		attempt: 1,
 		context: "test-context",
 		rules: "test-rules",
@@ -106,11 +123,17 @@ describe("createComplianceAdvisorHook", () => {
 		});
 		const result = hook(event);
 		expect(result).toBeDefined();
-		expect(result?.additionalSystemContext).toBe("test-rules\n\ntest-context");
+		expect(result?.additionalSystemContext).toContain("test-rules\n\ntest-context");
+		expect(result?.additionalSystemContext).toContain(`"review_id":"${env.reviewId}"`);
+		expect(result?.additionalSystemContext).toContain(`"project_id":"${PROJECT_ID}"`);
 		expect(result?.additionalTools).toHaveLength(1);
 		expect(result?.additionalTools?.[0]?.name).toBe("compliance_verdict");
 		expect(result?.additionalTools?.[0]?.label).toBe("Compliance Verdict");
 		expect(typeof result?.additionalTools?.[0]?.execute).toBe("function");
+		const required = result?.additionalTools?.[0]?.parameters.required as string[];
+		expect(required).toEqual(
+			expect.arrayContaining(["review_id", "project_id", "evidence_revision", "git_head", "diff_hash", "trigger"]),
+		);
 		expect(result?.metadata).toEqual({ complianceReviewId: env.reviewId });
 		expect(Object.isFrozen(result?.metadata)).toBe(true);
 	});
@@ -129,8 +152,14 @@ describe("createComplianceAdvisorHook", () => {
 		// Submit a valid verdict
 		const verdict = {
 			schema_version: 1,
+			review_id: env.reviewId,
 			task_id: TASK_ID,
+			project_id: PROJECT_ID,
 			contract_hash: HASH,
+			evidence_revision: EVIDENCE_REVISION,
+			git_head: GIT_HEAD,
+			diff_hash: DIFF_HASH,
+			trigger: "compliance_review",
 			attempt: 1,
 			status: "pass",
 			findings: [],
@@ -159,8 +188,14 @@ describe("createComplianceAdvisorHook", () => {
 		const tool = result.additionalTools?.[0];
 		const toolResult = await tool.execute("call-rejected", {
 			schema_version: 1,
+			review_id: env.reviewId,
 			task_id: TASK_ID,
+			project_id: PROJECT_ID,
 			contract_hash: HASH,
+			evidence_revision: EVIDENCE_REVISION,
+			git_head: GIT_HEAD,
+			diff_hash: DIFF_HASH,
+			trigger: "compliance_review",
 			attempt: 1,
 			status: "invalid",
 			findings: [],
@@ -183,6 +218,7 @@ describe("createComplianceAdvisorHook", () => {
 		const tool = (resultC.additionalTools as NonNullable<AdvisorBeforeRunResult["additionalTools"]>)[0];
 		const verdict = {
 			schema_version: 1,
+			review_id: env.reviewId,
 			task_id: TASK_ID,
 			contract_hash: HASH,
 			attempt: 99, // mismatch!
@@ -207,6 +243,7 @@ describe("createComplianceAdvisorHook", () => {
 		const tool = (resultC.additionalTools as NonNullable<AdvisorBeforeRunResult["additionalTools"]>)[0];
 		const verdict = {
 			schema_version: 1,
+			review_id: env.reviewId,
 			task_id: "wrong-task",
 			contract_hash: HASH,
 			attempt: 1,
@@ -231,6 +268,7 @@ describe("createComplianceAdvisorHook", () => {
 		const tool = (resultC.additionalTools as NonNullable<AdvisorBeforeRunResult["additionalTools"]>)[0];
 		const verdict = {
 			schema_version: 1,
+			review_id: env.reviewId,
 			task_id: TASK_ID,
 			contract_hash: "sha256:different" as string,
 			attempt: 1,

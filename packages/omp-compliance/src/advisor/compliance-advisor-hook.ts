@@ -39,9 +39,20 @@ export function createComplianceAdvisorHook(
 		if (!envelope || !matchesEnvelope(event, envelope)) {
 			return undefined;
 		}
+		const verdictIdentity = JSON.stringify({
+			review_id: envelope.reviewId,
+			task_id: envelope.taskId,
+			project_id: envelope.projectId,
+			contract_hash: envelope.contractHash,
+			evidence_revision: envelope.evidenceRevision,
+			git_head: envelope.gitHead,
+			diff_hash: envelope.diffHash,
+			trigger: envelope.trigger,
+			attempt: envelope.attempt,
+		});
 
 		return {
-			additionalSystemContext: `${envelope.rules}\n\n${envelope.context}`,
+			additionalSystemContext: `${envelope.rules}\n\n${envelope.context}\n\nBound verdict identity:\n${verdictIdentity}`,
 			additionalTools: [createComplianceVerdictTool(envelope, runtime, registry)],
 			metadata: Object.freeze({ complianceReviewId: envelope.reviewId }),
 		};
@@ -77,8 +88,14 @@ export function createComplianceVerdictTool(
 			type: "object",
 			properties: {
 				schema_version: { type: "number", const: 1 },
+				review_id: { type: "string" },
 				task_id: { type: "string" },
+				project_id: { type: "string" },
 				contract_hash: { type: "string" },
+				evidence_revision: { type: "string" },
+				git_head: { type: "string" },
+				diff_hash: { type: "string" },
+				trigger: { type: "string", const: "compliance_review" },
 				attempt: { type: "number" },
 				status: { type: "string", enum: ["pass", "remediate"] },
 				findings: {
@@ -95,7 +112,20 @@ export function createComplianceVerdictTool(
 					},
 				},
 			},
-			required: ["schema_version", "task_id", "contract_hash", "attempt", "status", "findings"],
+			required: [
+				"schema_version",
+				"review_id",
+				"task_id",
+				"project_id",
+				"contract_hash",
+				"evidence_revision",
+				"git_head",
+				"diff_hash",
+				"trigger",
+				"attempt",
+				"status",
+				"findings",
+			],
 		},
 		execute: async (_toolCallId: string, params: Record<string, unknown>) => {
 			validateVerdictIdentity(params, envelope);
@@ -130,7 +160,13 @@ function matchesEnvelope(event: AdvisorBeforeRunEvent, envelope: ComplianceRevie
 	const metaAttempt = typeof meta.attempt === "number" ? meta.attempt : -1;
 
 	return (
-		metaTaskId === envelope.taskId && metaContractHash === envelope.contractHash && metaAttempt === envelope.attempt
+		metaTaskId === envelope.taskId &&
+		meta.projectId === envelope.projectId &&
+		metaContractHash === envelope.contractHash &&
+		meta.evidenceRevision === envelope.evidenceRevision &&
+		meta.gitHead === envelope.gitHead &&
+		meta.diffHash === envelope.diffHash &&
+		metaAttempt === envelope.attempt
 	);
 }
 
@@ -141,6 +177,11 @@ function matchesEnvelope(event: AdvisorBeforeRunEvent, envelope: ComplianceRevie
  * silently routing a verdict to the wrong task.
  */
 function validateVerdictIdentity(params: Record<string, unknown>, envelope: ComplianceReviewEnvelope): void {
+	if (params.review_id !== envelope.reviewId) {
+		throw new Error(
+			`Verdict review_id (${String(params.review_id)}) does not match envelope review_id (${envelope.reviewId})`,
+		);
+	}
 	if (params.attempt !== envelope.attempt) {
 		throw new Error(
 			`Verdict attempt (${String(params.attempt)}) does not match envelope attempt (${envelope.attempt})`,
@@ -153,5 +194,16 @@ function validateVerdictIdentity(params: Record<string, unknown>, envelope: Comp
 		throw new Error(
 			`Verdict contract_hash (${String(params.contract_hash)}) does not match envelope contract_hash (${envelope.contractHash})`,
 		);
+	}
+	for (const [field, expected] of [
+		["project_id", envelope.projectId],
+		["evidence_revision", envelope.evidenceRevision],
+		["git_head", envelope.gitHead],
+		["diff_hash", envelope.diffHash],
+		["trigger", envelope.trigger],
+	] as const) {
+		if (params[field] !== expected) {
+			throw new Error(`Verdict ${field} (${String(params[field])}) does not match envelope ${field} (${expected})`);
+		}
 	}
 }

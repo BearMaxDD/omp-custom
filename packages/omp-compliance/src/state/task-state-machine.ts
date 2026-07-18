@@ -191,9 +191,7 @@ function processVerdict(state: TaskState, event: TaskEvent): TaskState {
 	if (event.type !== "verdict") {
 		return withError(state, "Internal error: non-verdict passed to processVerdict");
 	}
-
-	const schemaValid = event.schemaValid ?? true;
-	if (!schemaValid) {
+	if (event.schemaValid !== true) {
 		return update(state, { error: "Schema validation failed — verdict rejected", lastVerdict: undefined });
 	}
 
