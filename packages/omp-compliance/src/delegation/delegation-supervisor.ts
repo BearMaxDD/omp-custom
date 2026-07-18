@@ -24,12 +24,20 @@ const trustedContexts = new WeakSet<object>();
 const trustedEvidenceVerifiers = new WeakSet<object>();
 const trustedRecords = new WeakSet<object>();
 const trustedCompletionAttestations = new WeakSet<object>();
-const trustedActualFiles = new WeakMap<object, ReadonlyMap<string, readonly string[]>>();
-const completionContexts = new WeakMap<object, TrustedDelegationContext>();
+const trustedDelegationEvidence = new WeakMap<object, ReadonlyMap<string, TrustedDelegationEvidence>>();
+const contextTokens = new WeakMap<object, object>();
+const recordContextTokens = new WeakMap<object, object>();
+const completionContextTokens = new WeakMap<object, object>();
+
+interface TrustedDelegationEvidence {
+	readonly actualFiles: readonly string[];
+	readonly toolEvidenceIds: readonly string[];
+}
 
 export interface DelegationFileEvidence {
 	readonly delegationId: string;
 	readonly actualFiles: readonly string[];
+	readonly toolEvidenceIds?: readonly string[];
 }
 
 export interface DelegationEvidenceReference {
@@ -61,7 +69,7 @@ export function getTrustedDelegationActualFiles(
 	delegationId: string,
 ): readonly string[] | undefined {
 	if (!isTrustedDelegationContext(context)) return undefined;
-	return trustedActualFiles.get(context)?.get(delegationId);
+	return trustedDelegationEvidence.get(context)?.get(delegationId)?.actualFiles;
 }
 
 export function createTrustedDelegationContext(input: {
@@ -83,16 +91,20 @@ export function createTrustedDelegationContext(input: {
 		reference.evidenceRevision !== evidenceRevision
 	) throw new TypeError("delegation_evidence_mismatch");
 	const delegations = safeArrayValues(reference.delegations ?? [], "delegation_file_evidence");
-	const fileEvidence = new Map<string, readonly string[]>();
+	const delegationEvidence = new Map<string, TrustedDelegationEvidence>();
 	for (const entry of delegations) {
 		if (!isPlainObject(entry)) throw new TypeError("invalid_delegation_file_evidence");
 		const delegationId = boundedString(entry.delegationId, "delegation_file_evidence_id", MAX_ID_BYTES);
-		if (fileEvidence.has(delegationId)) throw new TypeError("duplicate_delegation_file_evidence");
-		fileEvidence.set(delegationId, deepFreeze(normalizePaths(entry.actualFiles, "delegation_actual_files")));
+		if (delegationEvidence.has(delegationId)) throw new TypeError("duplicate_delegation_file_evidence");
+		delegationEvidence.set(delegationId, deepFreeze({
+			actualFiles: normalizePaths(entry.actualFiles, "delegation_actual_files"),
+			toolEvidenceIds: boundedStrings(entry.toolEvidenceIds ?? [], "delegation_tool_evidence_ids"),
+		}));
 	}
 	const context = deepFreeze({ taskContract, evidenceRevision }) as TrustedDelegationContext;
 	trustedContexts.add(context);
-	trustedActualFiles.set(context, fileEvidence);
+	trustedDelegationEvidence.set(context, delegationEvidence);
+	contextTokens.set(context, Object.freeze({}));
 	return context;
 }
 
@@ -160,18 +172,19 @@ export function createDelegationCompletionAttestation(
 	if (!isTrustedDelegationContext(context)) throw new TypeError("invalid_trusted_delegation_context");
 	const safe = plainObject(input, "delegation_completion_attestation");
 	const delegationId = boundedString(safe.delegationId, "delegation_id", MAX_ID_BYTES);
-	const actualFiles = getTrustedDelegationActualFiles(context, delegationId);
+	const evidence = trustedDelegationEvidence.get(context)?.get(delegationId);
+	const submittedEvidenceIds = boundedStrings(safe.toolEvidenceIds, "tool_evidence_ids");
 	const attestation = deepFreeze({
 		delegationId,
 		type: "completed" as const,
 		originToolCallId: boundedString(safe.originToolCallId, "origin_tool_call_id", MAX_ID_BYTES),
 		resultToolCallId: boundedString(safe.resultToolCallId, "result_tool_call_id", MAX_ID_BYTES),
-		actualFilesKnown: actualFiles !== undefined,
-		actualFiles: actualFiles ?? [],
-		toolEvidenceIds: boundedStrings(safe.toolEvidenceIds, "tool_evidence_ids"),
+		actualFilesKnown: evidence !== undefined,
+		actualFiles: evidence?.actualFiles ?? [],
+		toolEvidenceIds: submittedEvidenceIds.filter((id) => evidence?.toolEvidenceIds.includes(id) === true),
 	});
 	trustedCompletionAttestations.add(attestation);
-	completionContexts.set(attestation, context);
+	completionContextTokens.set(attestation, contextTokens.get(context) as object);
 	return attestation;
 }
 
@@ -181,6 +194,8 @@ export function createDelegationRecord(input: DelegationRecordInput): Delegation
 	const safe = plainObject(input, "delegation_record");
 	if (!trustedContexts.has(safe.context as object)) throw new TypeError("invalid_trusted_delegation_context");
 	const context = safe.context as TrustedDelegationContext;
+	const contextToken = contextTokens.get(context);
+	if (!contextToken) throw new TypeError("invalid_trusted_delegation_context");
 	const agentId = safe.agentId === undefined ? undefined : boundedString(safe.agentId, "agent_id", MAX_ID_BYTES);
 	return trustRecord(deepFreeze({
 		delegationId: boundedString(safe.delegationId, "delegation_id", MAX_ID_BYTES),
@@ -200,27 +215,25 @@ export function createDelegationRecord(input: DelegationRecordInput): Delegation
 		actualFiles: [] as string[],
 		toolEvidenceIds: [] as string[],
 		violations: [] as DelegationViolation[],
-	}));
+	}), contextToken);
 }
 
 export function applyDelegationEvent(record: DelegationRecord, event: DelegationEvent): DelegationRecord {
 	if (!trustedRecords.has(record)) return record;
+	const contextToken = recordContextTokens.get(record);
+	if (!contextToken) return record;
 	if (!isPlainObject(record as unknown) || !isPlainObject(event as unknown)) return record;
 	if (event.delegationId !== record.delegationId || TERMINAL_STATUSES.has(record.status)) return record;
 
 	if (event.type === "started") {
-		return record.status === "queued" ? trustRecord(deepFreeze({ ...record, status: "running" as const })) : record;
+		return record.status === "queued"
+			? trustRecord(deepFreeze({ ...record, status: "running" as const }), contextToken)
+			: record;
 	}
 
 	if (event.type === "completed") {
 		if (record.status !== "running" || !trustedCompletionAttestations.has(event)) return record;
-		const context = completionContexts.get(event);
-		if (
-			!context ||
-			context.taskContract.taskId !== record.taskId ||
-			context.taskContract.contractHash !== record.contractHash ||
-			context.evidenceRevision !== record.evidenceRevision
-		) return record;
+		if (completionContextTokens.get(event) !== contextToken) return record;
 		const originToolCallId = boundedString(event.originToolCallId, "origin_tool_call_id", MAX_ID_BYTES);
 		const resultToolCallId = boundedString(event.resultToolCallId, "result_tool_call_id", MAX_ID_BYTES);
 		if (originToolCallId !== record.toolCallId) return record;
@@ -245,11 +258,14 @@ export function applyDelegationEvent(record: DelegationRecord, event: Delegation
 			actualFiles,
 			toolEvidenceIds,
 			violations,
-		}));
+		}), contextToken);
 	}
 
 	if (record.status !== "running") return record;
-	return trustRecord(deepFreeze({ ...record, status: event.type, gateStatus: "insufficient" as const }));
+	return trustRecord(
+		deepFreeze({ ...record, status: event.type, gateStatus: "insufficient" as const }),
+		contextToken,
+	);
 }
 
 export function delegationSatisfiesGate(record: DelegationRecord): boolean {
@@ -277,8 +293,9 @@ export function delegationSatisfiesGate(record: DelegationRecord): boolean {
 	}
 }
 
-function trustRecord<T extends DelegationRecord>(record: T): T {
+function trustRecord<T extends DelegationRecord>(record: T, contextToken: object): T {
 	trustedRecords.add(record);
+	recordContextTokens.set(record, contextToken);
 	return record;
 }
 

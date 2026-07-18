@@ -29,13 +29,16 @@ function contract() {
 	});
 }
 
-function trustedContext(actualFiles: readonly string[] | null = ["src/owned.ts"]) {
+function trustedContext(
+	actualFiles: readonly string[] | null = ["src/owned.ts"],
+	toolEvidenceIds: readonly string[] = ["tool-result:tool-call-14"],
+) {
 	const taskContract = contract();
 	const verifier = createDelegationEvidenceVerifier((revision) => ({
 		taskId: taskContract.taskId,
 		contractHash: taskContract.contractHash,
 		evidenceRevision: revision,
-		delegations: actualFiles === null ? [] : [{ delegationId: "delegation-14", actualFiles }],
+		delegations: actualFiles === null ? [] : [{ delegationId: "delegation-14", actualFiles, toolEvidenceIds }],
 	}));
 	return createTrustedDelegationContext({ taskContract, evidenceRevision: REVISION }, verifier);
 }
@@ -55,9 +58,10 @@ function queuedRecord(overrides: Partial<Parameters<typeof createDelegationRecor
 
 describe("DelegationSupervisor 生命周期与完成门", () => {
 	it("只允许 queued -> running -> completed，并用可信实际文件和真实工具结果满足 Gate", () => {
-		const queued = queuedRecord();
+		const context = trustedContext();
+		const queued = queuedRecord({ context });
 		const running = applyDelegationEvent(queued, { delegationId: queued.delegationId, type: "started" });
-		const completed = applyDelegationEvent(running, createDelegationCompletionAttestation(trustedContext(), {
+		const completed = applyDelegationEvent(running, createDelegationCompletionAttestation(context, {
 				delegationId: queued.delegationId,
 				originToolCallId: "tool-call-14",
 				resultToolCallId: "tool-call-14",
@@ -69,6 +73,39 @@ describe("DelegationSupervisor 生命周期与完成门", () => {
 		expect(delegationSatisfiesGate(completed)).toBe(true);
 	});
 
+	it("拒绝用相同任务哈希的另一个可信上下文替换原上下文", () => {
+		const originalContext = trustedContext();
+		const replacementContext = trustedContext();
+		const queued = queuedRecord({ context: originalContext });
+		const running = applyDelegationEvent(queued, { delegationId: queued.delegationId, type: "started" });
+		const replaced = applyDelegationEvent(running, createDelegationCompletionAttestation(replacementContext, {
+			delegationId: queued.delegationId,
+			originToolCallId: queued.toolCallId,
+			resultToolCallId: queued.toolCallId,
+			toolEvidenceIds: [`tool-result:${queued.toolCallId}`],
+		}));
+
+		expect(replaced).toBe(running);
+		expect(delegationSatisfiesGate(replaced)).toBe(false);
+	});
+
+	it("工具结果 ID 必须由记录原上下文的 Evidence verifier 证明", () => {
+		const context = trustedContext(["src/owned.ts"], []);
+		const queued = queuedRecord({ context });
+		const running = applyDelegationEvent(queued, { delegationId: queued.delegationId, type: "started" });
+		const completed = applyDelegationEvent(running, createDelegationCompletionAttestation(context, {
+			delegationId: queued.delegationId,
+			originToolCallId: queued.toolCallId,
+			resultToolCallId: queued.toolCallId,
+			toolEvidenceIds: [`tool-result:${queued.toolCallId}`],
+		}));
+
+		expect(completed.status).toBe("completed");
+		expect(completed.toolEvidenceIds).toEqual([]);
+		expect(completed.gateStatus).toBe("insufficient");
+		expect(delegationSatisfiesGate(completed)).toBe(false);
+	});
+
 	it.each(["failed", "cancelled", "timed_out"] as const)("支持 running -> %s 终态", (type) => {
 		const running = applyDelegationEvent(queuedRecord(), { delegationId: "delegation-14", type: "started" });
 		const terminal = applyDelegationEvent(running, { delegationId: "delegation-14", type });
@@ -77,8 +114,9 @@ describe("DelegationSupervisor 生命周期与完成门", () => {
 	});
 
 	it("未知 actualFiles 即使有工具结果也不能通过", () => {
-		const running = applyDelegationEvent(queuedRecord(), { delegationId: "delegation-14", type: "started" });
-		const completed = applyDelegationEvent(running, createDelegationCompletionAttestation(trustedContext(null), {
+		const context = trustedContext(null);
+		const running = applyDelegationEvent(queuedRecord({ context }), { delegationId: "delegation-14", type: "started" });
+		const completed = applyDelegationEvent(running, createDelegationCompletionAttestation(context, {
 				delegationId: "delegation-14",
 				originToolCallId: "tool-call-14",
 				resultToolCallId: "tool-call-14",
@@ -89,15 +127,22 @@ describe("DelegationSupervisor 生命周期与完成门", () => {
 	});
 
 	it("actualFiles 超出 ownedFiles 时形成违规且不满足 Gate", () => {
-		const running = applyDelegationEvent(queuedRecord(), { delegationId: "delegation-14", type: "started" });
 		const outsideContract = contract();
 		const verifier = createDelegationEvidenceVerifier((revision) => ({
 			taskId: outsideContract.taskId,
 			contractHash: outsideContract.contractHash,
 			evidenceRevision: revision,
-			delegations: [{ delegationId: "delegation-14", actualFiles: ["src/owned.ts", "src/outside.ts"] }],
+			delegations: [{
+				delegationId: "delegation-14",
+				actualFiles: ["src/owned.ts", "src/outside.ts"],
+				toolEvidenceIds: ["tool-result:tool-call-14"],
+			}],
 		}));
 		const context = createTrustedDelegationContext({ taskContract: outsideContract, evidenceRevision: REVISION }, verifier);
+		const running = applyDelegationEvent(
+			queuedRecord({ context }),
+			{ delegationId: "delegation-14", type: "started" },
+		);
 		const completed = applyDelegationEvent(running, createDelegationCompletionAttestation(context, {
 			delegationId: "delegation-14",
 			originToolCallId: "tool-call-14",
@@ -132,18 +177,22 @@ describe("DelegationSupervisor 生命周期与完成门", () => {
 	});
 
 	it("创建和迁移后的记录、数组与违规对象全部深冻结", () => {
-		const queued = queuedRecord();
-		expect(Object.isFrozen(queued)).toBe(true);
-		expect(Object.isFrozen(queued.ownedFiles)).toBe(true);
-		expect(() => (queued.ownedFiles as string[]).push("src/outside.ts")).toThrow();
 		const outsideContract = contract();
 		const verifier = createDelegationEvidenceVerifier((revision) => ({
 			taskId: outsideContract.taskId,
 			contractHash: outsideContract.contractHash,
 			evidenceRevision: revision,
-			delegations: [{ delegationId: "delegation-14", actualFiles: ["src/outside.ts"] }],
+			delegations: [{
+				delegationId: "delegation-14",
+				actualFiles: ["src/outside.ts"],
+				toolEvidenceIds: ["tool-result:tool-call-14"],
+			}],
 		}));
 		const context = createTrustedDelegationContext({ taskContract: outsideContract, evidenceRevision: REVISION }, verifier);
+		const queued = queuedRecord({ context });
+		expect(Object.isFrozen(queued)).toBe(true);
+		expect(Object.isFrozen(queued.ownedFiles)).toBe(true);
+		expect(() => (queued.ownedFiles as string[]).push("src/outside.ts")).toThrow();
 		const completed = applyDelegationEvent(
 			applyDelegationEvent(queued, { delegationId: "delegation-14", type: "started" }),
 			createDelegationCompletionAttestation(context, {

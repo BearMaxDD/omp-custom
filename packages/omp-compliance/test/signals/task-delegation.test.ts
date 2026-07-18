@@ -605,7 +605,11 @@ describe("task/hub 官方事件到 Completion Gate 的可信闭环", () => {
 		contractHash: taskContract.contractHash,
 		evidenceRevision: revision,
 		delegations: [
-			{ delegationId: "delegation-14", actualFiles: ["src/owned.ts"] },
+			{
+				delegationId: "delegation-14",
+				actualFiles: ["src/owned.ts"],
+				toolEvidenceIds: ["tool-result:task-call-14", "tool-result:hub-poll-14"],
+			},
 			{ delegationId: "delegation-unknown", actualFiles: ["src/owned.ts"] },
 		],
 	}));
