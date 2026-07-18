@@ -116,6 +116,7 @@ describe("ReviewEnvelope — 严格上下文", () => {
 			evidenceRevision: `sha256:${"b".repeat(64)}`,
 			gitHead: "c".repeat(40),
 			diffHash: `sha256:${"d".repeat(64)}`,
+			advisorPayloadHash: `sha256:${"e".repeat(64)}`,
 			attempt: 1,
 			trigger: "compliance_review" as const,
 			createdAt: "2026-07-18T00:00:00.000Z",
@@ -257,6 +258,31 @@ describe("ComplianceRuntime — start", () => {
 		const evidence = await store.readAll(taskId);
 		expect(evidence.filter((record) => record.event === "active")).toHaveLength(1);
 	});
+
+	it("首次状态落盘失败时不提交 active Evidence 或启动消息", async () => {
+		let persistAttempts = 0;
+		const dependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		});
+		const failingRuntime = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps, {
+			...dependencies,
+			persistRuntimeState: () => {
+				persistAttempts += 1;
+				if (persistAttempts === 1) throw new Error("state disk unavailable");
+			},
+		});
+
+		await expect(failingRuntime.start("tdd.md")).rejects.toThrow("state disk unavailable");
+		expect(failingRuntime.currentTaskState).toBeNull();
+		expect(api.sentMessages).toHaveLength(0);
+		const taskId = dependencies.strictEvidence().taskContract.taskId;
+		expect((await store.readAll(taskId)).filter((record) => record.event === "active")).toHaveLength(0);
+
+		await failingRuntime.start("tdd.md");
+		expect((await store.readAll(taskId)).filter((record) => record.event === "active")).toHaveLength(1);
+	});
 });
 
 describe("ComplianceRuntime — persisted recovery", () => {
@@ -368,6 +394,46 @@ describe("ComplianceRuntime — persisted recovery", () => {
 		expect(reviewRequests).toBe(2);
 		expect(recoveredRuntime.currentTaskState?.status).toBe("advisor_reviewing");
 		expect(recoveredRuntime.currentTaskState?.activeReviewId).not.toBe(persisted.activeEnvelope?.reviewId);
+	});
+
+	it("拒绝恢复与严格信封摘要不一致的 Advisor 上下文", async () => {
+		const schedulerStore = new ControllableSchedulerStore();
+		let persisted: ComplianceRuntimePersistenceSnapshot | undefined;
+		const firstDependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			schedulerStore,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		});
+		const firstRuntime = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps, {
+			...firstDependencies,
+			persistRuntimeState: (_taskId, snapshot) => {
+				persisted = structuredClone(snapshot);
+			},
+		});
+		await firstRuntime.start("tdd.md");
+		await firstRuntime.requestCompletion({ summary: "Done" });
+		if (!persisted?.activeEnvelope || !persisted.taskState?.activeReviewId) {
+			throw new Error("active review was not persisted");
+		}
+		const originalAdvisor = reviewDeps.registry.get(persisted.taskState.activeReviewId);
+		if (!originalAdvisor) throw new Error("Advisor Envelope was not registered");
+
+		const recoveredDependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			schedulerStore,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		});
+		const recovered = new ComplianceRuntime(() => store, new CollectorRuntime(), api, tmpDir, reviewDeps, {
+			...recoveredDependencies,
+			readAdvisorEnvelope: async () => ({ ...originalAdvisor, context: "UNTRUSTED EVIDENCE INJECTION" }),
+		});
+		await recoveredDependencies.scheduler.restore();
+
+		await expect(
+			recovered.restorePersistedState(firstDependencies.strictEvidence().taskContract, persisted),
+		).rejects.toThrow("Persisted compliance Review Envelope mismatch");
 	});
 
 	it("session 恢复会续提 remediate journal 并重新下发修复任务", async () => {
@@ -1374,5 +1440,56 @@ describe("ComplianceRuntime — resumeAfterRemediation", () => {
 		const attemptBefore = runtime.currentTaskState?.attempt;
 		await runtime.resumeAfterRemediation();
 		expect(runtime.currentTaskState?.attempt).toBe(attemptBefore + 1);
+	});
+
+	it("整改修改代码后恢复为无旧 Review 身份的可重启 active 状态", async () => {
+		const schedulerStore = new ControllableSchedulerStore();
+		let persisted: ComplianceRuntimePersistenceSnapshot | undefined;
+		const initialDependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			schedulerStore,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		});
+		const initial = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps, {
+			...initialDependencies,
+			persistRuntimeState: (_taskId, snapshot) => {
+				persisted = structuredClone(snapshot);
+			},
+		});
+		await initial.start("tdd.md");
+		await initial.requestCompletion({ summary: "Done" });
+		await initial.acceptVerdict(
+			advisorVerdict(initial, {
+				status: "remediate",
+				findings: [finding("f1", "Fix it", "fix it")],
+			}),
+		);
+		mkdirSync(join(tmpDir, "src"), { recursive: true });
+		writeFileSync(join(tmpDir, "src", "index.ts"), "export const fixed = true;\n", "utf8");
+		await initial.resumeAfterRemediation();
+		if (!persisted?.taskState) throw new Error("resumed state was not persisted");
+		expect(persisted.taskState.status).toBe("active");
+		expect(persisted.taskState.activeReviewId).toBeUndefined();
+		expect(persisted.activeEnvelope).toBeUndefined();
+
+		const recoveredDependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			schedulerStore,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		});
+		const recovered = new ComplianceRuntime(
+			() => store,
+			new CollectorRuntime(),
+			api,
+			tmpDir,
+			reviewDeps,
+			recoveredDependencies,
+		);
+		await recoveredDependencies.scheduler.restore();
+		await recovered.restorePersistedState(initialDependencies.strictEvidence().taskContract, persisted);
+		expect(recovered.currentTaskState?.status).toBe("active");
+		expect(recovered.currentTaskState?.activeReviewId).toBeUndefined();
 	});
 });

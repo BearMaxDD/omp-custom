@@ -27,7 +27,7 @@ import type { VerdictStore } from "../advisor/verdict-sink";
 import { loadComplianceContract } from "../contract/load-contract";
 import type { ComplianceContract } from "../contract/types";
 import type { TaskContract } from "../contract/types";
-import { createReviewEnvelope } from "../contracts/review-envelope";
+import { computeAdvisorPayloadHash, createReviewEnvelope } from "../contracts/review-envelope";
 import type { ReviewEnvelope } from "../contracts/review-envelope";
 import { validateTaskContractIntegrity } from "../contracts/task-contract";
 import { delegationSatisfiesGate } from "../delegation/delegation-supervisor";
@@ -177,6 +177,7 @@ export class ComplianceRuntime {
 	private activeAdvisorEnvelope: ComplianceReviewEnvelope | undefined;
 	private schedulerRestored = false;
 	private runtimeOperationTail: Promise<void> = Promise.resolve();
+	private skipNextFinalPersistence = false;
 
 	constructor(
 		private readonly getEvidenceStore: () => EvidenceStore,
@@ -327,7 +328,8 @@ export class ComplianceRuntime {
 					typeof authoritativeAdvisor.context !== "string" ||
 					authoritativeAdvisor.context.length > 256 * 1024 ||
 					typeof authoritativeAdvisor.rules !== "string" ||
-					authoritativeAdvisor.rules.length > 64 * 1024
+					authoritativeAdvisor.rules.length > 64 * 1024 ||
+					computeAdvisorPayloadHash(authoritativeAdvisor) !== restoredActiveEnvelope.advisorPayloadHash
 				) {
 					throw new Error("Persisted compliance Review Envelope mismatch");
 				}
@@ -431,6 +433,16 @@ export class ComplianceRuntime {
 		this.activeAdvisorEnvelope = undefined;
 		this.taskState = state;
 		this.contract = contract;
+		try {
+			await this.persistCurrentRuntimeState(taskId);
+			this.skipNextFinalPersistence = true;
+		} catch (error) {
+			this.taskState = null;
+			this.contract = null;
+			this.activeEnvelope = undefined;
+			this.activeAdvisorEnvelope = undefined;
+			throw error;
+		}
 
 		// Write active evidence record
 		await this.writeEvidenceRecord("active", {
@@ -588,6 +600,21 @@ export class ComplianceRuntime {
 		const context = buildCompletionContext(snapshot, activeContract.policy);
 		const rules = renderCompletionRules(activeContract.policy);
 
+		const createdAt = new Date().toISOString();
+		const advisorPayloadHash = computeAdvisorPayloadHash({
+			sessionId,
+			taskId: this.taskState.taskId,
+			projectId: this.taskState.projectId,
+			contractHash: this.taskState.contractHash,
+			evidenceRevision,
+			gitHead: currentGit.gitHead,
+			diffHash: currentGit.diffHash,
+			trigger: "compliance_review",
+			attempt: this.taskState.attempt,
+			context,
+			rules,
+			createdAt,
+		});
 		const strictEnvelope = createReviewEnvelope({
 			taskId: this.taskState.taskId,
 			projectId: this.taskState.projectId,
@@ -595,9 +622,10 @@ export class ComplianceRuntime {
 			evidenceRevision,
 			gitHead: currentGit.gitHead,
 			diffHash: currentGit.diffHash,
+			advisorPayloadHash,
 			attempt: this.taskState.attempt,
 			trigger: "compliance_review",
-			createdAt: new Date().toISOString(),
+			createdAt,
 		});
 		const envelope: ComplianceReviewEnvelope = Object.freeze({
 			reviewId: strictEnvelope.reviewId,
@@ -947,6 +975,12 @@ export class ComplianceRuntime {
 		const queued = this.scheduler.nextDueIntent(this.activeEnvelope.taskId, "compliance_review");
 		if (!queued) return;
 		const reviewAttempt = Math.min(queued.attempt + 1, Number.MAX_SAFE_INTEGER);
+		if (!this.activeAdvisorEnvelope) throw new Error("Authoritative Advisor Envelope is missing");
+		const createdAt = new Date().toISOString();
+		const advisorPayloadHash = computeAdvisorPayloadHash({
+			...this.activeAdvisorEnvelope,
+			createdAt,
+		});
 		const retryEnvelope = createReviewEnvelope(
 			{
 				taskId: this.activeEnvelope.taskId,
@@ -955,15 +989,15 @@ export class ComplianceRuntime {
 				evidenceRevision: this.activeEnvelope.evidenceRevision,
 				gitHead: this.activeEnvelope.gitHead,
 				diffHash: this.activeEnvelope.diffHash,
+				advisorPayloadHash,
 				attempt: this.activeEnvelope.attempt,
 				trigger: "compliance_review",
-				createdAt: new Date().toISOString(),
+				createdAt,
 			},
 			reviewAttempt,
 		);
 		const expectedReviewId = `review:${queued.dedupeKey.slice("sha256:".length)}:${reviewAttempt}`;
 		if (retryEnvelope.reviewId !== expectedReviewId) throw new Error("Scheduler retry identity mismatch");
-		if (!this.activeAdvisorEnvelope) throw new Error("Authoritative Advisor Envelope is missing");
 		const retryAdvisorEnvelope = Object.freeze({
 			...this.activeAdvisorEnvelope,
 			reviewId: retryEnvelope.reviewId,
@@ -1050,6 +1084,8 @@ export class ComplianceRuntime {
 		}
 
 		const newFingerprint = `remediated-${Date.now()}`;
+		const previousReviewId = this.taskState.activeReviewId;
+		const currentGit = this.authoritativeGit();
 		this.taskState = transition(this.taskState, {
 			type: "activity",
 			worktreeFingerprint: newFingerprint,
@@ -1059,7 +1095,13 @@ export class ComplianceRuntime {
 		this.taskState = {
 			...this.taskState,
 			attempt: this.taskState.attempt + 1,
+			activeReviewId: undefined,
+			gitHead: currentGit.gitHead,
+			diffHash: currentGit.diffHash,
 		};
+		this.activeEnvelope = undefined;
+		this.activeAdvisorEnvelope = undefined;
+		if (previousReviewId) this.reviewDeps.registry.consume(previousReviewId);
 
 		return this.taskState.status;
 	}
@@ -1097,12 +1139,10 @@ export class ComplianceRuntime {
 				return await operation();
 			} finally {
 				const taskId = this.taskState?.taskId ?? previousTaskId;
-				if (taskId && this.persistRuntimeState) {
-					await this.persistRuntimeState(taskId, {
-						schemaVersion: 1,
-						taskState: this.taskState ? structuredClone(this.taskState) : null,
-						...(this.activeEnvelope ? { activeEnvelope: this.activeEnvelope } : {}),
-					});
+				if (this.skipNextFinalPersistence) {
+					this.skipNextFinalPersistence = false;
+				} else {
+					await this.persistCurrentRuntimeState(taskId);
 				}
 			}
 		};
@@ -1112,6 +1152,15 @@ export class ComplianceRuntime {
 			() => undefined,
 		);
 		return result;
+	}
+
+	private async persistCurrentRuntimeState(taskId?: string): Promise<void> {
+		if (!taskId || !this.persistRuntimeState) return;
+		await this.persistRuntimeState(taskId, {
+			schemaVersion: 1,
+			taskState: this.taskState ? structuredClone(this.taskState) : null,
+			...(this.activeEnvelope ? { activeEnvelope: this.activeEnvelope } : {}),
+		});
 	}
 
 	private async dispatchFollowingReviews(): Promise<void> {
@@ -1268,6 +1317,7 @@ export class ComplianceRuntime {
 					evidenceRevision: persisted.evidenceRevision,
 					gitHead: persisted.gitHead,
 					diffHash: persisted.diffHash,
+					advisorPayloadHash: persisted.advisorPayloadHash,
 					attempt: persisted.attempt,
 					trigger: persisted.trigger,
 					createdAt: persisted.createdAt,

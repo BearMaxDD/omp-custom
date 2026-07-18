@@ -12,6 +12,7 @@ const ALLOWED_KEYS = new Set([
 	"evidenceRevision",
 	"gitHead",
 	"diffHash",
+	"advisorPayloadHash",
 	"attempt",
 	"trigger",
 	"createdAt",
@@ -24,6 +25,7 @@ export interface ReviewEnvelopeInput {
 	readonly evidenceRevision: string;
 	readonly gitHead: string;
 	readonly diffHash: string;
+	readonly advisorPayloadHash: string;
 	readonly attempt: number;
 	readonly trigger: "compliance_review";
 	readonly createdAt: string;
@@ -33,8 +35,42 @@ export interface ReviewEnvelope extends Omit<ReviewEnvelopeInput, "contractHash"
 	readonly contractHash: `sha256:${string}`;
 	readonly evidenceRevision: `sha256:${string}`;
 	readonly diffHash: `sha256:${string}`;
+	readonly advisorPayloadHash: `sha256:${string}`;
 	readonly reviewId: string;
 	readonly envelopeHash: `sha256:${string}`;
+}
+
+export interface AdvisorPayloadBindingInput {
+	readonly sessionId: string;
+	readonly taskId: string;
+	readonly projectId: string;
+	readonly contractHash: string;
+	readonly evidenceRevision: string;
+	readonly gitHead: string;
+	readonly diffHash: string;
+	readonly trigger: "compliance_review";
+	readonly attempt: number;
+	readonly context: string;
+	readonly rules: string;
+	readonly createdAt: string;
+}
+
+export function computeAdvisorPayloadHash(input: AdvisorPayloadBindingInput): `sha256:${string}` {
+	const canonical = JSON.stringify([
+		input.sessionId,
+		input.taskId,
+		input.projectId,
+		input.contractHash,
+		input.evidenceRevision,
+		input.gitHead,
+		input.diffHash,
+		input.trigger,
+		input.attempt,
+		input.context,
+		input.rules,
+		input.createdAt,
+	]);
+	return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
 }
 
 function plainDescriptors(input: unknown): PropertyDescriptorMap {
@@ -74,6 +110,7 @@ export function createReviewEnvelope(input: ReviewEnvelopeInput, reviewAttempt =
 		evidenceRevision: text(fields, "evidenceRevision"),
 		gitHead: text(fields, "gitHead").toLowerCase(),
 		diffHash: text(fields, "diffHash"),
+		advisorPayloadHash: text(fields, "advisorPayloadHash"),
 		attempt: fields.attempt?.value,
 		trigger: fields.trigger?.value,
 		createdAt: text(fields, "createdAt"),
@@ -81,7 +118,8 @@ export function createReviewEnvelope(input: ReviewEnvelopeInput, reviewAttempt =
 	if (
 		!SHA256.test(normalized.contractHash) ||
 		!SHA256.test(normalized.evidenceRevision) ||
-		!SHA256.test(normalized.diffHash)
+		!SHA256.test(normalized.diffHash) ||
+		!SHA256.test(normalized.advisorPayloadHash)
 	) {
 		throw new TypeError("review envelope hashes must be canonical sha256 values");
 	}
@@ -100,6 +138,7 @@ export function createReviewEnvelope(input: ReviewEnvelopeInput, reviewAttempt =
 		normalized.evidenceRevision,
 		normalized.gitHead,
 		normalized.diffHash,
+		normalized.advisorPayloadHash,
 		normalized.attempt,
 		normalized.trigger,
 		normalized.createdAt,
@@ -122,6 +161,7 @@ export function createReviewEnvelope(input: ReviewEnvelopeInput, reviewAttempt =
 		contractHash: normalized.contractHash as `sha256:${string}`,
 		evidenceRevision: normalized.evidenceRevision as `sha256:${string}`,
 		diffHash: normalized.diffHash as `sha256:${string}`,
+		advisorPayloadHash: normalized.advisorPayloadHash as `sha256:${string}`,
 		reviewId: `review:${dedupeKey.slice("sha256:".length)}:${reviewAttempt}`,
 		envelopeHash: `sha256:${digest}`,
 	});
