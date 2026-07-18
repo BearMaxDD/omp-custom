@@ -5,6 +5,7 @@ import { types as utilTypes } from "node:util";
 import type { JobSnapshot } from "@oh-my-pi/pi-coding-agent/tools/hub/types";
 import {
 	applyDelegationEvent,
+	createDelegationCompletionAttestation,
 	type DelegationRecord,
 	getTrustedDelegationActualFiles,
 	isTrustedDelegationContext,
@@ -24,6 +25,7 @@ export interface DelegationBinding {
 	readonly originalToolCallId: string;
 	readonly jobId?: string;
 	readonly agentId?: string;
+	readonly sessionId?: string;
 	readonly actualFiles?: readonly string[];
 }
 
@@ -33,14 +35,14 @@ export interface TrustedDelegationNormalizationContext {
 }
 
 const trustedNormalizationContexts = new WeakSet<object>();
+const trustedNormalizedEvents = new WeakSet<object>();
 
 export function createTrustedDelegationNormalizationContext(
 	delegation: TrustedDelegationContext,
 	bindings: readonly DelegationBinding[],
 ): TrustedDelegationNormalizationContext {
 	if (!isTrustedDelegationContext(delegation)) throw new TypeError("invalid_trusted_delegation_context");
-	if (!Array.isArray(bindings) || bindings.length > MAX_ITEMS) throw new TypeError("invalid_delegation_bindings");
-	const normalized = bindings.map((binding) => {
+	const normalized = safeArrayValues(bindings, "delegation_bindings").map((binding) => {
 		if (!isPlainRecord(binding)) throw new TypeError("invalid_delegation_binding");
 		if (binding.transport !== "task" && binding.transport !== "hub") {
 			throw new TypeError("invalid_delegation_binding_transport");
@@ -59,6 +61,7 @@ export function createTrustedDelegationNormalizationContext(
 			originalToolCallId: boundedString(binding.originalToolCallId, "binding_tool_call_id", MAX_ID_BYTES),
 			...(binding.jobId === undefined ? {} : { jobId: boundedString(binding.jobId, "binding_job_id", MAX_ID_BYTES) }),
 			...(binding.agentId === undefined ? {} : { agentId: boundedString(binding.agentId, "binding_agent_id", MAX_ID_BYTES) }),
+			...(binding.sessionId === undefined ? {} : { sessionId: boundedString(binding.sessionId, "binding_session_id", MAX_ID_BYTES) }),
 			...(attestedActualFiles === undefined ? {} : { actualFiles: attestedActualFiles }),
 		};
 	});
@@ -81,6 +84,7 @@ export interface NormalizedDelegationEvent {
 	readonly actualFilesKnown: boolean;
 	readonly actualFiles: readonly string[];
 	readonly toolEvidenceIds: readonly string[];
+	readonly completionAttestation?: ReturnType<typeof createDelegationCompletionAttestation>;
 }
 
 /** Normalize only official structured task/hub results into supervision events. */
@@ -88,11 +92,12 @@ export function normalizeDelegationEvents(
 	paired: ReadonlyArray<{ call: ToolCallRecord; result?: ToolResultRecord }>,
 	context?: TrustedDelegationNormalizationContext,
 ): NormalizedDelegationEvent[] {
-	if (!Array.isArray(paired) || paired.length > MAX_ITEMS) return [];
-	if (context !== undefined && !trustedNormalizationContexts.has(context)) return [];
-	const events: NormalizedDelegationEvent[] = [];
-	for (const rawPair of paired) {
-		try {
+	try {
+		const pairs = safeArrayValues(paired, "delegation_pairs");
+		if (context !== undefined && !trustedNormalizationContexts.has(context)) return [];
+		const events: NormalizedDelegationEvent[] = [];
+		for (const rawPair of pairs) {
+			try {
 			if (!isPlainRecord(rawPair) || !isToolCallRecord(rawPair.call)) continue;
 			const pair = rawPair as { call: ToolCallRecord; result?: ToolResultRecord };
 			if (pair.result !== undefined && (!isToolResultRecord(pair.result) || pair.result.toolCallId !== pair.call.toolCallId)) {
@@ -104,11 +109,14 @@ export function normalizeDelegationEvents(
 			if (pair.call.toolName === HUB_TOOL_NAME) {
 				events.push(...normalizeHubEvents(pair.call, pair.result, context));
 			}
-		} catch {
-			continue;
+			} catch {
+				continue;
+			}
 		}
+		return deepFreeze(events);
+	} catch {
+		return [];
 	}
-	return deepFreeze(events);
 }
 
 export function applyNormalizedDelegationEvents(
@@ -116,23 +124,36 @@ export function applyNormalizedDelegationEvents(
 	events: readonly NormalizedDelegationEvent[],
 ): DelegationRecord {
 	let current = record;
-	for (const event of events) {
-		if (event.delegationId !== current.delegationId) continue;
+	let normalizedEvents: unknown[];
+	try {
+		normalizedEvents = safeArrayValues(events, "normalized_delegation_events");
+	} catch {
+		return current;
+	}
+	for (const rawEvent of normalizedEvents) {
+		if (!isPlainRecord(rawEvent) || !trustedNormalizedEvents.has(rawEvent)) continue;
+		const event = rawEvent as unknown as NormalizedDelegationEvent;
+		if (
+			event.delegationId !== current.delegationId ||
+			event.agentId !== current.agentId ||
+			event.sessionId !== current.sessionId ||
+			event.transport !== current.transport ||
+			event.originToolCallId !== current.toolCallId
+		) continue;
 		if (event.status === "queued") continue;
+		if (
+			event.status !== "running" &&
+			(!event.resultToolCallId || event.resultToolCallId !== event.toolCallId)
+		) continue;
 		if (current.status === "queued") {
 			current = applyDelegationEvent(current, { delegationId: event.delegationId, type: "started" });
 		}
 		if (event.status === "running") continue;
 		if (event.status === "completed") {
-			current = applyDelegationEvent(current, {
-				delegationId: event.delegationId,
-				type: "completed",
-				originToolCallId: event.originToolCallId,
-				resultToolCallId: event.resultToolCallId ?? event.toolCallId,
-				actualFilesKnown: event.actualFilesKnown,
-				actualFiles: event.actualFiles,
-				toolEvidenceIds: event.toolEvidenceIds,
-			});
+			if (
+				!event.completionAttestation
+			) continue;
+			current = applyDelegationEvent(current, event.completionAttestation);
 		} else {
 			current = applyDelegationEvent(current, { delegationId: event.delegationId, type: event.status });
 		}
@@ -151,9 +172,21 @@ export function normalizeTaskDelegation(
 	paired: ReadonlyArray<{ call: ToolCallRecord; result?: ToolResultRecord }>,
 ): TaskDelegationEvidence[] {
 	const results: TaskDelegationEvidence[] = [];
+	let pairs: unknown[];
+	try {
+		pairs = safeArrayValues(paired, "task_delegation_pairs");
+	} catch {
+		return [];
+	}
 
-	for (const { call, result } of paired) {
-		if (call.toolName !== TASK_TOOL_NAME) continue;
+	for (const rawPair of pairs) {
+		try {
+			if (!isPlainRecord(rawPair)) continue;
+			const call = rawPair.call;
+			const result = rawPair.result;
+			if (!isToolCallRecord(call) || (result !== undefined && !isToolResultRecord(result))) continue;
+			if (result !== undefined && result.toolCallId !== call.toolCallId) continue;
+			if (call.toolName !== TASK_TOOL_NAME) continue;
 
 		if (!result) {
 			// Call with no result → insufficient evidence
@@ -232,7 +265,7 @@ export function normalizeTaskDelegation(
 			`${outputArtifacts.join(" ")} ${JSON.stringify(details)} ${result.resultRef}`,
 		);
 
-		results.push({
+			results.push({
 			agentId: agentId != null ? String(agentId) : undefined,
 			taskSummary: extractTaskSummary(call.params),
 			status: aborted ? "aborted" : exitCode === 0 ? "completed" : "aborted",
@@ -240,7 +273,10 @@ export function normalizeTaskDelegation(
 			exitCode: exitCode != null ? Number(exitCode) : undefined,
 			outputArtifacts,
 			codebaseRefs,
-		});
+			});
+		} catch {
+			continue;
+		}
 	}
 
 	return results;
@@ -260,13 +296,14 @@ function normalizeTaskEvents(
 			transport: "task" as const,
 			originalToolCallId: call.toolCallId,
 		}];
-		return bindings.map((binding) => delegationEvent(
+			return bindings.map((binding) => delegationEvent(
 			call,
 			binding,
 			"queued",
 			extractTaskSummary(call.params),
-			[],
-		));
+				[],
+				context?.delegation,
+			));
 	}
 	if (
 		!result.success ||
@@ -291,8 +328,8 @@ function normalizeTaskEvents(
 				agentId,
 			};
 		const summary = extractSingleResultSummary(single) ?? extractTaskSummary(call.params);
-		events.push(delegationEvent(call, binding, "running", summary, []));
-		events.push(delegationEvent(call, binding, taskResultStatus(single, result.success), summary, evidenceIds));
+		events.push(delegationEvent(call, binding, "running", summary, [], context?.delegation));
+		events.push(delegationEvent(call, binding, taskResultStatus(single, result.success), summary, evidenceIds, context?.delegation));
 	}
 
 	const asyncDetails = readRecord(result.details.async);
@@ -309,8 +346,9 @@ function normalizeTaskEvents(
 			binding,
 			asyncDetails.state === "running" ? "running" : "failed",
 			extractTaskSummary(call.params),
-			evidenceIds,
-		));
+				evidenceIds,
+				context?.delegation,
+			));
 	}
 	return events;
 }
@@ -337,7 +375,7 @@ function normalizeHubEvents(
 			(candidate) => candidate.transport === "hub" && candidate.jobId === job.id,
 		);
 		if (!binding) continue;
-		events.push(delegationEvent(call, binding, hubJobStatus(job), job.label, evidenceIds));
+		events.push(delegationEvent(call, binding, hubJobStatus(job), job.label, evidenceIds, context.delegation));
 	}
 	return events;
 }
@@ -348,22 +386,35 @@ function delegationEvent(
 	status: NormalizedDelegationEvent["status"],
 	workPackage: string | undefined,
 	toolEvidenceIds: readonly string[],
+	context?: TrustedDelegationContext,
 ): NormalizedDelegationEvent {
-	return {
+	const resultToolCallId = status === "queued" || status === "running" ? undefined : call.toolCallId;
+	const completionAttestation = status === "completed" && context
+		? createDelegationCompletionAttestation(context, {
+			delegationId: binding.delegationId,
+			originToolCallId: binding.originalToolCallId,
+			resultToolCallId: call.toolCallId,
+			toolEvidenceIds,
+		})
+		: undefined;
+	const event = deepFreeze({
 		delegationId: binding.delegationId,
 		...(binding.agentId === undefined ? {} : { agentId: binding.agentId }),
 		...(binding.jobId === undefined ? {} : { jobId: binding.jobId }),
-		...(call.sessionId === undefined ? {} : { sessionId: call.sessionId }),
+		...((binding.sessionId ?? call.sessionId) === undefined ? {} : { sessionId: binding.sessionId ?? call.sessionId }),
 		toolCallId: call.toolCallId,
 		originToolCallId: binding.originalToolCallId,
-		...(status === "queued" || status === "running" ? {} : { resultToolCallId: call.toolCallId }),
+		...(resultToolCallId === undefined ? {} : { resultToolCallId }),
 		transport: binding.transport,
 		status,
-		...(workPackage === undefined ? {} : { workPackage }),
-		actualFilesKnown: binding.actualFiles !== undefined,
-		actualFiles: binding.actualFiles ?? [],
-		toolEvidenceIds,
-	};
+		...(workPackage === undefined ? {} : { workPackage: boundedString(workPackage, "delegation_work_package", MAX_STRING_BYTES) }),
+		actualFilesKnown: completionAttestation?.actualFilesKnown ?? false,
+		actualFiles: completionAttestation?.actualFiles ?? [],
+		toolEvidenceIds: boundedStringArray(toolEvidenceIds, "delegation_tool_evidence", MAX_STRING_BYTES),
+		...(completionAttestation === undefined ? {} : { completionAttestation }),
+	});
+	trustedNormalizedEvents.add(event);
+	return event;
 }
 
 function taskResultStatus(
@@ -467,13 +518,13 @@ function isSingleResult(value: unknown): value is Record<string, unknown> {
 	if (!result) return false;
 	if (
 		!isFiniteNumber(result.index) ||
-		!isNonEmptyString(result.id) ||
-		!isNonEmptyString(result.agent) ||
+		!isBoundedString(result.id, MAX_ID_BYTES) ||
+		!isBoundedString(result.agent, MAX_ID_BYTES) ||
 		!AGENT_SOURCES.has(String(result.agentSource)) ||
-		typeof result.task !== "string" ||
-		!isFiniteNumber(result.exitCode) ||
-		typeof result.output !== "string" ||
-		typeof result.stderr !== "string" ||
+			!isBoundedString(result.task, MAX_STRING_BYTES) ||
+			!isFiniteNumber(result.exitCode) ||
+			!isStringWithinLimit(result.output, MAX_STRING_BYTES) ||
+			!isStringWithinLimit(result.stderr, MAX_STRING_BYTES) ||
 		typeof result.truncated !== "boolean" ||
 		!isFiniteNumber(result.durationMs) ||
 		!isFiniteNumber(result.tokens) ||
@@ -493,7 +544,7 @@ function isSingleResult(value: unknown): value is Record<string, unknown> {
 		"branchBaseSha",
 		"resolvedModel",
 	] as const) {
-		if (result[key] !== undefined && typeof result[key] !== "string") return false;
+		if (result[key] !== undefined && !isStringWithinLimit(result[key], MAX_STRING_BYTES)) return false;
 	}
 	if (result.aborted !== undefined && typeof result.aborted !== "boolean") return false;
 	if (result.modelOverride !== undefined && !isStringOrStringArray(result.modelOverride)) return false;
@@ -517,7 +568,11 @@ function isStringArray(value: unknown): value is string[] {
 }
 
 function isStringOrStringArray(value: unknown): boolean {
-	return typeof value === "string" || isStringArray(value);
+	return isStringWithinLimit(value, MAX_STRING_BYTES) || isStringArray(value);
+}
+
+function isStringWithinLimit(value: unknown, maxBytes: number): value is string {
+	return typeof value === "string" && Buffer.byteLength(value) <= maxBytes;
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -566,8 +621,27 @@ function isToolResultRecord(value: unknown): value is ToolResultRecord {
 }
 
 function boundedStringArray(values: unknown, label: string, maxBytes: number): string[] {
-	if (!Array.isArray(values) || values.length > MAX_ITEMS) throw new TypeError(`invalid_${label}`);
-	return [...new Set(values.map((value) => boundedString(value, label, maxBytes)))];
+	return [...new Set(safeArrayValues(values, label).map((value) => boundedString(value, label, maxBytes)))];
+}
+
+function safeArrayValues(value: unknown, label: string): unknown[] {
+	if (!Array.isArray(value) || utilTypes.isProxy(value)) throw new TypeError(`invalid_${label}`);
+	try {
+		if (Object.getPrototypeOf(value) !== Array.prototype || value.length > MAX_ITEMS) {
+			throw new TypeError(`invalid_${label}`);
+		}
+		const descriptors = Object.getOwnPropertyDescriptors(value);
+		const values: unknown[] = [];
+		for (let index = 0; index < value.length; index += 1) {
+			const descriptor = descriptors[String(index)];
+			if (!descriptor || !("value" in descriptor)) throw new TypeError(`invalid_${label}`);
+			values.push(descriptor.value);
+		}
+		return values;
+	} catch (error) {
+		if (error instanceof TypeError && error.message === `invalid_${label}`) throw error;
+		throw new TypeError(`invalid_${label}`);
+	}
 }
 
 function sameStrings(left: readonly string[], right: readonly string[] | undefined): boolean {

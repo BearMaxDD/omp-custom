@@ -13,6 +13,7 @@ import {
 	applyNormalizedDelegationEvents,
 	createTrustedDelegationNormalizationContext,
 	normalizeDelegationEvents,
+	normalizeTaskDelegation,
 } from "../../src/signals/task-delegation";
 import { ToolEventCollector } from "../../src/signals/tool-event-collector";
 import type { ToolCallRecord, ToolResultRecord } from "../../src/signals/types";
@@ -620,6 +621,7 @@ describe("task/hub 官方事件到 Completion Gate 的可信闭环", () => {
 			transport: "task",
 			originalToolCallId: "task-call-14",
 			agentId: "agent-real",
+			sessionId: "session-14",
 			actualFiles: ["src/owned.ts"],
 		}]);
 		const events = normalizeDelegationEvents(snapshot.calls.map((call) => ({
@@ -759,6 +761,80 @@ describe("task/hub 官方事件到 Completion Gate 的可信闭环", () => {
 		for (const details of hostileValues) {
 			expect(() => normalizeDelegationEvents([{ call, result: storedResult(call.toolCallId, details as Record<string, unknown>) }])).not.toThrow();
 			expect(normalizeDelegationEvents([{ call, result: storedResult(call.toolCallId, details as Record<string, unknown>) }])).toEqual([]);
+		}
+	});
+
+	it("顶层 paired Proxy 与访问器失败关闭且不执行访问器", () => {
+		let getterReads = 0;
+		const accessorPair = Object.defineProperty({}, "call", {
+			enumerable: true,
+			get() { getterReads += 1; return storedCall("task", "accessor", { task: "实现" }); },
+		});
+		for (const paired of [new Proxy([], { get() { throw new Error("proxy trap"); } }), [accessorPair]]) {
+			expect(() => normalizeDelegationEvents(paired as never)).not.toThrow();
+			expect(normalizeDelegationEvents(paired as never)).toEqual([]);
+		}
+		expect(getterReads).toBe(0);
+	});
+
+	it("SingleResult 结构化字符串超过上限时失败关闭且不保留超大 workPackage", () => {
+		const call = storedCall("task", "oversized-result", { task: "实现" });
+		const oversized = taskDetails({ results: [singleResult({ task: "x".repeat(5 * 1024 * 1024) })] });
+		const events = normalizeDelegationEvents([{ call, result: storedResult(call.toolCallId, oversized) }]);
+		expect(events).toEqual([]);
+	});
+
+	it.each(["id", "agent", "assignment", "output", "stderr"] as const)(
+		"SingleResult.%s 超过字节上限时失败关闭",
+		(field) => {
+			const call = storedCall("task", `oversized-${field}`, { task: "实现" });
+			const details = taskDetails({ results: [singleResult({ [field]: "x".repeat(5000) })] });
+			expect(normalizeDelegationEvents([{ call, result: storedResult(call.toolCallId, details) }])).toEqual([]);
+		},
+	);
+
+	it("兼容 normalizeTaskDelegation 限制输入数量并拒绝 Proxy 与访问器", () => {
+		const call = storedCall("task", "compat", { task: "实现" });
+		const pair = { call, result: storedResult(call.toolCallId, taskDetails()) };
+		expect(normalizeTaskDelegation(Array.from({ length: 513 }, () => pair))).toEqual([]);
+		expect(() => normalizeTaskDelegation(new Proxy([], {}) as never)).not.toThrow();
+		let reads = 0;
+		const accessorPair = Object.defineProperty({}, "call", { get() { reads += 1; return call; } });
+		expect(normalizeTaskDelegation([accessorPair] as never)).toEqual([]);
+		expect(reads).toBe(0);
+	});
+
+	it("身份任一字段错配时不得把归一化事件应用到记录", () => {
+		const call = storedCall("task", "identity-call", { task: "实现" });
+		const context = createTrustedDelegationNormalizationContext(trusted, [{
+			delegationId: "delegation-14",
+			transport: "task",
+			originalToolCallId: call.toolCallId,
+			agentId: "agent-real",
+			actualFiles: ["src/owned.ts"],
+		}]);
+		const events = normalizeDelegationEvents([{
+			call,
+			result: storedResult(call.toolCallId, taskDetails({ results: [singleResult({ id: "agent-real" })] })),
+		}], context);
+		for (const mismatch of [
+			{ agentId: "attacker" },
+			{ sessionId: "other-session" },
+			{ transport: "hub" as const },
+			{ originToolCallId: "other-call" },
+			{ resultToolCallId: "other-result" },
+		]) {
+			const record = createDelegationRecord({
+				delegationId: "delegation-14",
+				agentId: "agent-real",
+				sessionId: "session-14",
+				toolCallId: call.toolCallId,
+				transport: "task",
+				workPackage: "实现",
+				context: trusted,
+			});
+			const tampered = events.map((event) => ({ ...event, ...mismatch }));
+			expect(applyNormalizedDelegationEvents(record, tampered)).toBe(record);
 		}
 	});
 });

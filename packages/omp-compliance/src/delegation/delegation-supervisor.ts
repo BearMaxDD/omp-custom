@@ -23,7 +23,9 @@ export interface TrustedDelegationContext {
 const trustedContexts = new WeakSet<object>();
 const trustedEvidenceVerifiers = new WeakSet<object>();
 const trustedRecords = new WeakSet<object>();
+const trustedCompletionAttestations = new WeakSet<object>();
 const trustedActualFiles = new WeakMap<object, ReadonlyMap<string, readonly string[]>>();
+const completionContexts = new WeakMap<object, TrustedDelegationContext>();
 
 export interface DelegationFileEvidence {
 	readonly delegationId: string;
@@ -80,8 +82,7 @@ export function createTrustedDelegationContext(input: {
 		reference.contractHash !== taskContract.contractHash ||
 		reference.evidenceRevision !== evidenceRevision
 	) throw new TypeError("delegation_evidence_mismatch");
-	const delegations = reference.delegations ?? [];
-	if (!Array.isArray(delegations) || delegations.length > MAX_ITEMS) throw new TypeError("invalid_delegation_file_evidence");
+	const delegations = safeArrayValues(reference.delegations ?? [], "delegation_file_evidence");
 	const fileEvidence = new Map<string, readonly string[]>();
 	for (const entry of delegations) {
 		if (!isPlainObject(entry)) throw new TypeError("invalid_delegation_file_evidence");
@@ -132,16 +133,47 @@ export interface DelegationRecordInput {
 
 export type DelegationEvent =
 	| { readonly delegationId: string; readonly type: "started" }
-	| {
+	| DelegationCompletionAttestation
+	| { readonly delegationId: string; readonly type: "failed" | "cancelled" | "timed_out" };
+
+export interface DelegationCompletionAttestation {
 			readonly delegationId: string;
 			readonly type: "completed";
 			readonly originToolCallId: string;
 			readonly resultToolCallId: string;
 			readonly actualFilesKnown: boolean;
-			readonly actualFiles?: readonly string[];
+			readonly actualFiles: readonly string[];
 			readonly toolEvidenceIds: readonly string[];
-	  }
-	| { readonly delegationId: string; readonly type: "failed" | "cancelled" | "timed_out" };
+	}
+
+export interface DelegationCompletionAttestationInput {
+	readonly delegationId: string;
+	readonly originToolCallId: string;
+	readonly resultToolCallId: string;
+	readonly toolEvidenceIds: readonly string[];
+}
+
+export function createDelegationCompletionAttestation(
+	context: TrustedDelegationContext,
+	input: DelegationCompletionAttestationInput,
+): DelegationCompletionAttestation {
+	if (!isTrustedDelegationContext(context)) throw new TypeError("invalid_trusted_delegation_context");
+	const safe = plainObject(input, "delegation_completion_attestation");
+	const delegationId = boundedString(safe.delegationId, "delegation_id", MAX_ID_BYTES);
+	const actualFiles = getTrustedDelegationActualFiles(context, delegationId);
+	const attestation = deepFreeze({
+		delegationId,
+		type: "completed" as const,
+		originToolCallId: boundedString(safe.originToolCallId, "origin_tool_call_id", MAX_ID_BYTES),
+		resultToolCallId: boundedString(safe.resultToolCallId, "result_tool_call_id", MAX_ID_BYTES),
+		actualFilesKnown: actualFiles !== undefined,
+		actualFiles: actualFiles ?? [],
+		toolEvidenceIds: boundedStrings(safe.toolEvidenceIds, "tool_evidence_ids"),
+	});
+	trustedCompletionAttestations.add(attestation);
+	completionContexts.set(attestation, context);
+	return attestation;
+}
 
 const TERMINAL_STATUSES = new Set<DelegationStatus>(["completed", "failed", "cancelled", "timed_out"]);
 
@@ -172,7 +204,8 @@ export function createDelegationRecord(input: DelegationRecordInput): Delegation
 }
 
 export function applyDelegationEvent(record: DelegationRecord, event: DelegationEvent): DelegationRecord {
-	if (!isPlainObject(record) || !isPlainObject(event)) return record;
+	if (!trustedRecords.has(record)) return record;
+	if (!isPlainObject(record as unknown) || !isPlainObject(event as unknown)) return record;
 	if (event.delegationId !== record.delegationId || TERMINAL_STATUSES.has(record.status)) return record;
 
 	if (event.type === "started") {
@@ -180,12 +213,19 @@ export function applyDelegationEvent(record: DelegationRecord, event: Delegation
 	}
 
 	if (event.type === "completed") {
-		if (record.status !== "running") return record;
+		if (record.status !== "running" || !trustedCompletionAttestations.has(event)) return record;
+		const context = completionContexts.get(event);
+		if (
+			!context ||
+			context.taskContract.taskId !== record.taskId ||
+			context.taskContract.contractHash !== record.contractHash ||
+			context.evidenceRevision !== record.evidenceRevision
+		) return record;
 		const originToolCallId = boundedString(event.originToolCallId, "origin_tool_call_id", MAX_ID_BYTES);
 		const resultToolCallId = boundedString(event.resultToolCallId, "result_tool_call_id", MAX_ID_BYTES);
 		if (originToolCallId !== record.toolCallId) return record;
 		const actualFilesKnown = event.actualFilesKnown === true;
-		const actualFiles = actualFilesKnown ? normalizePaths(event.actualFiles ?? [], "actual_files") : [];
+		const actualFiles = actualFilesKnown ? normalizePaths(event.actualFiles, "actual_files") : [];
 		const outside = actualFiles.filter((file) => !record.ownedFiles.includes(file));
 		const expectedEvidenceId = `tool-result:${resultToolCallId}`;
 		const toolEvidenceIds = boundedStrings(event.toolEvidenceIds, "tool_evidence_ids").filter(
@@ -243,8 +283,7 @@ function trustRecord<T extends DelegationRecord>(record: T): T {
 }
 
 function normalizePaths(values: unknown, label: string): string[] {
-	if (!Array.isArray(values) || values.length > MAX_ITEMS) throw new TypeError(`invalid_${label}`);
-	return [...new Set(values.map((value) => normalizePath(value, label)))];
+	return [...new Set(safeArrayValues(values, label).map((value) => normalizePath(value, label)))];
 }
 
 function normalizePath(value: unknown, label: string): string {
@@ -258,8 +297,27 @@ function normalizePath(value: unknown, label: string): string {
 }
 
 function boundedStrings(values: unknown, label: string): string[] {
-	if (!Array.isArray(values) || values.length > MAX_ITEMS) throw new TypeError(`invalid_${label}`);
-	return [...new Set(values.map((value) => boundedString(value, label, MAX_STRING_BYTES)))];
+	return [...new Set(safeArrayValues(values, label).map((value) => boundedString(value, label, MAX_STRING_BYTES)))];
+}
+
+function safeArrayValues(value: unknown, label: string): unknown[] {
+	if (!Array.isArray(value) || utilTypes.isProxy(value)) throw new TypeError(`invalid_${label}`);
+	try {
+		if (Object.getPrototypeOf(value) !== Array.prototype || value.length > MAX_ITEMS) {
+			throw new TypeError(`invalid_${label}`);
+		}
+		const descriptors = Object.getOwnPropertyDescriptors(value);
+		const values: unknown[] = [];
+		for (let index = 0; index < value.length; index += 1) {
+			const descriptor = descriptors[String(index)];
+			if (!descriptor || !("value" in descriptor)) throw new TypeError(`invalid_${label}`);
+			values.push(descriptor.value);
+		}
+		return values;
+	} catch (error) {
+		if (error instanceof TypeError && error.message === `invalid_${label}`) throw error;
+		throw new TypeError(`invalid_${label}`);
+	}
 }
 
 function boundedString(value: unknown, label: string, maxBytes: number): string {
