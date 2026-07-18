@@ -112,31 +112,31 @@ export interface CodebaseEvidencePack {
 	readonly diffHash: `sha256:${string}`;
 	readonly queriedAt: string;
 	readonly affectedFiles: readonly string[];
+	readonly changedFiles: readonly string[];
+	readonly newFiles: readonly string[];
 	readonly allowedNewFileRoots: readonly string[];
 	readonly unresolvedClaims: readonly string[];
+	readonly requiredSymbols: readonly string[];
 	readonly tools: readonly CodebaseToolEvidence[];
 	readonly symbols: readonly CodebaseSymbolEvidence[];
 	readonly traces: readonly CodebaseTraceEvidence[];
 	readonly evidenceRevision: `sha256:${string}`;
 }
 
-/**
- * Nominal marker for a Collector-owned snapshot. This is an explicit handoff
- * boundary, not a claim that same-process JavaScript cannot forge the value.
- */
-export interface TrustedCodebaseCapture {
-	readonly __trustedCodebaseCaptureBrand: "collector_snapshot";
-	readonly pairs: ReadonlyArray<{ readonly call: ToolCallRecord; readonly result: ToolResultRecord }>;
-}
+declare const trustedCodebaseValidationContext: unique symbol;
 
 export interface TrustedCodebaseValidationContext {
+	readonly [trustedCodebaseValidationContext]: true;
 	readonly taskContract: TaskContract;
 	readonly codebaseProjectId: string;
 	readonly diffHash: `sha256:${string}`;
 	readonly indexRevision: string;
-	readonly trustedPairs: TrustedCodebaseCapture;
+	readonly queriedAt: string;
+	readonly changedFiles: readonly string[];
 	readonly newFiles: readonly string[];
-	readonly requiredSymbols?: readonly string[];
+	readonly allowedNewFileRoots: readonly string[];
+	readonly unresolvedClaims: readonly string[];
+	readonly requiredSymbols: readonly string[];
 }
 
 /** Normalized evidence for one task (subagent) delegation. */

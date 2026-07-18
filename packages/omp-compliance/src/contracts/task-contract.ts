@@ -1,5 +1,4 @@
 import { Buffer } from "node:buffer";
-import { basename } from "node:path";
 import { types as utilTypes } from "node:util";
 import { loadComplianceContract } from "../contract/load-contract";
 import type { SHA256Hash, TaskContract, TaskContractSource } from "../contract/types";
@@ -359,8 +358,4 @@ export function compareTaskContractRevision(
 		newRevision: newValue.revision as SHA256Hash,
 		drifted: oldValue.revision !== newValue.revision,
 	});
-}
-
-export function defaultProjectId(repoRoot: string): string {
-	return boundedString(basename(repoRoot), "project_id");
 }

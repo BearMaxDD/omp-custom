@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { join, resolve } from "node:path";
+import * as taskContractApi from "../../src/contracts/task-contract";
 import {
 	classifyTaskContractSource,
 	compareTaskContractRevision,
@@ -47,6 +48,10 @@ describe("统一任务契约分类", () => {
 });
 
 describe("正式与轻量任务契约", () => {
+	it("不得从仓库 basename 生成不合法 projectId", () => {
+		expect("defaultProjectId" in taskContractApi).toBe(false);
+	});
+
 	it("正式 TDD 生成 TRD 8.1 完整不可变契约", () => {
 		const contract = loadTaskContractFromTdd(fixture, repoRoot, {
 			projectId,

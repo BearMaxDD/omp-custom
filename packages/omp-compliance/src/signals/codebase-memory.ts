@@ -20,6 +20,7 @@ import { types as utilTypes } from "node:util";
 import { normalizeRepositoryPath, validateTaskContractIntegrity } from "../contracts/task-contract";
 import { READONLY_CODEBASE_TOOLS, WRITE_CODEBASE_TOOLS } from "../xdev/codebase-tool-policy";
 import { canonicalArgsFingerprint, canonicalJson } from "../xdev/tool-identity";
+import { ToolEventCollector } from "./tool-event-collector";
 import type {
 	CodebaseEvidencePack,
 	CodebaseMemoryEvidence,
@@ -28,7 +29,6 @@ import type {
 	CodebaseTraceEvidence,
 	ToolCallRecord,
 	ToolResultRecord,
-	TrustedCodebaseCapture,
 	TrustedCodebaseValidationContext,
 } from "./types";
 
@@ -60,14 +60,16 @@ const PACK_STRING_MAX_BYTES = 4096;
 const PACK_PATH_MAX_ITEMS = 512;
 const PACK_TOOL_MAX_ITEMS = 256;
 
-export interface CodebaseEvidencePackInput {
+export interface TrustedCodebaseValidationContextInput {
 	readonly taskContract: import("../contract/types").TaskContract;
 	readonly codebaseProjectId: string;
-	readonly diffHash: string;
-	readonly queriedAt?: string;
+	readonly indexRevision: string;
+	readonly queriedAt: string;
+	readonly changedFiles: readonly string[];
+	readonly newFiles: readonly string[];
 	readonly allowedNewFileRoots: readonly string[];
 	readonly unresolvedClaims: readonly string[];
-	readonly pairs: ReadonlyArray<{ readonly call: ToolCallRecord; readonly result?: ToolResultRecord }>;
+	readonly requiredSymbols: readonly string[];
 }
 
 /**
@@ -185,14 +187,16 @@ const SHA256_RE = /^sha256:[a-f0-9]{64}$/;
 const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const GIT_HEAD_RE = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const CODEBASE_PROJECT_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/;
-const PACK_INPUT_KEYS = new Set([
+const CONTEXT_INPUT_KEYS = new Set([
 	"taskContract",
 	"codebaseProjectId",
-	"diffHash",
+	"indexRevision",
 	"queriedAt",
+	"changedFiles",
+	"newFiles",
 	"allowedNewFileRoots",
 	"unresolvedClaims",
-	"pairs",
+	"requiredSymbols",
 ]);
 const PACK_KEYS = new Set([
 	"schemaVersion",
@@ -208,16 +212,22 @@ const PACK_KEYS = new Set([
 	"symbols",
 	"traces",
 	"affectedFiles",
+	"changedFiles",
+	"newFiles",
 	"allowedNewFileRoots",
 	"unresolvedClaims",
+	"requiredSymbols",
 ]);
 const CONTEXT_KEYS = new Set([
 	"taskContract",
 	"codebaseProjectId",
 	"diffHash",
 	"indexRevision",
-	"trustedPairs",
+	"queriedAt",
+	"changedFiles",
 	"newFiles",
+	"allowedNewFileRoots",
+	"unresolvedClaims",
 	"requiredSymbols",
 ]);
 const CALL_KEYS = new Set([
@@ -530,20 +540,127 @@ function deepFreezeValue<T>(value: T): T {
 	return value;
 }
 
-export function createTrustedCodebaseCapture(
-	pairs: ReadonlyArray<{ readonly call: ToolCallRecord; readonly result: ToolResultRecord }>,
-): TrustedCodebaseCapture {
-	const safePairs = plainCanonical<Array<{ call: ToolCallRecord; result: ToolResultRecord }>>(pairs, "trusted_pairs");
-	if (safePairs.length > PACK_TOOL_MAX_ITEMS) throw new TypeError("invalid_trusted_pairs");
-	const seen = new Map<string, string>();
-	for (const pair of safePairs) {
-		const tool = normalizePair(pair);
-		const canonical = canonicalJson(tool) ?? "";
-		const previous = seen.get(tool.toolCallId);
-		if (previous && previous !== canonical) throw new TypeError("conflicting_tool_call_id");
-		seen.set(tool.toolCallId, canonical);
+interface TrustedContextInternal {
+	readonly pairs: ReadonlyArray<{ readonly call: ToolCallRecord; readonly result: ToolResultRecord }>;
+}
+
+const trustedContexts = new WeakMap<object, TrustedContextInternal>();
+
+function authenticateContext(context: TrustedCodebaseValidationContext): TrustedContextInternal {
+	if (typeof context !== "object" || context === null || utilTypes.isProxy(context)) {
+		throw new TypeError("invalid_trusted_context");
 	}
-	return deepFreezeValue({ __trustedCodebaseCaptureBrand: "collector_snapshot", pairs: safePairs });
+	const internal = trustedContexts.get(context);
+	if (!internal) throw new TypeError("invalid_trusted_context");
+	return internal;
+}
+
+function captureCollectorPairs(
+	collector: ToolEventCollector,
+): Array<{ call: ToolCallRecord; result: ToolResultRecord }> {
+	if (
+		typeof collector !== "object" ||
+		collector === null ||
+		utilTypes.isProxy(collector) ||
+		Object.getPrototypeOf(collector) !== ToolEventCollector.prototype
+	) {
+		throw new TypeError("invalid_evidence_collector");
+	}
+	const snapshot = ToolEventCollector.prototype.snapshot.call(collector);
+	const results = new Map(snapshot.results.map((result) => [result.toolCallId, result]));
+	const pairs = snapshot.calls.flatMap((call) => {
+		const result = results.get(call.toolCallId);
+		if (!result) return [];
+		return [
+			{
+				call: {
+					toolName: call.toolName,
+					toolCallId: call.toolCallId,
+					...(call.serverName === undefined ? {} : { serverName: call.serverName }),
+					...(call.qualifiedName === undefined ? {} : { qualifiedName: call.qualifiedName }),
+					...(call.argsFingerprint === undefined ? {} : { argsFingerprint: call.argsFingerprint }),
+					params: call.params,
+					...(call.cwd === undefined ? {} : { cwd: call.cwd }),
+					...(call.sessionId === undefined ? {} : { sessionId: call.sessionId }),
+					timestamp: call.timestamp,
+				},
+				result: {
+					toolCallId: result.toolCallId,
+					success: result.success,
+					resultRef: result.resultRef,
+					source: result.source,
+					...(result.details === undefined ? {} : { details: result.details }),
+					...(result.detailsTruncated === undefined ? {} : { detailsTruncated: result.detailsTruncated }),
+					...(result.detailsFailure === undefined ? {} : { detailsFailure: result.detailsFailure }),
+					timestamp: result.timestamp,
+				},
+			},
+		];
+	});
+	const safePairs = plainCanonical<Array<{ call: ToolCallRecord; result: ToolResultRecord }>>(pairs, "collector_pairs");
+	if (safePairs.length > PACK_TOOL_MAX_ITEMS) throw new TypeError("invalid_collector_pairs");
+	for (const pair of safePairs) normalizePair(pair);
+	return safePairs;
+}
+
+function computeDiffHash(
+	gitHead: string,
+	changedFiles: readonly string[],
+	newFiles: readonly string[],
+): `sha256:${string}` {
+	const revision = canonicalArgsFingerprint({ gitHead, changedFiles, newFiles });
+	if (!revision) throw new TypeError("invalid_diff_snapshot");
+	return revision;
+}
+
+export function createTrustedCodebaseValidationContext(
+	collector: ToolEventCollector,
+	input: TrustedCodebaseValidationContextInput,
+): TrustedCodebaseValidationContext {
+	const pairs = captureCollectorPairs(collector);
+	const safe = plainCanonical<TrustedCodebaseValidationContextInput>(input, "trusted_context_input");
+	assertKeys(safe, CONTEXT_INPUT_KEYS, "trusted_context_input");
+	const taskContract = validateTaskContractIntegrity(safe.taskContract);
+	const task = taskBinding(taskContract);
+	const codebaseProjectId = strictCodebaseProjectId(safe.codebaseProjectId);
+	const indexRevision = boundedPackString(safe.indexRevision, "context_index_revision");
+	const queriedAt = strictIso(safe.queriedAt, "queried_at");
+	const changedFiles = normalizePackPaths(safe.changedFiles, true, "changed_files");
+	const newFiles = normalizePackPaths(safe.newFiles, true, "new_files");
+	const allowedNewFileRoots = normalizePackPaths(safe.allowedNewFileRoots, true, "allowed_new_file_roots");
+	const unresolvedClaims = normalizeClaims(safe.unresolvedClaims);
+	const requiredSymbols = normalizeClaims(safe.requiredSymbols);
+	if (task.source === "tdd" && requiredSymbols.length === 0) throw new TypeError("missing_required_symbols");
+	if (task.source === "tdd" && changedFiles.length === 0) throw new TypeError("missing_changed_files");
+	const changedSet = new Set(changedFiles);
+	for (const file of task.affectedFiles) if (!changedSet.has(file)) throw new TypeError(`missing_changed_file:${file}`);
+	for (const file of newFiles) if (!changedSet.has(file)) throw new TypeError(`new_file_not_changed:${file}`);
+	for (const pair of pairs) {
+		const tool = normalizePair(pair);
+		if (tool.access === "read" && tool.params.project !== codebaseProjectId) {
+			throw new TypeError(`project_mismatch:${tool.toolName}`);
+		}
+		if (
+			Date.parse(tool.callTimestamp) > Date.parse(tool.resultTimestamp) ||
+			Date.parse(tool.resultTimestamp) > Date.parse(queriedAt)
+		) {
+			throw new TypeError("invalid_tool_time_order");
+		}
+	}
+	const context = deepFreezeValue({
+		taskContract,
+		codebaseProjectId,
+		diffHash: computeDiffHash(task.gitHead, changedFiles, newFiles),
+		indexRevision,
+		queriedAt,
+		changedFiles,
+		newFiles,
+		allowedNewFileRoots,
+		unresolvedClaims,
+		requiredSymbols,
+	}) as unknown as TrustedCodebaseValidationContext;
+	trustedContexts.set(context, deepFreezeValue({ pairs }));
+	return context;
 }
 
 export function computeEvidenceRevision(pack: Omit<CodebaseEvidencePack, "evidenceRevision">): `sha256:${string}` {
@@ -552,16 +669,16 @@ export function computeEvidenceRevision(pack: Omit<CodebaseEvidencePack, "eviden
 	return revision;
 }
 
-export function createCodebaseEvidencePack(input: CodebaseEvidencePackInput): CodebaseEvidencePack {
-	const safe = plainCanonical<CodebaseEvidencePackInput>(input, "evidence_pack_input");
-	assertKeys(safe, PACK_INPUT_KEYS, "evidence_pack_input");
+export function createCodebaseEvidencePack(context: TrustedCodebaseValidationContext): CodebaseEvidencePack {
+	const internal = authenticateContext(context);
+	const safe = plainCanonical<TrustedCodebaseValidationContext>(context, "trusted_validation_context");
+	assertKeys(safe, CONTEXT_KEYS, "trusted_validation_context");
 	const task = taskBinding(safe.taskContract);
 	const codebaseProjectId = strictCodebaseProjectId(safe.codebaseProjectId);
-	const queriedAt = strictIso(safe.queriedAt ?? new Date().toISOString(), "queried_at");
-	if (!Array.isArray(safe.pairs) || safe.pairs.length > PACK_TOOL_MAX_ITEMS) throw new TypeError("invalid_tool_pairs");
+	const queriedAt = strictIso(safe.queriedAt, "queried_at");
 	const tools: CodebaseToolEvidence[] = [];
 	const seen = new Map<string, string>();
-	for (const pair of safe.pairs) {
+	for (const pair of internal.pairs) {
 		const tool = normalizePair(pair);
 		if (tool.access === "read" && tool.params.project !== codebaseProjectId) {
 			throw new TypeError(`project_mismatch:${tool.toolName}`);
@@ -593,7 +710,7 @@ export function createCodebaseEvidencePack(input: CodebaseEvidencePackInput): Co
 		projectId: task.projectId,
 		taskContractRevision: task.revision,
 		codebaseProjectId,
-		indexRevision: [...readyRevisions][0] ?? "",
+		indexRevision: boundedPackString(safe.indexRevision, "context_index_revision"),
 		gitHead: task.gitHead,
 		diffHash: strictHash(safe.diffHash, "diff_hash"),
 		queriedAt,
@@ -601,8 +718,11 @@ export function createCodebaseEvidencePack(input: CodebaseEvidencePackInput): Co
 		symbols: deriveSymbols(tools),
 		traces: deriveTraces(tools),
 		affectedFiles: task.affectedFiles,
+		changedFiles: normalizePackPaths(safe.changedFiles, true, "changed_files"),
+		newFiles: normalizePackPaths(safe.newFiles, true, "new_files"),
 		allowedNewFileRoots: normalizePackPaths(safe.allowedNewFileRoots, true, "allowed_new_file_roots"),
 		unresolvedClaims: normalizeClaims(safe.unresolvedClaims),
+		requiredSymbols: normalizeClaims(safe.requiredSymbols),
 	};
 	return deepFreezeValue({ ...body, evidenceRevision: computeEvidenceRevision(body) });
 }
@@ -611,23 +731,17 @@ function pathCovered(path: string, affected: ReadonlySet<string>, roots: readonl
 	return affected.has(path) || roots.some((root) => path === root || path.startsWith(`${root}/`));
 }
 
-export function validateCodebasePack(
-	pack: CodebaseEvidencePack,
-	changedFiles: readonly string[],
-	context: TrustedCodebaseValidationContext,
-): string[] {
+export function validateCodebasePack(pack: CodebaseEvidencePack, context: TrustedCodebaseValidationContext): string[] {
+	const internal = authenticateContext(context);
 	const safePack = plainCanonical<CodebaseEvidencePack>(pack, "evidence_pack");
-	const safeChanged = plainCanonical<readonly string[]>(changedFiles, "changed_files");
 	const safeContext = plainCanonical<TrustedCodebaseValidationContext>(context, "trusted_validation_context");
 	assertKeys(safePack, PACK_KEYS, "evidence_pack");
 	assertKeys(safeContext, CONTEXT_KEYS, "trusted_validation_context");
-	if (safeContext.trustedPairs?.__trustedCodebaseCaptureBrand !== "collector_snapshot")
-		throw new TypeError("invalid_trusted_capture");
 	const task = taskBinding(safeContext.taskContract);
 	const contextCodebaseProjectId = strictCodebaseProjectId(safeContext.codebaseProjectId);
 	const contextDiffHash = strictHash(safeContext.diffHash, "context_diff_hash");
 	const contextIndexRevision = boundedPackString(safeContext.indexRevision, "context_index_revision");
-	const requiredSymbols = safeContext.requiredSymbols === undefined ? [] : normalizeClaims(safeContext.requiredSymbols);
+	const requiredSymbols = normalizeClaims(safeContext.requiredSymbols);
 	strictProjectId(safePack.projectId);
 	strictHash(safePack.taskContractRevision, "task_contract_revision");
 	strictCodebaseProjectId(safePack.codebaseProjectId);
@@ -636,11 +750,11 @@ export function validateCodebasePack(
 	if (safePack.schemaVersion !== 1 || !SHA256_RE.test(safePack.diffHash) || !SHA256_RE.test(safePack.evidenceRevision))
 		throw new TypeError("invalid_evidence_pack_schema");
 	strictIso(safePack.queriedAt, "queried_at");
-	const changed = normalizePackPaths(safeChanged, true, "changed_files");
+	const changed = normalizePackPaths(safeContext.changedFiles, true, "changed_files");
 	const newFiles = normalizePackPaths(safeContext.newFiles, true, "new_files");
 	const affected = normalizePackPaths(safePack.affectedFiles);
-	const roots = normalizePackPaths(safePack.allowedNewFileRoots, true, "allowed_new_file_roots");
-	const claims = normalizeClaims(safePack.unresolvedClaims);
+	const roots = normalizePackPaths(safeContext.allowedNewFileRoots, true, "allowed_new_file_roots");
+	const claims = normalizeClaims(safeContext.unresolvedClaims);
 	if (!Array.isArray(safePack.tools) || safePack.tools.length > PACK_TOOL_MAX_ITEMS)
 		throw new TypeError("invalid_tools");
 	const affectedSet = new Set(task.affectedFiles);
@@ -653,6 +767,16 @@ export function validateCodebasePack(
 	if (safePack.diffHash !== contextDiffHash) errors.push("diff_hash_mismatch");
 	if (safePack.indexRevision !== contextIndexRevision) errors.push("index_revision_mismatch");
 	if (canonicalJson(affected) !== canonicalJson(task.affectedFiles)) errors.push("affected_files_mismatch");
+	if (canonicalJson(safePack.changedFiles) !== canonicalJson(changed)) errors.push("changed_files_mismatch");
+	if (canonicalJson(safePack.newFiles) !== canonicalJson(newFiles)) errors.push("new_files_mismatch");
+	if (canonicalJson(safePack.allowedNewFileRoots) !== canonicalJson(safeContext.allowedNewFileRoots))
+		errors.push("allowed_new_file_roots_mismatch");
+	if (canonicalJson(safePack.unresolvedClaims) !== canonicalJson(safeContext.unresolvedClaims))
+		errors.push("unresolved_claims_mismatch");
+	if (canonicalJson(safePack.requiredSymbols) !== canonicalJson(requiredSymbols))
+		errors.push("required_symbols_mismatch");
+	if (safePack.queriedAt !== safeContext.queriedAt) errors.push("queried_at_mismatch");
+	if (computeDiffHash(task.gitHead, changed, newFiles) !== contextDiffHash) errors.push("diff_hash_mismatch");
 	const trusted: CodebaseToolEvidence[] = [];
 	const ids = new Map<string, string>();
 	for (const raw of safePack.tools) {
@@ -711,20 +835,16 @@ export function validateCodebasePack(
 	const searchSymbols = new Set(
 		deriveSymbols(successful.filter((tool) => tool.toolName === "search_graph")).map((symbol) => symbol.qualifiedName),
 	);
+	const symbolTargets = requiredSymbols.length > 0 ? new Set(requiredSymbols) : searchSymbols;
 	const relevantSnippets = successful.filter((tool) => {
 		if (tool.toolName !== "get_code_snippet" || !relevant(tool)) return false;
 		const qualifiedName = tool.params.qualified_name;
-		return typeof qualifiedName === "string" && (searchSymbols.size === 0 || searchSymbols.has(qualifiedName));
+		return typeof qualifiedName === "string" && symbolTargets.has(qualifiedName) && searchSymbols.has(qualifiedName);
 	});
 	if (relevantSnippets.length === 0) errors.push("missing_relevant_snippet");
 	const knownSymbols = new Set(deriveSymbols(successful).map((symbol) => symbol.qualifiedName));
-	const relevantSymbols = new Set(searchSymbols);
-	for (const snippet of relevantSnippets) {
-		const qualifiedName = snippet.params.qualified_name;
-		if (typeof qualifiedName === "string") relevantSymbols.add(qualifiedName);
-	}
 	for (const required of requiredSymbols)
-		if (!knownSymbols.has(required)) errors.push(`missing_required_symbol:${required}`);
+		if (!knownSymbols.has(required) || !searchSymbols.has(required)) errors.push(`missing_required_symbol:${required}`);
 	const traceRequired = task.source === "tdd" || task.affectedFiles.length > 1;
 	const relevantTrace = (tool: CodebaseToolEvidence) => {
 		if (!(tool.toolName === "trace_path" || tool.toolName === "query_graph") || !relevant(tool)) return false;
@@ -732,9 +852,8 @@ export function validateCodebasePack(
 		const source = root.source ?? tool.params.function_name ?? tool.params.query;
 		const target = root.target;
 		return (
-			relevantSymbols.size === 0 ||
-			(typeof source === "string" && relevantSymbols.has(source)) ||
-			(typeof target === "string" && relevantSymbols.has(target))
+			(typeof source === "string" && symbolTargets.has(source)) ||
+			(typeof target === "string" && symbolTargets.has(target))
 		);
 	};
 	if (traceRequired && !successful.some(relevantTrace)) errors.push("missing_relevant_trace");
@@ -749,25 +868,12 @@ export function validateCodebasePack(
 	if (canonicalJson(derivedSymbols) !== canonicalJson(safePack.symbols)) errors.push("symbols_mismatch");
 	if (canonicalJson(derivedTraces) !== canonicalJson(safePack.traces)) errors.push("traces_mismatch");
 	try {
-		const expectedPack = createCodebaseEvidencePack({
-			taskContract: safeContext.taskContract,
-			codebaseProjectId: contextCodebaseProjectId,
-			diffHash: contextDiffHash,
-			queriedAt: safePack.queriedAt,
-			allowedNewFileRoots: roots,
-			unresolvedClaims: claims,
-			pairs: safeContext.trustedPairs.pairs,
-		});
+		if (internal.pairs.length > PACK_TOOL_MAX_ITEMS) throw new TypeError("invalid_collector_pairs");
+		const expectedPack = createCodebaseEvidencePack(context);
 		if (expectedPack.indexRevision !== contextIndexRevision) errors.push("index_revision_mismatch");
-		if (
-			canonicalJson(expectedPack.tools) !== canonicalJson(safePack.tools) ||
-			canonicalJson(expectedPack.symbols) !== canonicalJson(safePack.symbols) ||
-			canonicalJson(expectedPack.traces) !== canonicalJson(safePack.traces) ||
-			expectedPack.evidenceRevision !== safePack.evidenceRevision
-		)
-			errors.push("trusted_capture_mismatch");
+		if (canonicalJson(expectedPack) !== canonicalJson(safePack)) errors.push("trusted_context_mismatch");
 	} catch {
-		errors.push("trusted_capture_mismatch");
+		errors.push("trusted_context_mismatch");
 	}
 	const { evidenceRevision: _ignored, ...revisionBody } = safePack;
 	if (computeEvidenceRevision(revisionBody) !== safePack.evidenceRevision) errors.push("evidence_revision_mismatch");

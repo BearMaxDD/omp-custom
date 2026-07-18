@@ -1,16 +1,17 @@
 import { describe, expect, it, test } from "bun:test";
 import type { ToolResultEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { TaskContract } from "../../src/contract/types";
+import * as codebaseMemoryApi from "../../src/signals/codebase-memory";
 import {
 	codebaseIndexReady,
 	computeEvidenceRevision,
 	createCodebaseEvidencePack,
-	createTrustedCodebaseCapture,
+	createTrustedCodebaseValidationContext,
 	normalizeCodebaseMemory,
 	validateCodebasePack,
 } from "../../src/signals/codebase-memory";
+import type { TrustedCodebaseValidationContextInput } from "../../src/signals/codebase-memory";
 import { ToolEventCollector } from "../../src/signals/tool-event-collector";
-import type { ToolCallRecord, ToolResultRecord, TrustedCodebaseValidationContext } from "../../src/signals/types";
 import { canonicalArgsFingerprint } from "../../src/xdev/tool-identity";
 
 function mcpCall(shortName: string, input: Record<string, unknown>, toolCallId: string) {
@@ -227,59 +228,49 @@ describe("Codebase Evidence Pack", () => {
 	const codebaseProjectId = "codebase-demo";
 	const projectId = "123e4567-e89b-42d3-a456-426614174000";
 	const gitHead = "5e5560e5399236df8e403796291946ecf8bf7dba";
-	const callAt = "2026-07-18T07:59:00.000Z";
-	const resultAt = "2026-07-18T07:59:30.000Z";
-	const queriedAt = "2026-07-18T08:00:00.000Z";
-	const diffHash = `sha256:${"d".repeat(64)}`;
+	const queriedAt = "2099-07-18T08:00:00.000Z";
 
-	function pair(
+	interface ToolFixture {
+		readonly toolName: string;
+		readonly id: string;
+		readonly params: Record<string, unknown>;
+		readonly resultRef: string;
+		readonly details?: Record<string, unknown>;
+		readonly success?: boolean;
+	}
+
+	function fixture(
 		toolName: string,
 		id: string,
 		params: Record<string, unknown>,
 		resultRef: string,
 		details?: Record<string, unknown>,
 		success = true,
-	): { call: ToolCallRecord; result: ToolResultRecord } {
-		const argsFingerprint = canonicalArgsFingerprint(params);
-		if (!argsFingerprint) throw new Error("fixture args must be canonical");
-		return {
-			call: {
-				toolName,
-				toolCallId: id,
-				serverName: "codebase-memory",
-				qualifiedName: `codebase-memory-mcp.${toolName}`,
-				argsFingerprint,
-				params,
-				timestamp: callAt,
-			},
-			result: {
-				toolCallId: id,
-				success,
-				source: "official",
-				resultRef,
-				...(details ? { details } : {}),
-				detailsTruncated: false,
-				detailsFailure: !success,
-				timestamp: resultAt,
-			},
-		};
+	): ToolFixture {
+		return { toolName, id, params, resultRef, ...(details ? { details } : {}), success };
 	}
 
-	function validPairs() {
+	function validFixtures(): ToolFixture[] {
 		return [
-			pair("index_status", "index", { project: codebaseProjectId }, '{"status":"ready","revision":"idx-1"}', {
+			fixture("index_status", "index", { project: codebaseProjectId }, '{"status":"ready","revision":"idx-1"}', {
 				status: "ready",
 				revision: "idx-1",
 			}),
-			pair("search_graph", "search", { project: codebaseProjectId, query: "demo.a" }, "file:src/a.ts", {
+			fixture("search_graph", "search", { project: codebaseProjectId, query: "demo.a" }, "file:src/a.ts", {
 				results: [{ qualified_name: "demo.a", file_path: "src/a.ts" }],
 			}),
-			pair("get_code_snippet", "snippet", { project: codebaseProjectId, qualified_name: "demo.a" }, "file:src/a.ts", {
-				qualified_name: "demo.a",
-				file_path: "src/a.ts",
-				line: 10,
-			}),
-			pair(
+			fixture(
+				"get_code_snippet",
+				"snippet",
+				{ project: codebaseProjectId, qualified_name: "demo.a" },
+				"file:src/a.ts",
+				{
+					qualified_name: "demo.a",
+					file_path: "src/a.ts",
+					line: 10,
+				},
+			),
+			fixture(
 				"trace_path",
 				"trace",
 				{ project: codebaseProjectId, function_name: "demo.a", direction: "outbound" },
@@ -287,18 +278,6 @@ describe("Codebase Evidence Pack", () => {
 				{ source: "demo.a", target: "demo.b", file_path: "src/a.ts" },
 			),
 		];
-	}
-
-	function metadata(pairs = validPairs()) {
-		return {
-			taskContract: taskContract(),
-			codebaseProjectId,
-			diffHash,
-			queriedAt,
-			allowedNewFileRoots: ["src/new"],
-			unresolvedClaims: [] as string[],
-			pairs,
-		};
 	}
 
 	function taskContract(
@@ -329,31 +308,56 @@ describe("Codebase Evidence Pack", () => {
 		};
 	}
 
+	function collector(fixtures: readonly ToolFixture[]): ToolEventCollector {
+		const instance = new ToolEventCollector();
+		for (const item of fixtures) {
+			const toolName = `mcp__codebase_memory_mcp__${item.toolName}`;
+			instance.recordCall({ type: "tool_call", toolName, toolCallId: item.id, input: item.params });
+			instance.recordResult({
+				type: "tool_result",
+				toolName,
+				toolCallId: item.id,
+				input: item.params,
+				content: [{ type: "text", text: item.resultRef }],
+				isError: item.success === false,
+				details: item.details,
+			});
+		}
+		return instance;
+	}
+
 	function context(
-		pairs = validPairs(),
-		overrides: Partial<TrustedCodebaseValidationContext> = {},
-	): TrustedCodebaseValidationContext {
-		return {
-			taskContract: taskContract(),
+		fixtures: readonly ToolFixture[] = validFixtures(),
+		overrides: Partial<TrustedCodebaseValidationContextInput> = {},
+	) {
+		const contract = overrides.taskContract ?? taskContract();
+		return createTrustedCodebaseValidationContext(collector(fixtures), {
+			taskContract: contract,
 			codebaseProjectId,
-			diffHash,
 			indexRevision: "idx-1",
-			trustedPairs: createTrustedCodebaseCapture(pairs),
+			queriedAt,
+			changedFiles: contract.affectedFiles,
 			newFiles: [],
+			allowedNewFileRoots: ["src/new"],
+			unresolvedClaims: [],
+			requiredSymbols: contract.source === "tdd" ? ["demo.a"] : [],
 			...overrides,
-		};
+		});
 	}
 
 	it("生成 TRD 9.3 完整、稳定、不可变 Pack", () => {
-		const pack = createCodebaseEvidencePack(metadata());
+		const trusted = context();
+		const pack = createCodebaseEvidencePack(trusted);
 		expect(pack).toMatchObject({
 			schemaVersion: 1,
 			projectId,
 			codebaseProjectId,
 			indexRevision: "idx-1",
 			gitHead,
-			diffHash,
+			diffHash: trusted.diffHash,
 			queriedAt,
+			changedFiles: ["src/a.ts"],
+			requiredSymbols: ["demo.a"],
 		});
 		expect(pack.symbols).toContainEqual({ qualifiedName: "demo.a", file: "src/a.ts", line: 10 });
 		expect(pack.traces.length).toBeGreaterThan(0);
@@ -362,131 +366,150 @@ describe("Codebase Evidence Pack", () => {
 		expect(computeEvidenceRevision(body)).toBe(pack.evidenceRevision);
 		expect(Object.isFrozen(pack)).toBe(true);
 		expect(Object.isFrozen(pack.tools[0].params)).toBe(true);
+		expect(Object.isFrozen(trusted)).toBe(true);
 	});
 
-	it("伪造 indexRevision 后即使重算 revision 仍被真实性复核拒绝", () => {
-		const pack = createCodebaseEvidencePack(metadata());
+	it("普通调用方不能铸造 raw capture，字符串 brand 与 JSON clone 均无效", () => {
+		expect("createTrustedCodebaseCapture" in codebaseMemoryApi).toBe(false);
+		const trusted = context();
+		expect("pairs" in trusted).toBe(false);
+		const pack = createCodebaseEvidencePack(trusted);
+		const forged = { ...trusted, __trustedCodebaseCaptureBrand: "collector_snapshot", pairs: [] };
+		expect(() => validateCodebasePack(pack, forged as never)).toThrow("invalid_trusted_context");
+		expect(() => validateCodebasePack(pack, JSON.parse(JSON.stringify(trusted)) as never)).toThrow(
+			"invalid_trusted_context",
+		);
+		let reads = 0;
+		const proxy = new Proxy(trusted, {
+			get: () => {
+				reads++;
+				throw new Error("trap");
+			},
+		});
+		expect(() => validateCodebasePack(pack, proxy)).toThrow("invalid_trusted_context");
+		expect(reads).toBe(0);
+		const forgedAccessor = Object.defineProperty({}, "taskContract", {
+			enumerable: true,
+			get: () => {
+				reads++;
+				throw new Error("trap");
+			},
+		});
+		expect(() => validateCodebasePack(pack, forgedAccessor as never)).toThrow("invalid_trusted_context");
+		expect(reads).toBe(0);
+		const accessorInput = Object.defineProperty({}, "taskContract", {
+			enumerable: true,
+			get: () => {
+				reads++;
+				throw new Error("trap");
+			},
+		});
+		expect(() => createTrustedCodebaseValidationContext({} as never, accessorInput as never)).toThrow(
+			"invalid_evidence_collector",
+		);
+		expect(reads).toBe(0);
+	});
+
+	it("Pack 的时间、roots、claims、diff 与文件集全部由可信上下文绑定", () => {
+		const trusted = context();
+		const original = createCodebaseEvidencePack(trusted);
+		const forgedBody = {
+			...original,
+			queriedAt: "2099-07-18T09:00:00.000Z",
+			allowedNewFileRoots: ["other"],
+			changedFiles: [],
+			diffHash: `sha256:${"d".repeat(64)}` as const,
+		};
+		const { evidenceRevision: _old, ...body } = forgedBody;
+		const forged = { ...body, evidenceRevision: computeEvidenceRevision(body) };
+		const errors = validateCodebasePack(forged, trusted);
+		expect(errors).toContain("trusted_context_mismatch");
+		expect(errors).toContain("queried_at_mismatch");
+		expect(errors).toContain("allowed_new_file_roots_mismatch");
+		expect(errors).toContain("changed_files_mismatch");
+		expect(errors).toContain("diff_hash_mismatch");
+		expect(() => context(validFixtures(), { changedFiles: [] })).toThrow("missing_changed_files");
+		const claimContext = context(validFixtures(), { unresolvedClaims: ["claim-a"] });
+		const claimPack = createCodebaseEvidencePack(claimContext);
+		const claimBody = { ...claimPack, unresolvedClaims: [] as string[] };
+		const { evidenceRevision: _claimRevision, ...claimWithoutRevision } = claimBody;
+		const forgedClaims = {
+			...claimWithoutRevision,
+			evidenceRevision: computeEvidenceRevision(claimWithoutRevision),
+		};
+		expect(validateCodebasePack(forgedClaims, claimContext)).toContain("unresolved_claims_mismatch");
+		expect(validateCodebasePack(forgedClaims, claimContext)).toContain("unresolved_claim:claim-a");
+	});
+
+	it("formal requiredSymbols 是硬门，unrelated symbol 即使伪装 affected path 也失败", () => {
+		const unrelated = validFixtures().map((item) => {
+			if (item.toolName === "search_graph")
+				return fixture(
+					"search_graph",
+					"search",
+					{ project: codebaseProjectId, query: "unrelated.z" },
+					"file:src/a.ts",
+					{
+						results: [{ qualified_name: "unrelated.z", file_path: "src/a.ts" }],
+					},
+				);
+			if (item.toolName === "get_code_snippet")
+				return fixture(
+					"get_code_snippet",
+					"snippet",
+					{ project: codebaseProjectId, qualified_name: "unrelated.z" },
+					"file:src/a.ts",
+					{ qualified_name: "unrelated.z", file_path: "src/a.ts" },
+				);
+			if (item.toolName === "trace_path")
+				return fixture(
+					"trace_path",
+					"trace",
+					{ project: codebaseProjectId, function_name: "unrelated.z", direction: "outbound" },
+					"file:src/a.ts",
+					{ source: "unrelated.z", target: "unrelated.y", file_path: "src/a.ts" },
+				);
+			return item;
+		});
+		const trusted = context(unrelated);
+		const errors = validateCodebasePack(createCodebaseEvidencePack(trusted), trusted);
+		expect(errors).toContain("missing_required_symbol:demo.a");
+		expect(errors).toContain("missing_relevant_snippet");
+		expect(errors).toContain("missing_relevant_trace");
+		expect(() => context(validFixtures(), { requiredSymbols: [] })).toThrow("missing_required_symbols");
+	});
+
+	it("index 三方绑定，index_repository 不能替代 ready index_status", () => {
+		const trusted = context();
+		const pack = createCodebaseEvidencePack(trusted);
 		const forgedBody = { ...pack, indexRevision: "idx-forged" };
-		const { evidenceRevision: _old, ...withoutRevision } = forgedBody;
-		const forged = { ...withoutRevision, evidenceRevision: computeEvidenceRevision(withoutRevision) };
-		expect(validateCodebasePack(forged, [], context())).toContain("index_revision_mismatch");
-	});
-
-	it("拒绝无关项目、无关 snippet 和无关 trace", () => {
-		const wrongProject = validPairs().map((entry) =>
-			entry.call.toolName === "search_graph"
-				? pair("search_graph", "search", { project: "other", query: "demo.a" }, "file:src/a.ts")
-				: entry,
-		);
-		expect(() => createCodebaseEvidencePack(metadata(wrongProject))).toThrow("project_mismatch:search_graph");
-
-		const unrelatedSnippet = validPairs().map((entry) =>
-			entry.call.toolName === "get_code_snippet"
-				? pair(
-						"get_code_snippet",
-						"snippet",
-						{ project: codebaseProjectId, qualified_name: "other.z" },
-						"file:other/z.ts",
-						{ qualified_name: "other.z", file_path: "other/z.ts" },
-					)
-				: entry,
-		);
-		expect(
-			validateCodebasePack(createCodebaseEvidencePack(metadata(unrelatedSnippet)), [], context(unrelatedSnippet)),
-		).toContain("missing_relevant_snippet");
-
-		const unrelatedTrace = validPairs().map((entry) =>
-			entry.call.toolName === "trace_path"
-				? pair(
-						"trace_path",
-						"trace",
-						{ project: codebaseProjectId, function_name: "other.z", direction: "outbound" },
-						"file:other/z.ts",
-						{ source: "other.z", target: "other.y", file_path: "other/z.ts" },
-					)
-				: entry,
-		);
-		expect(
-			validateCodebasePack(createCodebaseEvidencePack(metadata(unrelatedTrace)), [], context(unrelatedTrace)),
-		).toContain("missing_relevant_trace");
-	});
-
-	it("同 toolCallId 冲突结果失败关闭", () => {
-		const pairs = validPairs();
-		pairs.push(
-			pair("get_code_snippet", "snippet", { project: codebaseProjectId, qualified_name: "demo.a" }, "file:src/evil.ts"),
-		);
-		expect(() => createCodebaseEvidencePack(metadata(pairs))).toThrow("conflicting_tool_call_id");
-	});
-
-	it("配对重新校验 ID、argsFingerprint、官方 source 与失败结果", () => {
-		const mismatchedFingerprint = validPairs();
-		mismatchedFingerprint[1] = {
-			...mismatchedFingerprint[1],
-			call: { ...mismatchedFingerprint[1].call, argsFingerprint: `sha256:${"a".repeat(64)}` },
-		};
-		expect(() => createCodebaseEvidencePack(metadata(mismatchedFingerprint))).toThrow("args_fingerprint_mismatch");
-
-		const mismatchedId = validPairs();
-		mismatchedId[1] = { ...mismatchedId[1], result: { ...mismatchedId[1].result, toolCallId: "other" } };
-		expect(() => createCodebaseEvidencePack(metadata(mismatchedId))).toThrow("tool_result_id_mismatch");
-
-		const legacy = validPairs();
-		legacy[1] = { ...legacy[1], result: { ...legacy[1].result, source: "legacy" } };
-		expect(() => createCodebaseEvidencePack(metadata(legacy))).toThrow("untrusted_tool_result_source");
-
-		const failedSnippet = validPairs().map((entry) =>
-			entry.call.toolName === "get_code_snippet"
-				? pair(
-						"get_code_snippet",
-						"snippet",
-						{ project: codebaseProjectId, qualified_name: "demo.a" },
-						"file:src/a.ts",
-						{},
-						false,
-					)
-				: entry,
-		);
-		expect(
-			validateCodebasePack(createCodebaseEvidencePack(metadata(failedSnippet)), [], context(failedSnippet)),
-		).toContain("missing_relevant_snippet");
-
-		const truncatedQuery = validPairs();
-		truncatedQuery[1] = {
-			...truncatedQuery[1],
-			call: { ...truncatedQuery[1].call, params: { project: codebaseProjectId, query: `${"q".repeat(80)}…[+20]` } },
-		};
-		expect(() => createCodebaseEvidencePack(metadata(truncatedQuery))).not.toThrow();
-	});
-
-	it("缺 architecture/search、snippet、index_status 均 invalid，index_repository 不替代", () => {
-		const pairs = validPairs();
-		const withoutDiscovery = pairs.filter((entry) => entry.call.toolName !== "search_graph");
-		expect(
-			validateCodebasePack(createCodebaseEvidencePack(metadata(withoutDiscovery)), [], context(withoutDiscovery)),
-		).toContain("missing_architecture_or_search");
-		const withoutSnippet = pairs.filter((entry) => entry.call.toolName !== "get_code_snippet");
-		expect(
-			validateCodebasePack(createCodebaseEvidencePack(metadata(withoutSnippet)), [], context(withoutSnippet)),
-		).toContain("missing_relevant_snippet");
-		const repositoryOnly = pairs.filter((entry) => entry.call.toolName !== "index_status");
+		const { evidenceRevision: _old, ...body } = forgedBody;
+		const forged = { ...body, evidenceRevision: computeEvidenceRevision(body) };
+		expect(validateCodebasePack(forged, trusted)).toContain("index_revision_mismatch");
+		const repositoryOnly = validFixtures().filter((item) => item.toolName !== "index_status");
 		repositoryOnly.push(
-			pair(
+			fixture(
 				"index_repository",
 				"index-write",
 				{ project: codebaseProjectId },
 				'{"status":"indexed","revision":"idx-1"}',
 			),
 		);
-		expect(
-			validateCodebasePack(createCodebaseEvidencePack(metadata(repositoryOnly)), [], context(repositoryOnly)),
-		).toContain("missing_index_status");
+		const repositoryContext = context(repositoryOnly);
+		expect(validateCodebasePack(createCodebaseEvidencePack(repositoryContext), repositoryContext)).toContain(
+			"missing_index_status",
+		);
 	});
 
-	it("query_graph 可替代跨模块 trace_path，但必须与 affectedFiles 相关", () => {
-		const pairs = validPairs().filter((entry) => entry.call.toolName !== "trace_path");
-		pairs.push(
-			pair(
+	it("formal 自动要求 trace，相关 query_graph 可替代 trace_path", () => {
+		const noTrace = validFixtures().filter((item) => item.toolName !== "trace_path");
+		const noTraceContext = context(noTrace);
+		expect(validateCodebasePack(createCodebaseEvidencePack(noTraceContext), noTraceContext)).toContain(
+			"missing_relevant_trace",
+		);
+		const queryFixtures = [...noTrace];
+		queryFixtures.push(
+			fixture(
 				"query_graph",
 				"query",
 				{ project: codebaseProjectId, query: "MATCH demo.a -> demo.b" },
@@ -494,176 +517,77 @@ describe("Codebase Evidence Pack", () => {
 				{ source: "demo.a", target: "demo.b", file_path: "src/a.ts" },
 			),
 		);
-		const pack = createCodebaseEvidencePack(metadata(pairs));
-		expect(validateCodebasePack(pack, [], context(pairs))).not.toContain("missing_relevant_trace");
+		const queryContext = context(queryFixtures);
+		expect(validateCodebasePack(createCodebaseEvidencePack(queryContext), queryContext)).not.toContain(
+			"missing_relevant_trace",
+		);
+		const lightweight = taskContract("lightweight");
+		const lightContext = context(noTrace, { taskContract: lightweight, changedFiles: lightweight.affectedFiles });
+		expect(validateCodebasePack(createCodebaseEvidencePack(lightContext), lightContext)).not.toContain(
+			"missing_relevant_trace",
+		);
 	});
 
-	it("新增文件只能位于 allowedNewFileRoots，unresolvedClaims 一律失败关闭", () => {
-		const pack = createCodebaseEvidencePack(metadata());
-		expect(
-			validateCodebasePack(pack, ["src/new/item.ts"], context(validPairs(), { newFiles: ["src/new/item.ts"] })),
-		).not.toContain("new_file_outside_allowed_root:src/new/item.ts");
-		expect(
-			validateCodebasePack(pack, ["other/item.ts"], context(validPairs(), { newFiles: ["other/item.ts"] })),
-		).toContain("new_file_outside_allowed_root:other/item.ts");
-		const unresolved = createCodebaseEvidencePack({ ...metadata(), unresolvedClaims: ["无法定位写入者"] });
-		expect(validateCodebasePack(unresolved, [], context())).toContain("unresolved_claim:无法定位写入者");
-	});
-
-	it("changedFiles/options Proxy 与 accessor trap=0，ISO/hash/path/大小严格", () => {
-		const pack = createCodebaseEvidencePack(metadata());
-		let reads = 0;
-		const changed = new Proxy([], {
-			get: () => {
-				reads++;
-				throw new Error("trap");
-			},
+	it("new roots 与 unresolved claims 由上下文绑定并失败关闭", () => {
+		const validNew = context(validFixtures(), {
+			changedFiles: ["src/a.ts", "src/new/item.ts"],
+			newFiles: ["src/new/item.ts"],
 		});
-		expect(() => validateCodebasePack(pack, changed, context())).toThrow();
-		expect(reads).toBe(0);
-		const options = Object.defineProperty({}, "taskContract", {
-			enumerable: true,
-			get: () => {
-				reads++;
-				return true;
-			},
+		expect(validateCodebasePack(createCodebaseEvidencePack(validNew), validNew)).not.toContain(
+			"new_file_outside_allowed_root:src/new/item.ts",
+		);
+		const outside = context(validFixtures(), {
+			changedFiles: ["src/a.ts", "other/item.ts"],
+			newFiles: ["other/item.ts"],
 		});
-		expect(() => validateCodebasePack(pack, [], options as never)).toThrow();
-		expect(reads).toBe(0);
-		expect(() => createCodebaseEvidencePack({ ...metadata(), queriedAt: "2026-07-18" })).toThrow();
-		expect(() => createCodebaseEvidencePack({ ...metadata(), diffHash: "sha256:bad" })).toThrow();
-		expect(() =>
-			createCodebaseEvidencePack({ ...metadata(), taskContract: taskContract("tdd", ["../escape.ts"]) }),
-		).toThrow();
-		expect(() =>
-			createCodebaseEvidencePack({
-				...metadata(),
-				taskContract: { ...taskContract(), projectId: "x".repeat(70_000) },
-			}),
-		).toThrow();
+		expect(validateCodebasePack(createCodebaseEvidencePack(outside), outside)).toContain(
+			"new_file_outside_allowed_root:other/item.ts",
+		);
+		const unresolved = context(validFixtures(), { unresolvedClaims: ["无法定位写入者"] });
+		expect(validateCodebasePack(createCodebaseEvidencePack(unresolved), unresolved)).toContain(
+			"unresolved_claim:无法定位写入者",
+		);
 	});
 
-	it("第三参数为必需可信上下文，Pack 元数据逐项与任务绑定", () => {
-		const pack = createCodebaseEvidencePack(metadata());
-		// @ts-expect-error TrustedCodebaseValidationContext is required.
-		expect(() => validateCodebasePack(pack, [])).toThrow();
-		expect(
-			validateCodebasePack(
-				pack,
-				[],
-				context(validPairs(), {
-					taskContract: taskContract("tdd", ["src/a.ts"], {
-						projectId: "123e4567-e89b-42d3-a456-426614174001",
-					}),
-				}),
+	it("项目、任务 revision、格式、路径与资源上限严格绑定", () => {
+		const trusted = context();
+		const pack = createCodebaseEvidencePack(trusted);
+		const otherFixtures = validFixtures().map((item) => ({
+			...item,
+			params: { ...item.params, project: "other-project" },
+		}));
+		const otherProject = context(otherFixtures, { codebaseProjectId: "other-project" });
+		expect(validateCodebasePack(pack, otherProject)).toContain("codebase_project_id_mismatch");
+		const otherTask = taskContract("tdd", ["src/a.ts"], { taskId: "other-task" });
+		const replay = context(validFixtures(), { taskContract: otherTask, changedFiles: otherTask.affectedFiles });
+		expect(validateCodebasePack(pack, replay)).toContain("task_contract_mismatch");
+		expect(() => context(validFixtures(), { queriedAt: "2026-07-18" })).toThrow();
+		expect(() => context(validFixtures(), { codebaseProjectId: "bad/project" })).toThrow();
+		expect(() => context(validFixtures(), { changedFiles: ["../escape.ts"] })).toThrow();
+		expect(() =>
+			context(validFixtures(), { requiredSymbols: Array.from({ length: 513 }, (_, i) => `s${i}`) }),
+		).toThrow();
+		const tooManyTools = Array.from({ length: 257 }, (_, index) =>
+			fixture(
+				"search_graph",
+				`search-${index}`,
+				{ project: codebaseProjectId, query: `symbol-${index}` },
+				"file:src/a.ts",
+				{ results: [{ qualified_name: `symbol-${index}`, file_path: "src/a.ts" }] },
 			),
-		).toContain("project_id_mismatch");
-		expect(validateCodebasePack(pack, [], context(validPairs(), { codebaseProjectId: "other-project" }))).toContain(
-			"codebase_project_id_mismatch",
 		);
-		expect(
-			validateCodebasePack(
-				pack,
-				[],
-				context(validPairs(), {
-					taskContract: taskContract("tdd", ["src/a.ts"], { gitHead: "a".repeat(40) }),
-				}),
-			),
-		).toContain("git_head_mismatch");
-		expect(validateCodebasePack(pack, [], context(validPairs(), { diffHash: `sha256:${"a".repeat(64)}` }))).toContain(
-			"diff_hash_mismatch",
-		);
-		expect(validateCodebasePack(pack, [], context(validPairs(), { indexRevision: "idx-2" }))).toContain(
-			"index_revision_mismatch",
-		);
-		expect(
-			validateCodebasePack(pack, [], context(validPairs(), { taskContract: taskContract("tdd", ["src/b.ts"]) })),
-		).toContain("affected_files_mismatch");
+		expect(() => context(tooManyTools)).toThrow("invalid_collector_pairs");
 	});
 
-	it("独立 trustedPairs 可阻止完全伪造、重算 hash 与跨任务重放", () => {
-		const originalPairs = validPairs();
-		const pack = createCodebaseEvidencePack(metadata(originalPairs));
-		const otherPairs = validPairs().map((entry) =>
-			entry.call.toolName === "get_code_snippet"
-				? pair(
-						"get_code_snippet",
-						"snippet-other",
-						{ project: codebaseProjectId, qualified_name: "other.z" },
-						"file:src/a.ts",
-						{ qualified_name: "other.z", file_path: "src/a.ts" },
-					)
-				: entry,
-		);
-		expect(validateCodebasePack(pack, [], context(otherPairs))).toContain("trusted_capture_mismatch");
-
-		const replayContext = context(originalPairs, {
-			taskContract: taskContract("tdd", ["src/a.ts"], { taskId: "other-task" }),
-		});
-		expect(validateCodebasePack(pack, [], replayContext)).toContain("task_contract_mismatch");
-	});
-
-	it("formal 自动要求 trace，lightweight 不允许通过可选参数绕过", () => {
-		const noTrace = validPairs().filter((entry) => entry.call.toolName !== "trace_path");
-		const pack = createCodebaseEvidencePack(metadata(noTrace));
-		expect(validateCodebasePack(pack, [], context(noTrace))).toContain("missing_relevant_trace");
-		expect(
-			validateCodebasePack(pack, [], context(noTrace, { taskContract: taskContract("lightweight") })),
-		).not.toContain("missing_relevant_trace");
-	});
-
-	it("同 affected path 的无关 symbol 和 trace 不能过关", () => {
-		const unrelated = validPairs().map((entry) => {
-			if (entry.call.toolName === "get_code_snippet") {
-				return pair(
-					"get_code_snippet",
-					"snippet",
-					{ project: codebaseProjectId, qualified_name: "other.z" },
-					"file:src/a.ts",
-					{ qualified_name: "other.z", file_path: "src/a.ts" },
-				);
-			}
-			if (entry.call.toolName === "trace_path") {
-				return pair(
-					"trace_path",
-					"trace",
-					{ project: codebaseProjectId, function_name: "other.z", direction: "outbound" },
-					"file:src/a.ts",
-					{ source: "other.z", target: "other.y", file_path: "src/a.ts" },
-				);
-			}
-			return entry;
-		});
-		const errors = validateCodebasePack(createCodebaseEvidencePack(metadata(unrelated)), [], context(unrelated));
-		expect(errors).toContain("missing_relevant_snippet");
-		expect(errors).toContain("missing_relevant_trace");
-	});
-
-	it("严格校验项目、Git 与 pair 时间顺序", () => {
-		expect(() =>
-			createCodebaseEvidencePack({
-				...metadata(),
-				taskContract: { ...taskContract(), projectId: "not-a-uuid" },
-			}),
-		).toThrow();
-		expect(() =>
-			createCodebaseEvidencePack({
-				...metadata(),
-				taskContract: { ...taskContract(), gitHead: "deadbeef" },
-			}),
-		).toThrow();
-		expect(() => createCodebaseEvidencePack({ ...metadata(), codebaseProjectId: "bad/project" })).toThrow();
-		const resultBeforeCall = validPairs();
-		resultBeforeCall[0] = {
-			...resultBeforeCall[0],
-			result: { ...resultBeforeCall[0].result, timestamp: "2026-07-18T07:58:00.000Z" },
-		};
-		expect(() => createCodebaseEvidencePack(metadata(resultBeforeCall))).toThrow("invalid_tool_time_order");
-		const resultAfterQuery = validPairs();
-		resultAfterQuery[0] = {
-			...resultAfterQuery[0],
-			result: { ...resultAfterQuery[0].result, timestamp: "2026-07-18T08:01:00.000Z" },
-		};
-		expect(() => createCodebaseEvidencePack(metadata(resultAfterQuery))).toThrow("invalid_tool_time_order");
+	it("create/validate API 不能漏传可信上下文，Pack 可由同一上下文完整重建", () => {
+		const trusted = context();
+		const first = createCodebaseEvidencePack(trusted);
+		const replay = createCodebaseEvidencePack(trusted);
+		expect(replay).toEqual(first);
+		expect(validateCodebasePack(first, trusted)).toEqual([]);
+		// @ts-expect-error Trusted context is mandatory.
+		expect(() => createCodebaseEvidencePack()).toThrow("invalid_trusted_context");
+		// @ts-expect-error Trusted context is mandatory.
+		expect(() => validateCodebasePack(first)).toThrow("invalid_trusted_context");
 	});
 });
