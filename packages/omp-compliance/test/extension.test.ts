@@ -380,6 +380,34 @@ describe("extension activate — no lazy file side-effects", () => {
 		rmSync(root, { recursive: true, force: true });
 	});
 
+	it("doctor 识别 v17 MCP Bridge 的单下划线 Codebase 工具名", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ext-doctor-v17-codebase-"));
+		Bun.spawnSync(["git", "init"], { cwd: root });
+		const api = new FakeExtensionAPI(createFakeExtensionContext({ cwd: root, sessionId: "doctor-v17-codebase" }));
+		api.tools.push("mcp__codebase_memory_search_graph");
+		const activate = (await import("../src/extension")).default;
+		activate(api.toAPI());
+		await api.fireSessionStart();
+
+		await api.fireCommand("compliance", "doctor");
+		expect(api.logs.some((line) => line.includes("Doctor codebase: ready"))).toBe(true);
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	it("doctor 不把 v17 MCP Bridge 的 Codebase 写工具视为只读能力", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ext-doctor-v17-codebase-write-"));
+		Bun.spawnSync(["git", "init"], { cwd: root });
+		const api = new FakeExtensionAPI(createFakeExtensionContext({ cwd: root, sessionId: "doctor-v17-codebase-write" }));
+		api.tools.push("mcp__codebase_memory_index_repository");
+		const activate = (await import("../src/extension")).default;
+		activate(api.toAPI());
+		await api.fireSessionStart();
+
+		await api.fireCommand("compliance", "doctor");
+		expect(api.logs.some((line) => line.includes("Doctor codebase: missing"))).toBe(true);
+		rmSync(root, { recursive: true, force: true });
+	});
+
 	it("remote 漂移保持失败关闭，只有显式 rebind 命令更新项目绑定", async () => {
 		const sessionRoot = mkdtempSync(join(tmpdir(), "ext-rebind-"));
 		Bun.spawnSync(["git", "init"], { cwd: sessionRoot });

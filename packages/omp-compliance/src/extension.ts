@@ -650,8 +650,9 @@ export default function activate(api: ComplianceExtensionHost): void {
 			}
 			const allTools = api.getAllTools();
 			const codebaseAvailable = allTools.some((name) => {
-				const simpleName = name.includes("__") ? name.slice(name.lastIndexOf("__") + 2) : name;
-				return READONLY_CODEBASE_TOOLS.has(simpleName);
+				if (READONLY_CODEBASE_TOOLS.has(name)) return true;
+				const identity = canonicalizeToolIdentity({ toolName: name, args: {} });
+				return identity !== null && isAdvisorCodebaseToolAllowed(identity);
 			});
 			return {
 				protocol: protocolReady
