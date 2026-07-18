@@ -21,6 +21,7 @@ const STATE_VERSION = 2 as const;
 const DEFAULT_MAX_QUEUE_SIZE = 256;
 const MAX_COMPLETED_HISTORY = 256;
 const MAX_DEDUPE_LEDGER_SIZE = 50_000;
+const DEFAULT_REQUEST_RECEIPT_TIMEOUT_MS = 30_000;
 export const MAX_REVIEW_SCHEDULER_STATE_BYTES = 8 * 1024 * 1024;
 
 export interface ReviewSchedulerClock {
@@ -39,6 +40,24 @@ export interface ReviewSchedulerState {
 export interface ReviewSchedulerStore {
 	load(): Promise<ReviewSchedulerState | undefined>;
 	save(state: ReviewSchedulerState): Promise<void>;
+}
+
+export interface ReviewDedupeArchiveBatch {
+	readonly reason: string;
+	readonly archivedAt: number;
+	readonly keys: readonly string[];
+}
+
+export interface ReviewDedupeArchive {
+	has(key: string): Promise<boolean>;
+	archive(batch: ReviewDedupeArchiveBatch): Promise<{ readonly archiveId: string }>;
+}
+
+export interface ReviewDedupeArchiveReceipt {
+	readonly archiveId: string;
+	readonly archivedCount: number;
+	readonly reason: string;
+	readonly archivedAt: number;
 }
 
 export class JsonFileReviewSchedulerStore implements ReviewSchedulerStore {
@@ -81,6 +100,23 @@ export interface ReviewSchedulerOptions {
 	readonly store: ReviewSchedulerStore;
 	readonly maxQueueSize?: number;
 	readonly nonceSource?: () => string;
+	readonly requestReceiptTimeoutMs?: number;
+	readonly requestTimeout?: (delayMs: number, signal: AbortSignal) => Promise<void>;
+	readonly dedupeArchive?: ReviewDedupeArchive;
+}
+
+function waitForTimeout(delayMs: number, signal: AbortSignal): Promise<void> {
+	return new Promise((resolve) => {
+		const timer = setTimeout(resolve, delayMs);
+		signal.addEventListener(
+			"abort",
+			() => {
+				clearTimeout(timer);
+				resolve();
+			},
+			{ once: true },
+		);
+	});
 }
 
 function isTerminal(event: AdvisorReviewLifecycleEvent): boolean {
@@ -175,6 +211,25 @@ function reviewIdFor(dedupeKey: string, attempt: number): string {
 	return `review:${dedupeKey.slice("sha256:".length)}:${attempt}`;
 }
 
+function validatedNonce(value: unknown): string {
+	if (
+		typeof value !== "string" ||
+		value.length === 0 ||
+		value.length > REVIEW_INTENT_MAX_STRING_LENGTH ||
+		!/^[A-Za-z0-9._:-]+$/.test(value)
+	) {
+		throw new Error("nonce must be a bounded identifier");
+	}
+	return value;
+}
+
+function boundedArchiveString(name: string, value: unknown): string {
+	if (typeof value !== "string" || value.trim().length === 0 || value.length > REVIEW_INTENT_MAX_STRING_LENGTH) {
+		throw new Error(`${name} must be a bounded non-empty string`);
+	}
+	return value;
+}
+
 export class ReviewScheduler {
 	readonly #clock: ReviewSchedulerClock;
 	readonly #random: () => number;
@@ -182,6 +237,9 @@ export class ReviewScheduler {
 	readonly #store: ReviewSchedulerStore;
 	readonly #maxQueueSize: number;
 	readonly #nonceSource: () => string;
+	readonly #requestReceiptTimeoutMs: number;
+	readonly #requestTimeout: (delayMs: number, signal: AbortSignal) => Promise<void>;
+	readonly #dedupeArchive: ReviewDedupeArchive | undefined;
 	#queued: ReviewIntent[] = [];
 	#inFlight: ReviewIntent | undefined;
 	#completed: ReviewIntent[] = [];
@@ -189,6 +247,7 @@ export class ReviewScheduler {
 	#nextSequence = 0;
 	#operationTail: Promise<void> = Promise.resolve();
 	#pumping: Promise<void> | undefined;
+	#lifecycleWaiters = new Map<string, () => void>();
 
 	constructor(options: ReviewSchedulerOptions) {
 		this.#clock = options.clock;
@@ -196,9 +255,15 @@ export class ReviewScheduler {
 		this.#requester = options.requester;
 		this.#store = options.store;
 		this.#nonceSource = options.nonceSource ?? randomUUID;
+		this.#requestReceiptTimeoutMs = options.requestReceiptTimeoutMs ?? DEFAULT_REQUEST_RECEIPT_TIMEOUT_MS;
+		this.#requestTimeout = options.requestTimeout ?? waitForTimeout;
+		this.#dedupeArchive = options.dedupeArchive;
 		this.#maxQueueSize = options.maxQueueSize ?? DEFAULT_MAX_QUEUE_SIZE;
 		if (!Number.isInteger(this.#maxQueueSize) || this.#maxQueueSize < 1 || this.#maxQueueSize > 10_000) {
 			throw new Error("maxQueueSize must be an integer between 1 and 10000");
+		}
+		if (!Number.isSafeInteger(this.#requestReceiptTimeoutMs) || this.#requestReceiptTimeoutMs < 1) {
+			throw new Error("requestReceiptTimeoutMs must be a positive safe integer");
 		}
 	}
 
@@ -228,7 +293,7 @@ export class ReviewScheduler {
 			const forceNonce = input.force ? this.#validatedNonce() : undefined;
 			const dedupeKey = forceNonce ? buildForcedReviewDedupeKey(baseDedupeKey, forceNonce) : baseDedupeKey;
 			const existing = this.#findIntent(dedupeKey);
-			if (existing || this.#dedupeLedger.has(dedupeKey)) {
+			if (existing || this.#dedupeLedger.has(dedupeKey) || (await this.#dedupeArchive?.has(dedupeKey))) {
 				return frozenClone({
 					kind: "deduplicated" as const,
 					intent: existing ?? this.#historicalIntent(input, baseDedupeKey, forceNonce, dedupeKey),
@@ -275,9 +340,37 @@ export class ReviewScheduler {
 		});
 	}
 
+	archiveDedupeLedger(reason: string): Promise<ReviewDedupeArchiveReceipt> {
+		return this.#serialize(async () => {
+			if (!this.#dedupeArchive) throw new Error("review dedupe archive is not configured");
+			const normalizedReason = boundedArchiveString("archive reason", reason);
+			const retained = new Set(
+				[...this.#queued, ...(this.#inFlight ? [this.#inFlight] : []), ...this.#completed].map(
+					(intent) => intent.dedupeKey,
+				),
+			);
+			const keys = [...this.#dedupeLedger].filter((key) => !retained.has(key));
+			if (keys.length === 0) throw new Error("review dedupe ledger has no compacted keys to archive");
+			const archivedAt = safeNow(this.#clock);
+			const result = await this.#dedupeArchive.archive(
+				frozenClone({ reason: normalizedReason, archivedAt, keys }),
+			);
+			const archiveId = boundedArchiveString("archiveId", result?.archiveId);
+			const previousLedger = this.#dedupeLedger;
+			this.#dedupeLedger = new Set([...previousLedger].filter((key) => retained.has(key)));
+			try {
+				await this.#persist();
+			} catch (error) {
+				this.#dedupeLedger = previousLedger;
+				throw error;
+			}
+			return Object.freeze({ archiveId, archivedCount: keys.length, reason: normalizedReason, archivedAt });
+		});
+	}
+
 	pump(): Promise<void> {
 		if (this.#pumping) return this.#pumping;
-		this.#pumping = this.#pumpOnce().finally(() => {
+		this.#pumping = this.#pumpUntilBlocked().finally(() => {
 			this.#pumping = undefined;
 		});
 		return this.#pumping;
@@ -299,6 +392,7 @@ export class ReviewScheduler {
 				sortQueue(this.#queued);
 			}
 			await this.#persist();
+			this.#lifecycleWaiters.get(event.reviewId)?.();
 		});
 	}
 
@@ -306,7 +400,13 @@ export class ReviewScheduler {
 		return frozenClone(this.#state());
 	}
 
-	async #pumpOnce(): Promise<void> {
+	async #pumpUntilBlocked(): Promise<void> {
+		while (await this.#pumpOnce()) {
+			// A lifecycle terminal released a silent request; dispatch the next due item.
+		}
+	}
+
+	async #pumpOnce(): Promise<boolean> {
 		const candidate = await this.#serialize(async () => {
 			if (this.#inFlight) return undefined;
 			const now = safeNow(this.#clock);
@@ -317,9 +417,11 @@ export class ReviewScheduler {
 			if (!Number.isSafeInteger(attempt) || attempt > REVIEW_RETRY_MAX_ATTEMPT) {
 				throw new Error("review attempt capacity exceeded");
 			}
-			const index = this.#queued.findIndex((item) => item.sequence === queued.sequence);
+			const index = this.#queued.findIndex((item) => item.dedupeKey === queued.dedupeKey);
 			if (index < 0) return undefined;
-			this.#queued.splice(index, 1);
+			const previousQueue = this.#queued;
+			const previousInFlight = this.#inFlight;
+			this.#queued = this.#queued.filter((_, queuedIndex) => queuedIndex !== index);
 			const active: ReviewIntent = Object.freeze({
 				...queued,
 				attempt,
@@ -328,17 +430,33 @@ export class ReviewScheduler {
 				updatedAt: now,
 			});
 			this.#inFlight = active;
-			await this.#persist();
+			try {
+				await this.#persist();
+			} catch (error) {
+				this.#queued = previousQueue;
+				this.#inFlight = previousInFlight;
+				throw error;
+			}
 			return active;
 		});
-		if (!candidate) return;
+		if (!candidate) return false;
 
-		let receipt: AdvisorReviewReceipt | undefined;
-		try {
-			receipt = await this.#requester(requestFor(candidate));
-		} catch {
-			// Reconciled below; a terminal lifecycle may already have won the race.
-		}
+		const abortTimeout = new AbortController();
+		const lifecycle = new Promise<{ kind: "lifecycle" }>((resolve) => {
+			this.#lifecycleWaiters.set(candidate.reviewId, () => resolve({ kind: "lifecycle" }));
+		});
+		const request = this.#requester(requestFor(candidate)).then(
+			(receipt) => ({ kind: "receipt" as const, receipt }),
+			() => ({ kind: "request_failed" as const }),
+		);
+		const timeout = this.#requestTimeout(this.#requestReceiptTimeoutMs, abortTimeout.signal).then(() => ({
+			kind: "timeout" as const,
+		}));
+		const outcome = await Promise.race([request, lifecycle, timeout]);
+		abortTimeout.abort();
+		this.#lifecycleWaiters.delete(candidate.reviewId);
+		if (outcome.kind === "lifecycle") return true;
+		const receipt = outcome.kind === "receipt" ? outcome.receipt : undefined;
 		await this.#serialize(async () => {
 			if (this.#inFlight?.reviewId !== candidate.reviewId) return;
 			if (receipt?.status === "accepted" && receipt.reviewId === candidate.reviewId) return;
@@ -348,6 +466,7 @@ export class ReviewScheduler {
 			sortQueue(this.#queued);
 			await this.#persist();
 		});
+		return false;
 	}
 
 	#stall(intent: ReviewIntent): ReviewIntent {
@@ -357,11 +476,7 @@ export class ReviewScheduler {
 	}
 
 	#validatedNonce(): string {
-		const nonce = this.#nonceSource();
-		if (typeof nonce !== "string" || nonce.length === 0 || nonce.length > REVIEW_INTENT_MAX_STRING_LENGTH) {
-			throw new Error("nonceSource must return a bounded non-empty string");
-		}
-		return nonce;
+		return validatedNonce(this.#nonceSource());
 	}
 
 	#findIntent(dedupeKey: string): ReviewIntent | undefined {
@@ -415,9 +530,12 @@ export class ReviewScheduler {
 		const inFlight = raw.inFlight ? this.#validatePersistedIntent(raw.inFlight, ["in_flight"]) : undefined;
 		const all = [...queued, ...(inFlight ? [inFlight] : []), ...completed];
 		const intentKeys = new Set<string>();
+		const sequences = new Set<number>();
 		for (const item of all) {
 			if (intentKeys.has(item.dedupeKey)) throw new Error("duplicate persisted review dedupeKey");
 			intentKeys.add(item.dedupeKey);
+			if (sequences.has(item.sequence)) throw new Error("duplicate persisted review sequence");
+			sequences.add(item.sequence);
 		}
 		const ledger = new Set<string>();
 		for (const key of raw.dedupeLedger) {
@@ -431,7 +549,7 @@ export class ReviewScheduler {
 			if (!ledger.has(key)) throw new Error("persisted intent is missing from dedupe ledger");
 		}
 		const maximumSequence = all.reduce((maximum, item) => Math.max(maximum, item.sequence), -1);
-		if (raw.nextSequence <= maximumSequence) throw new Error("persisted nextSequence is inconsistent");
+		if (raw.nextSequence !== maximumSequence + 1) throw new Error("persisted nextSequence is inconsistent");
 		return { queued, inFlight, completed, dedupeLedger: ledger, nextSequence: raw.nextSequence };
 	}
 
@@ -456,7 +574,7 @@ export class ReviewScheduler {
 			throw new Error("invalid persisted review intent");
 		}
 		const baseDedupeKey = buildReviewDedupeKey(input);
-		const forceNonce = candidate.forceNonce;
+		const forceNonce = candidate.forceNonce === undefined ? undefined : validatedNonce(candidate.forceNonce);
 		if (
 			candidate.baseDedupeKey !== baseDedupeKey ||
 			(input.force ? typeof forceNonce !== "string" || forceNonce.length === 0 : forceNonce !== undefined)

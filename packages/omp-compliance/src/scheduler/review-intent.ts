@@ -140,28 +140,45 @@ function sanitizeMetadata(metadata: ReviewIntentInput["metadata"]): Readonly<Rec
 }
 
 export function normalizeReviewIntentInput(input: ReviewIntentInput): ReviewIntentInput {
-	if (input === null || typeof input !== "object" || utilTypes.isProxy(input)) {
+	if (
+		input === null ||
+		typeof input !== "object" ||
+		Array.isArray(input) ||
+		utilTypes.isProxy(input) ||
+		(Object.getPrototypeOf(input) !== Object.prototype && Object.getPrototypeOf(input) !== null) ||
+		Object.getOwnPropertySymbols(input).length > 0
+	) {
 		throw new Error("review intent must be a plain object");
 	}
-	if (!Object.hasOwn(REVIEW_TRIGGER_PRIORITIES, input.trigger)) throw new Error("trigger is not supported");
-	const expectedPriority = REVIEW_TRIGGER_PRIORITIES[input.trigger];
-	if (input.priority !== expectedPriority) {
-		throw new Error(`priority for ${input.trigger} must be ${expectedPriority}`);
+	const descriptors = Object.getOwnPropertyDescriptors(input);
+	if (Object.values(descriptors).some((descriptor) => "get" in descriptor || "set" in descriptor)) {
+		throw new Error("review intent must be a plain object without accessors");
 	}
-	if (input.force !== undefined && typeof input.force !== "boolean") throw new Error("force must be boolean");
-	if (input.force && input.trigger !== "manual_review") throw new Error("force is only valid for manual_review");
+	const value = <K extends keyof ReviewIntentInput>(key: K): ReviewIntentInput[K] | undefined =>
+		descriptors[key]?.value as ReviewIntentInput[K] | undefined;
+	const trigger = value("trigger");
+	if (typeof trigger !== "string" || !Object.hasOwn(REVIEW_TRIGGER_PRIORITIES, trigger)) {
+		throw new Error("trigger is not supported");
+	}
+	const expectedPriority = REVIEW_TRIGGER_PRIORITIES[trigger as ReviewTrigger];
+	if (value("priority") !== expectedPriority) {
+		throw new Error(`priority for ${trigger} must be ${expectedPriority}`);
+	}
+	const force = value("force");
+	if (force !== undefined && typeof force !== "boolean") throw new Error("force must be boolean");
+	if (force && trigger !== "manual_review") throw new Error("force is only valid for manual_review");
 	return Object.freeze({
-		trigger: input.trigger,
+		trigger: trigger as ReviewTrigger,
 		priority: expectedPriority,
-		projectId: boundedString("projectId", input.projectId, true),
-		taskId: boundedString("taskId", input.taskId, false),
-		topicId: boundedString("topicId", input.topicId, false),
-		contractHash: boundedString("contractHash", input.contractHash, true),
-		evidenceRevision: boundedString("evidenceRevision", input.evidenceRevision, true),
-		gitHead: boundedString("gitHead", input.gitHead, true),
-		diffHash: boundedString("diffHash", input.diffHash, true),
-		force: input.force === true ? true : undefined,
-		metadata: sanitizeMetadata(input.metadata),
+		projectId: boundedString("projectId", value("projectId"), true),
+		taskId: boundedString("taskId", value("taskId"), false),
+		topicId: boundedString("topicId", value("topicId"), false),
+		contractHash: boundedString("contractHash", value("contractHash"), true),
+		evidenceRevision: boundedString("evidenceRevision", value("evidenceRevision"), true),
+		gitHead: boundedString("gitHead", value("gitHead"), true),
+		diffHash: boundedString("diffHash", value("diffHash"), true),
+		force: force === true ? true : undefined,
+		metadata: sanitizeMetadata(value("metadata")),
 	});
 }
 

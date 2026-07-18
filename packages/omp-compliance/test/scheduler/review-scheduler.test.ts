@@ -12,6 +12,7 @@ import type { ReviewIntentInput } from "../../src/scheduler/review-intent";
 import {
 	JsonFileReviewSchedulerStore,
 	ReviewScheduler,
+	type ReviewDedupeArchive,
 	type ReviewSchedulerState,
 	type ReviewSchedulerStore,
 } from "../../src/scheduler/review-scheduler";
@@ -83,6 +84,8 @@ function harness(
 		nonceSource?: () => string;
 		requester?: (request: AdvisorReviewRequest) => Promise<AdvisorReviewReceipt>;
 		clock?: FakeClock;
+		requestTimeout?: (delayMs: number, signal: AbortSignal) => Promise<void>;
+		dedupeArchive?: ReviewDedupeArchive;
 	} = {},
 ) {
 	const clock = options.clock ?? new FakeClock();
@@ -95,6 +98,8 @@ function harness(
 		store,
 		maxQueueSize: options.maxQueueSize,
 		nonceSource: options.nonceSource,
+		requestTimeout: options.requestTimeout,
+		dedupeArchive: options.dedupeArchive,
 		requester:
 			options.requester ??
 			(async (request) => {
@@ -485,5 +490,149 @@ describe("ReviewScheduler", () => {
 		await restored.scheduler.restore();
 		await expect(restored.scheduler.pump()).rejects.toThrow("attempt capacity");
 		expect(restored.scheduler.snapshot().queued).toHaveLength(1);
+	});
+
+	it("releases a never-settling requester on lifecycle completion and dispatches the next item", async () => {
+		const requests: AdvisorReviewRequest[] = [];
+		let timeout: (() => void) | undefined;
+		const { scheduler } = harness({
+			requester: (request) => {
+				requests.push(request);
+				if (request.metadata?.taskId === "second") {
+					return Promise.resolve({ reviewId: request.reviewId, status: "accepted" });
+				}
+				return new Promise<AdvisorReviewReceipt>(() => undefined);
+			},
+			requestTimeout: () =>
+				new Promise<void>((resolve) => {
+					timeout = resolve;
+				}),
+		});
+		await scheduler.enqueue(intent({ trigger: "compliance_review", priority: 100, taskId: "first" }));
+		await scheduler.enqueue(intent({ trigger: "manual_review", priority: 80, taskId: "second" }));
+		const pumping = scheduler.pump();
+		while (!requests[0]) await Promise.resolve();
+		await scheduler.handleLifecycle(terminal(defined(requests[0]).reviewId, "advisor_run_completed"));
+		await pumping;
+		expect(requests.map((request) => request.metadata?.taskId)).toEqual(["first", "second"]);
+		defined(timeout)();
+	});
+
+	it("times out a silent requester without sleeping and ignores its late receipt", async () => {
+		let resolveRequest: ((receipt: AdvisorReviewReceipt) => void) | undefined;
+		let expire: (() => void) | undefined;
+		const { scheduler } = harness({
+			requester: (request) =>
+				new Promise<AdvisorReviewReceipt>((resolve) => {
+					resolveRequest = resolve;
+				}),
+			requestTimeout: () =>
+				new Promise<void>((resolve) => {
+					expire = resolve;
+				}),
+		});
+		await scheduler.enqueue(intent());
+		const pumping = scheduler.pump();
+		while (!expire) await Promise.resolve();
+		defined(expire)();
+		await pumping;
+		expect(scheduler.snapshot().queued[0]?.status).toBe("stalled");
+		const timedOut = defined(scheduler.snapshot().queued[0]);
+		defined(resolveRequest)({ reviewId: timedOut.reviewId, status: "accepted" });
+		await Promise.resolve();
+		expect(scheduler.snapshot().queued[0]?.status).toBe("stalled");
+	});
+
+	it("rejects duplicate persisted sequences and requires nextSequence to be exact", async () => {
+		const store = new MemoryStore();
+		const seeded = harness({ store });
+		await seeded.scheduler.enqueue(intent({ taskId: "one" }));
+		await seeded.scheduler.enqueue(intent({ taskId: "two" }));
+		const state = defined(store.state);
+		const [one, two] = state.queued;
+		store.state = { ...state, queued: [defined(one), { ...defined(two), sequence: defined(one).sequence }] };
+		await expect(harness({ store }).scheduler.restore()).rejects.toThrow("sequence");
+		store.state = { ...state, nextSequence: state.nextSequence + 1 };
+		await expect(harness({ store }).scheduler.restore()).rejects.toThrow("nextSequence");
+	});
+
+	it("rejects root intent accessors, proxies, arrays, and non-plain prototypes without invoking getters", async () => {
+		const { scheduler } = harness();
+		let reads = 0;
+		const accessor = Object.defineProperty(intent(), "trigger", {
+			enumerable: true,
+			get: () => {
+				reads++;
+				return "file_change";
+			},
+		});
+		await expect(scheduler.enqueue(accessor)).rejects.toThrow("plain object");
+		expect(reads).toBe(0);
+		await expect(scheduler.enqueue(new Proxy(intent(), {}) as ReviewIntentInput)).rejects.toThrow("plain object");
+		await expect(scheduler.enqueue([] as unknown as ReviewIntentInput)).rejects.toThrow("plain object");
+		await expect(
+			scheduler.enqueue(Object.assign(Object.create({ inherited: true }), intent()) as ReviewIntentInput),
+		).rejects.toThrow("plain object");
+	});
+
+	it("applies runtime nonce bounds while restoring forced review intents", async () => {
+		const store = new MemoryStore();
+		const seeded = harness({ store, nonceSource: () => "valid-nonce" });
+		await seeded.scheduler.enqueue(intent({ trigger: "manual_review", priority: 80, force: true }));
+		const state = defined(store.state);
+		const queued = defined(state.queued[0]);
+		store.state = { ...state, queued: [{ ...queued, forceNonce: "x".repeat(257) }] };
+		await expect(harness({ store }).scheduler.restore()).rejects.toThrow("nonce");
+	});
+
+	it("archives compacted dedupe keys without losing permanent duplicate detection", async () => {
+		const keys = new Set<string>();
+		const batches: Array<{ reason: string; keys: readonly string[] }> = [];
+		const archive: ReviewDedupeArchive = {
+			async has(key) {
+				return keys.has(key);
+			},
+			async archive(batch) {
+				batches.push(batch);
+				for (const key of batch.keys) keys.add(key);
+				return { archiveId: `archive-${batches.length}` };
+			},
+		};
+		const { scheduler } = harness({ dedupeArchive: archive });
+		const firstInput = intent({ taskId: "archived-first" });
+		for (let index = 0; index < 257; index++) {
+			await scheduler.enqueue(intent({ taskId: index === 0 ? "archived-first" : `archive-${index}` }));
+			await scheduler.pump();
+			await scheduler.handleLifecycle(
+				terminal(defined(scheduler.snapshot().inFlight).reviewId, "advisor_run_completed"),
+			);
+		}
+		const receipt = await scheduler.archiveDedupeLedger("季度去重账本归档");
+		expect(receipt).toMatchObject({ archiveId: "archive-1", archivedCount: 1, reason: "季度去重账本归档" });
+		expect((await scheduler.enqueue(firstInput)).kind).toBe("deduplicated");
+	});
+
+	it("rolls an in-flight transition back to queued when persistence fails", async () => {
+		let saves = 0;
+		let requests = 0;
+		const store: ReviewSchedulerStore = {
+			load: async () => undefined,
+			async save() {
+				saves++;
+				if (saves === 2) throw new Error("disk down");
+			},
+		};
+		const { scheduler } = harness({
+			store,
+			requester: async (request) => {
+				requests++;
+				return { reviewId: request.reviewId, status: "accepted" };
+			},
+		});
+		await scheduler.enqueue(intent());
+		await expect(scheduler.pump()).rejects.toThrow("disk down");
+		expect(requests).toBe(0);
+		expect(scheduler.snapshot()).toMatchObject({ inFlight: undefined });
+		expect(scheduler.snapshot().queued).toHaveLength(1);
 	});
 });
