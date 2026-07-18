@@ -236,6 +236,47 @@ describe("canonicalizeToolIdentity", () => {
 		expect(traps).toEqual({ getPrototypeOf: 0, ownKeys: 0, getOwnPropertyDescriptor: 0 });
 	});
 
+	it("xd 外层 args Proxy 在读取 path/content 前必须 fail closed", () => {
+		const traps = { get: 0, ownKeys: 0, getOwnPropertyDescriptor: 0 };
+		const target = { path: "xd://search_graph", content: '{"query":"proxy"}' };
+		const args = new Proxy(target, {
+			get: () => {
+				traps.get++;
+				throw new Error("不得读取 Proxy 字段");
+			},
+			ownKeys: () => {
+				traps.ownKeys++;
+				throw new Error("不得枚举 Proxy 键");
+			},
+			getOwnPropertyDescriptor: () => {
+				traps.getOwnPropertyDescriptor++;
+				throw new Error("不得读取 Proxy descriptor");
+			},
+		});
+
+		expect(() => canonicalizeToolIdentity({ toolName: "write", args })).not.toThrow();
+		expect(canonicalizeToolIdentity({ toolName: "write", args })).toBeNull();
+		expect(traps).toEqual({ get: 0, ownKeys: 0, getOwnPropertyDescriptor: 0 });
+	});
+
+	it("xd 外层 path/content 必须是 enumerable data property 且整体满足 JSON 边界", () => {
+		let reads = 0;
+		const accessor = Object.defineProperty({ content: '{"query":"accessor"}' }, "path", {
+			enumerable: true,
+			get: () => {
+				reads++;
+				return "xd://search_graph";
+			},
+		});
+		const hidden = Object.defineProperty({ content: '{"query":"hidden"}' }, "path", { value: "xd://search_graph" });
+		const nonJson = { path: "xd://search_graph", content: '{"query":"invalid"}', extra: undefined };
+
+		for (const args of [accessor, hidden, nonJson]) {
+			expect(canonicalizeToolIdentity({ toolName: "write", args })).toBeNull();
+		}
+		expect(reads).toBe(0);
+	});
+
 	it("规范化 xd 外层 write", () => {
 		expectIdentity(
 			canonicalizeToolIdentity({

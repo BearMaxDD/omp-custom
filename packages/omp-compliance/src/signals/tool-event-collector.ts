@@ -16,6 +16,7 @@
 
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
+import { types as utilTypes } from "node:util";
 import type {
 	ExtensionContext,
 	ToolCallEvent,
@@ -285,6 +286,10 @@ function sanitizeDetailJson(
 		state.incomplete = true;
 		return boundedJsonString(`[Unsupported:${typeof value}]`, maxBytes, state);
 	}
+	if (utilTypes.isProxy(value)) {
+		state.incomplete = true;
+		return boundedJsonString("[Proxy]", maxBytes, state);
+	}
 	if (ancestors.has(value)) {
 		state.incomplete = true;
 		return boundedJsonString("[Circular]", maxBytes, state);
@@ -301,9 +306,21 @@ function sanitizeDetailJson(
 			if (value.length > DETAILS_MAX_ARRAY) state.incomplete = true;
 			const parts: string[] = [];
 			let used = 2;
-			for (const item of value.slice(0, DETAILS_MAX_ARRAY)) {
+			const retainedLength = Math.min(value.length, DETAILS_MAX_ARRAY);
+			for (let index = 0; index < retainedLength; index++) {
+				const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+				if (!descriptor?.enumerable || !("value" in descriptor)) {
+					state.incomplete = true;
+					break;
+				}
 				const separatorBytes = parts.length === 0 ? 0 : 1;
-				const child = sanitizeDetailJson(item, depth + 1, ancestors, maxBytes - used - separatorBytes, state);
+				const child = sanitizeDetailJson(
+					descriptor.value,
+					depth + 1,
+					ancestors,
+					maxBytes - used - separatorBytes,
+					state,
+				);
 				if (child === null) {
 					state.incomplete = true;
 					break;
@@ -326,18 +343,13 @@ function sanitizeDetailJson(
 				state.incomplete = true;
 				break;
 			}
+			const descriptor = Object.getOwnPropertyDescriptor(value, key);
 			let child: string | null;
-			try {
-				child = sanitizeDetailJson(
-					(value as Record<string, unknown>)[key],
-					depth + 1,
-					ancestors,
-					maxBytes - used - overhead,
-					state,
-				);
-			} catch {
+			if (!descriptor?.enumerable || !("value" in descriptor)) {
 				state.incomplete = true;
 				child = boundedJsonString("[Unreadable]", maxBytes - used - overhead, state);
+			} else {
+				child = sanitizeDetailJson(descriptor.value, depth + 1, ancestors, maxBytes - used - overhead, state);
 			}
 			if (child === null) {
 				state.incomplete = true;
@@ -378,6 +390,10 @@ function summarizeFailures(
 	},
 ): { failure: boolean; incomplete: boolean } {
 	if (typeof value !== "object" || value === null) return { failure: false, incomplete: false };
+	if (utilTypes.isProxy(value)) {
+		state.incomplete = true;
+		return { failure: false, incomplete: true };
+	}
 	if (ancestors.has(value) || depth >= FAILURE_SCAN_MAX_DEPTH) {
 		state.incomplete = true;
 		return { failure: false, incomplete: true };
@@ -397,15 +413,19 @@ function summarizeFailures(
 				break;
 			}
 			state.remainingKeys--;
-			let child: unknown;
-			try {
-				child = (value as Record<string, unknown>)[key];
-			} catch {
+			const descriptor = Object.getOwnPropertyDescriptor(value, key);
+			if (!descriptor?.enumerable || !("value" in descriptor)) {
 				state.incomplete = true;
 				continue;
 			}
+			const child = descriptor.value;
 			if (["exitCode", "exit", "code"].includes(key)) {
-				const exitCode = typeof child === "number" ? child : Number(child);
+				const exitCode =
+					typeof child === "number"
+						? child
+						: typeof child === "string" && child.trim() !== ""
+							? Number(child)
+							: Number.NaN;
 				if (Number.isFinite(exitCode) && exitCode !== 0) failure = true;
 			}
 			if (["status", "state"].includes(key) && typeof child === "string") {
@@ -456,6 +476,18 @@ export class ToolEventCollector {
 			toolCallId = boundedIdentifier(String(event.toolCallId ?? `${toolName}-${Date.now()}`));
 			serverName = event.serverName ? String(event.serverName) : undefined;
 			input = event.params ?? {};
+		}
+		if (utilTypes.isProxy(input)) {
+			if (toolName === "write") {
+				this.recordInvalidXdev(
+					toolCallId,
+					"invalid_content",
+					context,
+					undefined,
+					isOfficialToolCallEvent(event) ? "official" : "legacy",
+				);
+			}
+			return;
 		}
 
 		const classified = classifyToolCallEvent(event);
@@ -917,6 +949,9 @@ export class ToolEventCollector {
 
 	private extractStructuredDetails(event: ToolResultEvent | LegacySyntheticToolResultEvent): DetailSummary {
 		const value = isOfficialToolResultEvent(event) ? event.details : event.result;
+		if (typeof value === "object" && value !== null && utilTypes.isProxy(value)) {
+			return { truncated: true, failure: false };
+		}
 		if (typeof value !== "object" || value === null || Array.isArray(value)) {
 			return { truncated: false, failure: false };
 		}

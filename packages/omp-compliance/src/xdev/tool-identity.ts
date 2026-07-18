@@ -152,6 +152,7 @@ export function canonicalJson(value: unknown): string | null {
 					enumerableIndex++;
 				}
 				if (enumerableIndex !== current.length) return null;
+				// ECMAScript has no incremental own-key iterator; run the complete hidden/Symbol check only after length budgeting.
 				const ownKeys = Reflect.ownKeys(current);
 				if (ownKeys.length !== current.length + 1) return null;
 				for (const key of ownKeys) {
@@ -200,6 +201,7 @@ export function canonicalJson(value: unknown): string | null {
 				if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) return null;
 				entries.push({ key, value: descriptor.value });
 			}
+			// The enumerable projection is byte-bounded above before paying the unavoidable complete own-key validation cost.
 			const ownKeys = Reflect.ownKeys(current);
 			if (ownKeys.length !== entries.length) return null;
 			const entriesByKey = new Map(entries.map((entry) => [entry.key, entry]));
@@ -236,12 +238,25 @@ export function canonicalArgsFingerprint(value: unknown): `sha256:${string}` | n
 }
 
 function parseXdevArgs(args: unknown): { toolName: string; args: Record<string, unknown> } | null {
-	if (!isRecord(args) || typeof args.path !== "string" || typeof args.content !== "string") return null;
-	const path = args.path.trim();
+	if (typeof args !== "object" || args === null || utilTypes.isProxy(args) || !isRecord(args)) return null;
+	if (canonicalJson(args) === null) return null;
+	const pathDescriptor = Object.getOwnPropertyDescriptor(args, "path");
+	const contentDescriptor = Object.getOwnPropertyDescriptor(args, "content");
+	if (
+		!pathDescriptor?.enumerable ||
+		!("value" in pathDescriptor) ||
+		typeof pathDescriptor.value !== "string" ||
+		!contentDescriptor?.enumerable ||
+		!("value" in contentDescriptor) ||
+		typeof contentDescriptor.value !== "string"
+	) {
+		return null;
+	}
+	const path = pathDescriptor.value.trim();
 	if (!path.toLowerCase().startsWith("xd://")) return null;
 	const toolName = path.slice("xd://".length);
 	if (!toolName || /[/?#\\]/.test(toolName) || toolName === "." || toolName === "..") return null;
-	const content = args.content.trim();
+	const content = contentDescriptor.value.trim();
 	if (HELP_CONTENT_RE.test(content)) return null;
 	let parsed: unknown;
 	try {

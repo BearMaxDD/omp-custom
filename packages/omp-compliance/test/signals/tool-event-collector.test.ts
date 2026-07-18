@@ -156,6 +156,31 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 		expect(snap.codebaseMemory.references).toEqual(["packages/omp-compliance/src/signals/tool-event-collector.ts"]);
 	});
 
+	it("xd 外层 input Proxy 在 collector 分类前拒绝且不触发 trap", () => {
+		const traps = { get: 0, ownKeys: 0, getOwnPropertyDescriptor: 0 };
+		const target = { path: "xd://search_graph", content: '{"query":"proxy"}' };
+		const input = new Proxy(target, {
+			get: () => {
+				traps.get++;
+				throw new Error("不得读取 Proxy 字段");
+			},
+			ownKeys: () => {
+				traps.ownKeys++;
+				throw new Error("不得枚举 Proxy 键");
+			},
+			getOwnPropertyDescriptor: () => {
+				traps.getOwnPropertyDescriptor++;
+				throw new Error("不得读取 Proxy descriptor");
+			},
+		});
+
+		expect(() => collector.recordCall(makeCall("write", input, "xd-proxy-input"))).not.toThrow();
+		expect(traps).toEqual({ get: 0, ownKeys: 0, getOwnPropertyDescriptor: 0 });
+		expect(collector.snapshot().calls).toContainEqual(
+			expect.objectContaining({ toolName: "invalid_xdev_event", params: { reason: "invalid_content" } }),
+		);
+	});
+
 	it("外层 xd 与同 id 内层事件按 canonical identity 去重且结果保持关联", () => {
 		collector.recordCall(makeCall("write", { path: "xd://search_graph", content: '{"query":"same"}' }, "shared"));
 		collector.recordCall(makeCall("mcp__codebase_memory_mcp__search_graph", { query: "same" }, "shared"));
@@ -852,6 +877,85 @@ describe("ToolEventCollector — recordCall / recordResult 记录与关联", () 
 
 		expect(reads).toBeLessThan(10_000);
 		expect(collector.snapshot().results[0].detailsTruncated).toBe(true);
+	});
+
+	it.each(["object", "array"] as const)("structured details 中的 %s Proxy 不触发 trap 并 fail closed", (kind) => {
+		const traps = { get: 0, ownKeys: 0, getOwnPropertyDescriptor: 0 };
+		const target: Record<string, unknown> | unknown[] = kind === "array" ? [] : { results: [] };
+		const proxy = new Proxy(target, {
+			get: () => {
+				traps.get++;
+				throw new Error("不得读取 Proxy 字段");
+			},
+			ownKeys: () => {
+				traps.ownKeys++;
+				throw new Error("不得枚举 Proxy 键");
+			},
+			getOwnPropertyDescriptor: () => {
+				traps.getOwnPropertyDescriptor++;
+				throw new Error("不得读取 Proxy descriptor");
+			},
+		});
+		const details = kind === "object" ? proxy : { results: proxy };
+		const id = `proxy-details-${kind}`;
+		collector.recordCall(makeCall("task", { task: "Proxy details" }, id));
+
+		expect(() =>
+			collector.recordResult({
+				type: "tool_result",
+				toolName: "task",
+				toolCallId: id,
+				input: { task: "Proxy details" },
+				isError: false,
+				content: [{ type: "text", text: "completed" }],
+				details,
+			} as ToolResultEvent),
+		).not.toThrow();
+
+		const snap = collector.snapshot();
+		expect(traps).toEqual({ get: 0, ownKeys: 0, getOwnPropertyDescriptor: 0 });
+		expect(snap.results[0]).toMatchObject({ detailsTruncated: true });
+		expect(snap.subagentDelegations[0]).toMatchObject({ status: "insufficient" });
+	});
+
+	it.each(["object", "array"] as const)("structured details 中的 %s accessor 不执行并标记不完整", (kind) => {
+		let reads = 0;
+		let details: Record<string, unknown>;
+		if (kind === "object") {
+			details = Object.defineProperty({}, "results", {
+				enumerable: true,
+				get: () => {
+					reads++;
+					return [];
+				},
+			});
+		} else {
+			const results: unknown[] = [];
+			Object.defineProperty(results, "0", {
+				enumerable: true,
+				get: () => {
+					reads++;
+					return { exitCode: 0 };
+				},
+			});
+			details = { results };
+		}
+		const id = `accessor-details-${kind}`;
+		collector.recordCall(makeCall("task", { task: "Accessor details" }, id));
+		collector.recordResult({
+			type: "tool_result",
+			toolName: "task",
+			toolCallId: id,
+			input: { task: "Accessor details" },
+			isError: false,
+			content: [{ type: "text", text: "completed" }],
+			details,
+		} as ToolResultEvent);
+
+		const snap = collector.snapshot();
+		expect(reads).toBe(0);
+		expect(snap.results[0]).toMatchObject({ detailsTruncated: true });
+		expect(snap.subagentDelegations[0]).toMatchObject({ status: "insufficient" });
 	});
 
 	it("2MiB 长期字符串字段与 Map key 均保持固定字节预算", () => {
