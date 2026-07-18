@@ -1,7 +1,9 @@
 import { posix } from "node:path";
 import { types as utilTypes } from "node:util";
 import type { TaskContract } from "../contract/types";
-import type { CodebaseEvidencePack } from "../signals/types";
+import { validateTaskContractIntegrity } from "../contracts/task-contract";
+import { validateCodebasePack } from "../signals/codebase-memory";
+import type { CodebaseEvidencePack, TrustedCodebaseValidationContext } from "../signals/types";
 import {
 	CANONICAL_CODEBASE_SERVER_ID,
 	codebaseToolAccess,
@@ -31,13 +33,14 @@ const READ_ONLY_COMMANDS = new Set([
 	"wc",
 	"which",
 ]);
-const READ_ONLY_GIT_COMMANDS = new Set(["diff", "grep", "log", "ls-files", "rev-parse", "show", "status"]);
+const READ_ONLY_GIT_COMMANDS = new Set(["diff", "grep", "log", "ls-files", "rev-parse", "show"]);
 const SIMPLE_MUTATION_COMMANDS = new Set(["mkdir", "rm", "rmdir", "touch", "truncate", "unlink"]);
 
 export type PreToolActor = "main" | "advisor";
 export type PreToolDenyReason =
 	| "advisor_tool_forbidden"
 	| "invalid_input"
+	| "invalid_codebase_evidence"
 	| "missing_codebase_evidence"
 	| "missing_contract"
 	| "scope_violation"
@@ -62,6 +65,7 @@ export interface PreToolContext {
 	readonly evidenceRevision: `sha256:${string}`;
 	readonly contract?: TaskContract;
 	readonly codebasePack?: CodebaseEvidencePack;
+	readonly trustedCodebaseContext?: TrustedCodebaseValidationContext;
 }
 
 export type PreToolDecision =
@@ -76,7 +80,18 @@ export interface PreToolBlockedEvidence {
 	readonly event: "tool_call_blocked";
 	readonly task: string;
 	readonly call: string;
+	readonly actor: PreToolActor | "unknown";
+	readonly canonicalServer: string;
+	readonly canonicalTool: string;
+	readonly qualifiedName: string;
+	readonly argsFingerprint: string;
+	readonly callEvidenceRevision: string;
+	readonly contextEvidenceRevision?: string;
+	readonly packEvidenceRevision?: string;
+	readonly contractRevision?: string;
 	readonly reason: PreToolDenyReason;
+	readonly remediationHint: string;
+	readonly remediationAction: string;
 }
 
 export interface PreToolEvidenceSink {
@@ -93,6 +108,18 @@ interface ValidatedCall {
 }
 
 type ShellClassification = { kind: "read" } | { kind: "write"; targets: readonly string[] | null };
+
+const REMEDIATION_HINT = "A pre-tool policy requirement was not satisfied.";
+const REMEDIATION_ACTIONS: Readonly<Record<PreToolDenyReason, string>> = {
+	advisor_tool_forbidden: "Use only canonical read-only Codebase tools from the Advisor.",
+	invalid_input: "Submit a bounded canonical tool call with plain data-only inputs.",
+	invalid_codebase_evidence: "Rebuild trusted Codebase evidence from the controlled collector before retrying.",
+	missing_codebase_evidence: "Provide a trusted Codebase context and its validated Evidence Pack before retrying.",
+	missing_contract: "Provide a valid TaskContract before retrying the tool call.",
+	scope_violation: "Restrict mutation targets to the trusted contract and Codebase evidence scope.",
+	stale_evidence: "Refresh Codebase evidence and retry with the current evidence revision.",
+	unknown_tool: "Use a canonical tool identity explicitly supported by the pre-tool policy.",
+};
 
 function isPlainDataObject(value: unknown): value is Record<string, unknown> {
 	if (typeof value !== "object" || value === null || Array.isArray(value) || utilTypes.isProxy(value)) return false;
@@ -136,6 +163,55 @@ function safeEvidenceLabel(value: unknown, key: string, fallback: string): strin
 	} catch {
 		return fallback;
 	}
+}
+
+function safeRecord(value: unknown): Record<string, unknown> | null {
+	return isPlainDataObject(value) ? value : null;
+}
+
+function safeRecordProperty(record: Record<string, unknown> | null, key: string): Record<string, unknown> | null {
+	return record ? safeRecord(dataProperty(record, key)) : null;
+}
+
+function safeBoundedProperty(record: Record<string, unknown> | null, key: string, fallback: string): string {
+	if (!record) return fallback;
+	const value = dataProperty(record, key);
+	return boundedString(value) ? value : fallback;
+}
+
+function safeOptionalRevision(record: Record<string, unknown> | null, key: string): string | undefined {
+	if (!record) return undefined;
+	const value = dataProperty(record, key);
+	return validRevision(value) ? value : undefined;
+}
+
+function blockedEvidenceMetadata(
+	callInput: unknown,
+	contextInput: unknown,
+): Omit<PreToolBlockedEvidence, "event" | "task" | "call" | "reason" | "remediationHint" | "remediationAction"> {
+	const call = safeRecord(callInput);
+	const identity = safeRecordProperty(call, "identity");
+	const context = safeRecord(contextInput);
+	const contract = safeRecordProperty(context, "contract");
+	const pack = safeRecordProperty(context, "codebasePack");
+	const actor = call ? dataProperty(call, "actor") : undefined;
+	return {
+		actor: actor === "main" || actor === "advisor" ? actor : "unknown",
+		canonicalServer: safeBoundedProperty(identity, "serverId", "<invalid-server>"),
+		canonicalTool: safeBoundedProperty(identity, "toolName", "<invalid-tool>"),
+		qualifiedName: safeBoundedProperty(identity, "qualifiedName", "<invalid-qualified-name>"),
+		argsFingerprint: safeBoundedProperty(identity, "argsFingerprint", "<invalid-args-fingerprint>"),
+		callEvidenceRevision: safeBoundedProperty(call, "evidenceRevision", "<invalid-call-evidence-revision>"),
+		...(safeOptionalRevision(context, "evidenceRevision")
+			? { contextEvidenceRevision: safeOptionalRevision(context, "evidenceRevision") }
+			: {}),
+		...(safeOptionalRevision(pack, "evidenceRevision")
+			? { packEvidenceRevision: safeOptionalRevision(pack, "evidenceRevision") }
+			: {}),
+		...(safeOptionalRevision(contract, "revision")
+			? { contractRevision: safeOptionalRevision(contract, "revision") }
+			: {}),
+	};
 }
 
 function validRevision(value: unknown): value is `sha256:${string}` {
@@ -238,11 +314,13 @@ function validateContext(value: unknown): {
 	evidenceRevision: `sha256:${string}`;
 	contract?: TaskContract;
 	codebasePack?: CodebaseEvidencePack;
+	trustedCodebaseContext?: TrustedCodebaseValidationContext;
 } | null {
 	if (!isPlainDataObject(value)) return null;
 	const evidenceRevision = dataProperty(value, "evidenceRevision");
 	const contract = dataProperty(value, "contract");
 	const codebasePack = dataProperty(value, "codebasePack");
+	const trustedCodebaseContext = dataProperty(value, "trustedCodebaseContext");
 	if (!validRevision(evidenceRevision)) return null;
 	if (contract !== undefined && !isPlainDataObject(contract)) return null;
 	if (codebasePack !== undefined && !isPlainDataObject(codebasePack)) return null;
@@ -258,6 +336,7 @@ function validateContext(value: unknown): {
 		evidenceRevision,
 		contract: contract as TaskContract | undefined,
 		codebasePack: codebasePack as CodebaseEvidencePack | undefined,
+		trustedCodebaseContext: trustedCodebaseContext as TrustedCodebaseValidationContext | undefined,
 	};
 }
 
@@ -354,9 +433,18 @@ export class PreToolPolicy {
 	evaluate(callInput: CanonicalToolCall, contextInput: PreToolContext): PreToolDecision {
 		const task = safeEvidenceLabel(callInput, "taskId", "<invalid-task>");
 		const callId = safeEvidenceLabel(callInput, "callId", "<invalid-call>");
+		const evidenceMetadata = blockedEvidenceMetadata(callInput, contextInput);
 		const deny = (reason: PreToolDenyReason): PreToolDecision => {
 			try {
-				this.evidence.append({ event: "tool_call_blocked", task, call: callId, reason });
+				this.evidence.append({
+					event: "tool_call_blocked",
+					task,
+					call: callId,
+					...evidenceMetadata,
+					reason,
+					remediationHint: REMEDIATION_HINT,
+					remediationAction: REMEDIATION_ACTIONS[reason],
+				});
 				return { allow: false, reason };
 			} catch {
 				return { allow: false, reason, evidenceWriteFailed: true };
@@ -391,7 +479,31 @@ export class PreToolPolicy {
 		}
 
 		if (!context.contract) return deny("missing_contract");
-		if (!context.codebasePack) return deny("missing_codebase_evidence");
+		let validatedContract: TaskContract;
+		try {
+			validatedContract = validateTaskContractIntegrity(context.contract);
+		} catch {
+			return deny("invalid_codebase_evidence");
+		}
+		if (!context.codebasePack || !context.trustedCodebaseContext) return deny("missing_codebase_evidence");
+		try {
+			const packErrors = validateCodebasePack(context.codebasePack, context.trustedCodebaseContext);
+			if (packErrors.length > 0) return deny("invalid_codebase_evidence");
+		} catch {
+			return deny("invalid_codebase_evidence");
+		}
+		const trustedContract = context.trustedCodebaseContext.taskContract;
+		if (
+			validatedContract.revision !== trustedContract.revision ||
+			validatedContract.taskId !== trustedContract.taskId ||
+			validatedContract.projectId !== trustedContract.projectId ||
+			validatedContract.gitHead !== trustedContract.gitHead ||
+			validatedContract.revision !== context.codebasePack.taskContractRevision ||
+			validatedContract.projectId !== context.codebasePack.projectId ||
+			validatedContract.gitHead !== context.codebasePack.gitHead
+		) {
+			return deny("invalid_codebase_evidence");
+		}
 		if (
 			call.evidenceRevision !== context.evidenceRevision ||
 			call.evidenceRevision !== context.codebasePack.evidenceRevision
@@ -401,7 +513,7 @@ export class PreToolPolicy {
 
 		if (toolName === "task" || toolName === "hub") return { allow: true };
 		if (targets === null) return deny("scope_violation");
-		const contractPaths = normalizedPathList(context.contract.affectedFiles);
+		const contractPaths = normalizedPathList(validatedContract.affectedFiles);
 		const allowedRoots = normalizedPathList(context.codebasePack.allowedNewFileRoots);
 		if (
 			!contractPaths ||
