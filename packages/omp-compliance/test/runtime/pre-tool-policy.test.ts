@@ -268,6 +268,23 @@ describe("PreToolPolicy decision matrix", () => {
 		expect(decision).toEqual({ allow: false, reason: "missing_contract" });
 	});
 
+	it.each(["file -C -m src/existing.magic", "file --compile --magic-file src/existing.magic"])(
+		"does not treat a file magic compilation command as read-only: %s",
+		(command) => {
+			const policy = new PreToolPolicy(recorder().sink);
+			const decision = policy.evaluate(builtinCall("bash", { command }), {
+				evidenceRevision: REVISION,
+			});
+
+			expect(decision).toEqual({ allow: false, reason: "missing_contract" });
+
+			const valid = trustedEvidence();
+			expect(
+				policy.evaluate(builtinCall("bash", { command }, { evidenceRevision: valid.evidenceRevision }), valid),
+			).toEqual({ allow: false, reason: "scope_violation" });
+		},
+	);
+
 	it("applies scope gates to explicit shell mutation targets", () => {
 		const policy = new PreToolPolicy(recorder().sink);
 		const valid = trustedEvidence();

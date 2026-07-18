@@ -22,7 +22,6 @@ const READ_ONLY_COMMANDS = new Set([
 	"basename",
 	"cat",
 	"dirname",
-	"file",
 	"grep",
 	"head",
 	"ls",
