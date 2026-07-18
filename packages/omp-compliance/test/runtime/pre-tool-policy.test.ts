@@ -9,12 +9,19 @@ import {
 } from "../../src/signals/codebase-memory";
 import { createControlledCollectorRuntime } from "../../src/signals/collector-runtime";
 import type { CodebaseEvidencePack, TrustedCodebaseValidationContext } from "../../src/signals/types";
+import { READONLY_CODEBASE_TOOLS } from "../../src/xdev/codebase-tool-policy";
 import { canonicalArgsFingerprint, canonicalizeToolIdentity } from "../../src/xdev/tool-identity";
 
 const REVISION = `sha256:${"a".repeat(64)}` as const;
 const OTHER_REVISION = `sha256:${"b".repeat(64)}` as const;
 const PROJECT_ID = "123e4567-e89b-42d3-a456-426614174000";
 const CODEBASE_PROJECT_ID = "Users-mima1234-Code-super-omp-custom";
+const PROJECT_ROOT = "/Users/mima1234/Code/super/.worktrees/omp-custom-v17-adapter";
+const PROJECT_CONTEXT = Object.freeze({
+	projectId: PROJECT_ID,
+	root: PROJECT_ROOT,
+	codebaseProject: CODEBASE_PROJECT_ID,
+});
 const GIT_HEAD = "d919e373fe16bbe04794ebad1558bd157d3b3fc2";
 const QUERIED_AT = "2099-07-18T08:00:00.000Z";
 
@@ -47,8 +54,11 @@ function codebaseCall(
 	toolName: string,
 	actor: "main" | "advisor" = "main",
 	toolFqn = `mcp__codebase_memory_mcp__${toolName}`,
+	args: Record<string, unknown> = toolName === "index_repository"
+		? { repo_path: PROJECT_ROOT }
+		: { project: CODEBASE_PROJECT_ID },
 ): CanonicalToolCall {
-	const identity = canonicalizeToolIdentity({ toolName: toolFqn, args: { project: "omp-custom" } });
+	const identity = canonicalizeToolIdentity({ toolName: toolFqn, args });
 	if (!identity) throw new Error(`test identity must canonicalize: ${toolFqn}`);
 	return {
 		actor,
@@ -77,11 +87,13 @@ function contract(affectedFiles: readonly string[] = ["src/existing.ts"]): TaskC
 function trustedEvidence(
 	taskContract = contract(),
 	allowedNewFileRoots: readonly string[] = ["src/generated"],
+	newFiles: readonly string[] = [],
 ): {
 	contract: TaskContract;
 	trustedCodebaseContext: TrustedCodebaseValidationContext;
 	codebasePack: CodebaseEvidencePack;
 	evidenceRevision: `sha256:${string}`;
+	projectContext: typeof PROJECT_CONTEXT;
 } {
 	const controlled = createControlledCollectorRuntime();
 	const fixtures = [
@@ -132,8 +144,8 @@ function trustedEvidence(
 		currentDiffHash: `sha256:${"e".repeat(64)}`,
 		indexRevision: "index-13",
 		queriedAt: QUERIED_AT,
-		changedFiles: [],
-		newFiles: [],
+		changedFiles: newFiles,
+		newFiles,
 		allowedNewFileRoots,
 		unresolvedClaims: [],
 		requiredSymbols: [],
@@ -144,6 +156,7 @@ function trustedEvidence(
 		trustedCodebaseContext,
 		codebasePack,
 		evidenceRevision: codebasePack.evidenceRevision,
+		projectContext: PROJECT_CONTEXT,
 	};
 }
 
@@ -209,17 +222,31 @@ describe("PreToolPolicy decision matrix", () => {
 		expect(decision).toEqual({ allow: false, reason: "stale_evidence" });
 	});
 
-	it.each([
-		["existing contract target", "src/existing.ts"],
-		["new target under an allowed root", "src/generated/new.ts"],
-	] as const)("allows an edit to an %s", (_label, path) => {
+	it("allows an edit to an existing contract target", () => {
 		const valid = trustedEvidence();
 		const decision = new PreToolPolicy(recorder().sink).evaluate(
-			builtinCall("edit", { path }, { evidenceRevision: valid.evidenceRevision }),
+			builtinCall("edit", { path: "src/existing.ts" }, { evidenceRevision: valid.evidenceRevision }),
 			valid,
 		);
 
 		expect(decision).toEqual({ allow: true });
+	});
+
+	it("allows only new files explicitly captured by the trusted Codebase Pack", () => {
+		const valid = trustedEvidence(contract(), ["src/generated"], ["src/generated/new.ts"]);
+		const policy = new PreToolPolicy(recorder().sink);
+		expect(
+			policy.evaluate(
+				builtinCall("write", { path: "src/generated/new.ts" }, { evidenceRevision: valid.evidenceRevision }),
+				valid,
+			),
+		).toEqual({ allow: true });
+		expect(
+			policy.evaluate(
+				builtinCall("write", { path: "src/generated/unlisted.ts" }, { evidenceRevision: valid.evidenceRevision }),
+				valid,
+			),
+		).toEqual({ allow: false, reason: "scope_violation" });
 	});
 
 	it.each(["src/outside.ts", "../escape.ts", "/tmp/escape.ts", "src/generated/../escape.ts", "bad\0path"])(
@@ -341,21 +368,46 @@ describe("PreToolPolicy decision matrix", () => {
 });
 
 describe("PreToolPolicy canonical Codebase identities", () => {
-	it("allows canonical main-agent read-only Codebase tools", () => {
+	it.each([...READONLY_CODEBASE_TOOLS])("binds the canonical read-only %s tool to the current project", (toolName) => {
+		const policy = new PreToolPolicy(recorder().sink);
+		const context = { evidenceRevision: REVISION, projectContext: PROJECT_CONTEXT };
+		expect(policy.evaluate(codebaseCall(toolName), context)).toEqual({ allow: true });
+		expect(policy.evaluate(codebaseCall(toolName, "advisor"), context)).toEqual({ allow: true });
+		expect(policy.evaluate(codebaseCall(toolName), { evidenceRevision: REVISION })).toEqual({
+			allow: false,
+			reason: "project_identity_mismatch",
+		});
+		expect(policy.evaluate(codebaseCall(toolName, "main", undefined, {}), context)).toEqual({
+			allow: false,
+			reason: "project_identity_mismatch",
+		});
 		expect(
-			new PreToolPolicy(recorder().sink).evaluate(codebaseCall("search_graph"), { evidenceRevision: REVISION }),
-		).toEqual({ allow: true });
+			policy.evaluate(codebaseCall(toolName, "advisor", undefined, { project: "other-project" }), context),
+		).toEqual({ allow: false, reason: "project_identity_mismatch" });
+	});
+
+	it.each([
+		["non-canonical root", { ...PROJECT_CONTEXT, root: `${PROJECT_ROOT}/../omp-custom-v17-adapter` }],
+		["relative root", { ...PROJECT_CONTEXT, root: "Users/mima1234/Code/super" }],
+		["empty Codebase project", { ...PROJECT_CONTEXT, codebaseProject: "" }],
+		["oversized Codebase project", { ...PROJECT_CONTEXT, codebaseProject: "x".repeat(513) }],
+	] as const)("rejects a %s in the current project identity", (_label, projectContext) => {
+		expect(
+			new PreToolPolicy(recorder().sink).evaluate(codebaseCall("search_graph"), {
+				evidenceRevision: REVISION,
+				projectContext,
+			}),
+		).toEqual({ allow: false, reason: "project_identity_mismatch" });
 	});
 
 	it("allows only Advisor canonical read-only allowlist tools", () => {
 		const policy = new PreToolPolicy(recorder().sink);
-		expect(policy.evaluate(codebaseCall("get_code_snippet", "advisor"), { evidenceRevision: REVISION })).toEqual({
-			allow: true,
-		});
-		expect(policy.evaluate(codebaseCall("index_repository", "advisor"), { evidenceRevision: REVISION })).toEqual({
-			allow: false,
-			reason: "advisor_tool_forbidden",
-		});
+		expect(
+			policy.evaluate(codebaseCall("index_repository", "advisor"), {
+				evidenceRevision: REVISION,
+				projectContext: PROJECT_CONTEXT,
+			}),
+		).toEqual({ allow: false, reason: "advisor_tool_forbidden" });
 		expect(
 			policy.evaluate(builtinCall("edit", { path: "src/existing.ts" }, { actor: "advisor" }), {
 				evidenceRevision: REVISION,
@@ -364,11 +416,52 @@ describe("PreToolPolicy canonical Codebase identities", () => {
 	});
 
 	it("allows canonical main-agent index_repository and invalidates evidence without a Pack", () => {
-		const decision = new PreToolPolicy(recorder().sink).evaluate(codebaseCall("index_repository"), {
+		const policy = new PreToolPolicy(recorder().sink);
+		const decision = policy.evaluate(codebaseCall("index_repository"), {
 			evidenceRevision: REVISION,
+			projectContext: PROJECT_CONTEXT,
 		});
 
 		expect(decision).toEqual({ allow: true, invalidatesEvidence: true });
+		expect(policy.evaluate(codebaseCall("index_repository"), { evidenceRevision: REVISION })).toEqual({
+			allow: false,
+			reason: "project_identity_mismatch",
+		});
+	});
+
+	it.each([
+		["missing repo_path", {}],
+		["other repository", { repo_path: "/Users/mima1234/Code/other" }],
+		["symlink alias", { repo_path: "/tmp/omp-custom-v17-adapter-link" }],
+		["relative repository", { repo_path: "Users/mima1234/Code/super" }],
+		["parent traversal", { repo_path: `${PROJECT_ROOT}/../omp-custom-v17-adapter` }],
+		["non-canonical slash", { repo_path: `${PROJECT_ROOT}/` }],
+		["cross-repo mode", { repo_path: PROJECT_ROOT, cross_repo: true }],
+		["foreign target_projects", { repo_path: PROJECT_ROOT, target_projects: ["other-project"] }],
+	] as const)("blocks index_repository for %s", (_label, args) => {
+		const decision = new PreToolPolicy(recorder().sink).evaluate(
+			codebaseCall("index_repository", "main", undefined, args),
+			{ evidenceRevision: REVISION, projectContext: PROJECT_CONTEXT },
+		);
+
+		expect(decision).toEqual({ allow: false, reason: "project_identity_mismatch" });
+	});
+
+	it("binds an active trusted context to the current project identity", () => {
+		const valid = trustedEvidence();
+		const policy = new PreToolPolicy(recorder().sink);
+		expect(
+			policy.evaluate(codebaseCall("search_graph"), {
+				...valid,
+				projectContext: { ...PROJECT_CONTEXT, projectId: "other-project" },
+			}),
+		).toEqual({ allow: false, reason: "project_identity_mismatch" });
+		expect(
+			policy.evaluate(builtinCall("write", { path: "src/existing.ts" }, { evidenceRevision: valid.evidenceRevision }), {
+				...valid,
+				projectContext: { ...PROJECT_CONTEXT, codebaseProject: "other-project" },
+			}),
+		).toEqual({ allow: false, reason: "project_identity_mismatch" });
 	});
 
 	it.each([
@@ -386,7 +479,7 @@ describe("PreToolPolicy canonical Codebase identities", () => {
 				...forged,
 				identity: { ...forged.identity, qualifiedName: "evil.index_repository" },
 			},
-			{ evidenceRevision: REVISION },
+			{ evidenceRevision: REVISION, projectContext: PROJECT_CONTEXT },
 		);
 		expect(decision).toEqual({ allow: false, reason: "invalid_input" });
 
@@ -495,6 +588,46 @@ describe("PreToolPolicy trusted Codebase evidence gate", () => {
 });
 
 describe("PreToolPolicy fail-closed input and Evidence handling", () => {
+	it("fails closed on high-cardinality args and context without executing accessors", () => {
+		let invoked = false;
+		const highCardinalityArgs = Object.create(null) as Record<string, unknown>;
+		for (let index = 0; index < 20_000; index++) highCardinalityArgs[`field_${index}`] = "value";
+		Object.defineProperty(highCardinalityArgs, "lateAccessor", {
+			enumerable: true,
+			get: () => {
+				invoked = true;
+				return "PASSWORD_SHOULD_NOT_RUN";
+			},
+		});
+		const highCardinalityCall = builtinCall("write", { path: "src/existing.ts" });
+		(highCardinalityCall.identity as { args: unknown }).args = highCardinalityArgs;
+		expect(new PreToolPolicy(recorder().sink).evaluate(highCardinalityCall, { evidenceRevision: REVISION })).toEqual({
+			allow: false,
+			reason: "invalid_input",
+		});
+
+		const highCardinalityContext = Object.create(null) as Record<string, unknown>;
+		Object.defineProperty(highCardinalityContext, "evidenceRevision", {
+			enumerable: true,
+			value: REVISION,
+		});
+		for (let index = 0; index < 20_000; index++) highCardinalityContext[`unknown_${index}`] = index;
+		Object.defineProperty(highCardinalityContext, "unknownAccessor", {
+			enumerable: true,
+			get: () => {
+				invoked = true;
+				return "Authorization SHOULD_NOT_RUN";
+			},
+		});
+		expect(
+			new PreToolPolicy(recorder().sink).evaluate(
+				builtinCall("write", { path: "src/existing.ts" }),
+				highCardinalityContext as never,
+			),
+		).toEqual({ allow: false, reason: "missing_contract" });
+		expect(invoked).toBe(false);
+	});
+
 	it("blocks Proxy, accessor, and oversized args", () => {
 		const policy = new PreToolPolicy(recorder().sink);
 		const proxied = builtinCall("write", { path: "src/existing.ts" });
@@ -538,7 +671,7 @@ describe("PreToolPolicy fail-closed input and Evidence handling", () => {
 			{ ...valid, contract: unsafeContract },
 		);
 
-		expect(decision).toEqual({ allow: false, reason: "invalid_input" });
+		expect(decision).toEqual({ allow: false, reason: "invalid_codebase_evidence" });
 		expect(invoked).toBe(false);
 	});
 
@@ -606,6 +739,55 @@ describe("PreToolPolicy fail-closed input and Evidence handling", () => {
 			qualifiedName: "<invalid-qualified-name>",
 			argsFingerprint: "<invalid-args-fingerprint>",
 		});
+	});
+
+	it("does not persist unvalidated or sensitive call identity fields", () => {
+		const rawSecrets = [
+			"token=task-secret",
+			"Authorization Bearer call-secret",
+			"https://user:password@example.test/repo",
+			"PASSWORD_TOOL_SECRET",
+		];
+		const invalidCall = builtinCall("write", { path: "src/existing.ts" });
+		const invalidIdentity = {
+			...invalidCall.identity,
+			serverId: rawSecrets[2],
+			toolName: rawSecrets[3],
+			qualifiedName: `${rawSecrets[2]}.${rawSecrets[3]}`,
+		};
+		const { records, sink } = recorder();
+		const decision = new PreToolPolicy(sink).evaluate(
+			{ ...invalidCall, taskId: rawSecrets[0], callId: rawSecrets[1], identity: invalidIdentity },
+			{ evidenceRevision: REVISION },
+		);
+
+		expect(decision).toEqual({ allow: false, reason: "invalid_input" });
+		expect(records[0]).toMatchObject({
+			task: "<invalid-task>",
+			call: "<invalid-call>",
+			canonicalServer: "<invalid-server>",
+			canonicalTool: "<invalid-tool>",
+			qualifiedName: "<invalid-qualified-name>",
+		});
+		const serialized = JSON.stringify(records[0]);
+		for (const secret of rawSecrets) expect(serialized).not.toContain(secret);
+	});
+
+	it("redacts sensitive task and call identifiers on an otherwise valid canonical call", () => {
+		const sensitiveTask = "token=valid-task-secret";
+		const sensitiveCall = "PASSWORD_valid-call-secret";
+		const { records, sink } = recorder();
+		const decision = new PreToolPolicy(sink).evaluate(
+			builtinCall("write", { path: "src/existing.ts" }, { taskId: sensitiveTask, callId: sensitiveCall }),
+			{ evidenceRevision: REVISION },
+		);
+
+		expect(decision).toEqual({ allow: false, reason: "missing_contract" });
+		expect(records[0].task).toStartWith("<redacted:sha256:");
+		expect(records[0].call).toStartWith("<redacted:sha256:");
+		const serialized = JSON.stringify(records[0]);
+		expect(serialized).not.toContain(sensitiveTask);
+		expect(serialized).not.toContain(sensitiveCall);
 	});
 
 	it("keeps the block decision when Evidence persistence throws", () => {
