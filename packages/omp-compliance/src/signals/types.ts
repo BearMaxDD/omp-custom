@@ -70,6 +70,24 @@ export interface CodebaseMemoryEvidence {
 	resultRef: string;
 }
 
+export interface CodebaseToolEvidence {
+	readonly serverName: "codebase-memory";
+	readonly qualifiedName: `codebase-memory-mcp.${string}`;
+	readonly toolName: string;
+	readonly access: "read" | "write";
+	readonly success: boolean;
+	readonly params: Readonly<Record<string, unknown>>;
+	readonly resultRef: string;
+}
+
+export interface CodebaseEvidencePack {
+	readonly projectId: string;
+	readonly indexRevision: string;
+	readonly affectedFiles: readonly string[];
+	readonly tools: readonly CodebaseToolEvidence[];
+	readonly evidenceRevision: `sha256:${string}`;
+}
+
 /** Normalized evidence for one task (subagent) delegation. */
 export interface TaskDelegationEvidence {
 	/** The agent id assigned to the subtask, if available. */
@@ -120,6 +138,8 @@ export interface EvidenceSnapshot {
 		queries: string[];
 		/** Codebase references collected from search / snippet results. */
 		references: string[];
+		/** Optional immutable Task 12 pack; legacy snapshots may omit it. */
+		pack?: CodebaseEvidencePack;
 	};
 	/** Normalized task delegation evidence. */
 	subagentDelegations: TaskDelegationEvidence[];

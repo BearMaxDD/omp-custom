@@ -90,7 +90,7 @@ export function loadComplianceContract(filePath: string, repoRoot: string): Comp
  * Returns a branded `sha256:hex` string for cryptographic identity
  * of the contract source.
  */
-function computeContractHash(text: string): SHA256Hash {
+export function computeContractHash(text: string): SHA256Hash {
 	const hash = createHash("sha256");
 	hash.update(text, "utf-8");
 	return `sha256:${hash.digest("hex")}`;

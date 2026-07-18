@@ -1,6 +1,12 @@
 import { describe, expect, it, test } from "bun:test";
 import type { ToolResultEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
-import { codebaseIndexReady, normalizeCodebaseMemory } from "../../src/signals/codebase-memory";
+import {
+	codebaseIndexReady,
+	computeEvidenceRevision,
+	createCodebaseEvidencePack,
+	normalizeCodebaseMemory,
+	validateCodebasePack,
+} from "../../src/signals/codebase-memory";
 import { ToolEventCollector } from "../../src/signals/tool-event-collector";
 
 function mcpCall(shortName: string, input: Record<string, unknown>, toolCallId: string) {
@@ -210,5 +216,194 @@ describe("codebaseIndexReady matrix", () => {
 				result: { success: true, status: "indexed" },
 			}),
 		).toEqual({ indexReady: true, queries: [], references: [] });
+	});
+});
+
+describe("Codebase Evidence Pack", () => {
+	const successfulTools = [
+		{
+			serverName: "codebase-memory",
+			qualifiedName: "codebase-memory-mcp.index_status",
+			toolName: "index_status",
+			success: true,
+			params: {},
+			resultRef: '{"status":"ready","revision":"idx-1"}',
+		},
+		{
+			serverName: "codebase-memory",
+			qualifiedName: "codebase-memory-mcp.get_code_snippet",
+			toolName: "get_code_snippet",
+			success: true,
+			params: { qualified_name: "a" },
+			resultRef: "file:src/a.ts",
+		},
+		{
+			serverName: "codebase-memory",
+			qualifiedName: "codebase-memory-mcp.trace_path",
+			toolName: "trace_path",
+			success: true,
+			params: { function_name: "a" },
+			resultRef: "file:src/a.ts",
+		},
+	] as const;
+
+	it("生成稳定、不可变且包含结构化工具证据的 Pack", () => {
+		const pack = createCodebaseEvidencePack({
+			projectId: "demo",
+			affectedFiles: ["src/b.ts", "src/a.ts", "src/a.ts"],
+			tools: successfulTools,
+		});
+
+		expect(pack.indexRevision).toBe("idx-1");
+		expect(pack.affectedFiles).toEqual(["src/a.ts", "src/b.ts"]);
+		expect(pack.tools.map((tool) => tool.toolName)).toEqual(["get_code_snippet", "index_status", "trace_path"]);
+		expect(pack.evidenceRevision).toMatch(/^sha256:[a-f0-9]{64}$/);
+		const { evidenceRevision: _ignored, ...revisionBody } = pack;
+		expect(computeEvidenceRevision(revisionBody)).toBe(pack.evidenceRevision);
+		expect(Object.isFrozen(pack)).toBe(true);
+		expect(Object.isFrozen(pack.tools)).toBe(true);
+		expect(Object.isFrozen(pack.tools[0].params)).toBe(true);
+	});
+
+	it("字段顺序和集合顺序不影响 revision，内容变化会改变 revision", () => {
+		const first = createCodebaseEvidencePack({
+			projectId: "demo",
+			affectedFiles: ["src/b.ts", "src/a.ts"],
+			tools: successfulTools,
+		});
+		const second = createCodebaseEvidencePack({
+			projectId: "demo",
+			tools: [...successfulTools].reverse(),
+			affectedFiles: ["src/a.ts", "src/b.ts"],
+		});
+		const changed = createCodebaseEvidencePack({
+			projectId: "demo-2",
+			affectedFiles: ["src/a.ts", "src/b.ts"],
+			tools: successfulTools,
+		});
+		expect(first.evidenceRevision).toBe(second.evidenceRevision);
+		expect(first.evidenceRevision).not.toBe(changed.evidenceRevision);
+	});
+
+	it("缺索引、index_status、snippet 或正式跨模块 trace 时 invalid", () => {
+		const pack = createCodebaseEvidencePack({ projectId: "demo", affectedFiles: ["src/a.ts"], tools: successfulTools });
+		expect(validateCodebasePack({ ...pack, indexRevision: "" }, [], { requiresTrace: true })).toContain(
+			"missing_index_revision",
+		);
+		expect(
+			validateCodebasePack({ ...pack, tools: pack.tools.filter((tool) => tool.toolName !== "index_status") }, [], {
+				requiresTrace: true,
+			}),
+		).toContain("missing_index_status");
+		expect(
+			validateCodebasePack(
+				{
+					...pack,
+					tools: pack.tools.map((tool) =>
+						tool.toolName === "index_status"
+							? { ...tool, resultRef: '{"status":"indexing","revision":"idx-1"}' }
+							: tool,
+					),
+				},
+				[],
+				{ requiresTrace: true },
+			),
+		).toContain("missing_index_status");
+		expect(
+			validateCodebasePack({ ...pack, tools: pack.tools.filter((tool) => tool.toolName !== "get_code_snippet") }, [], {
+				requiresTrace: true,
+			}),
+		).toContain("missing_snippet");
+		expect(
+			validateCodebasePack({ ...pack, tools: pack.tools.filter((tool) => tool.toolName !== "trace_path") }, [], {
+				requiresTrace: true,
+			}),
+		).toContain("missing_trace");
+	});
+
+	it("修改文件必须由 affectedFiles 精确覆盖", () => {
+		const pack = createCodebaseEvidencePack({ projectId: "demo", affectedFiles: ["src/a.ts"], tools: successfulTools });
+		expect(validateCodebasePack(pack, ["src/a.ts", "src/b.ts"])).toContain("uncovered_file:src/b.ts");
+		expect(() => validateCodebasePack(pack, ["../src/a.ts"])).toThrow();
+		expect(() => validateCodebasePack(pack, ["/src/a.ts"])).toThrow();
+		expect(() => validateCodebasePack(pack, ["src\\a.ts"])).toThrow();
+		expect(() =>
+			createCodebaseEvidencePack({
+				projectId: "demo",
+				affectedFiles: ["src/A.ts", "src/a.ts"],
+				tools: successfulTools,
+			}),
+		).toThrow();
+	});
+
+	it("正式任务或多文件范围即使未显式传 requiresTrace 也要求 trace", () => {
+		const noTrace = successfulTools.filter((tool) => tool.toolName !== "trace_path");
+		const single = createCodebaseEvidencePack({ projectId: "demo", affectedFiles: ["src/a.ts"], tools: noTrace });
+		const multiple = createCodebaseEvidencePack({
+			projectId: "demo",
+			affectedFiles: ["src/a.ts", "src/b.ts"],
+			tools: noTrace,
+		});
+		expect(validateCodebasePack(single, [], { taskSource: "tdd" })).toContain("missing_trace");
+		expect(validateCodebasePack(multiple, [])).toContain("missing_trace");
+	});
+
+	it("失败工具不算完整性，index_repository 不算只读 index_status", () => {
+		const pack = createCodebaseEvidencePack({
+			projectId: "demo",
+			affectedFiles: ["src/a.ts"],
+			tools: [
+				{ ...successfulTools[0], toolName: "index_repository", qualifiedName: "codebase-memory-mcp.index_repository" },
+				{ ...successfulTools[1], success: false },
+			],
+		});
+		const errors = validateCodebasePack(pack, []);
+		expect(errors).toContain("missing_index_status");
+		expect(errors).toContain("missing_snippet");
+	});
+
+	it("验证阶段重新校验可信 server 与 qualifiedName，不信任伪造 access", () => {
+		const pack = createCodebaseEvidencePack({ projectId: "demo", affectedFiles: ["src/a.ts"], tools: successfulTools });
+		const forged = {
+			...pack,
+			tools: pack.tools.map((tool) =>
+				tool.toolName === "get_code_snippet" ? { ...tool, serverName: "evil", access: "read" as const } : tool,
+			),
+		};
+		expect(validateCodebasePack(forged as never, [])).toContain("missing_snippet");
+	});
+
+	it("Proxy、accessor 和超限输入失败关闭且不执行用户代码", () => {
+		let reads = 0;
+		const accessor = Object.defineProperty({}, "projectId", {
+			enumerable: true,
+			get: () => {
+				reads++;
+				return "demo";
+			},
+		});
+		expect(() => createCodebaseEvidencePack(accessor as never)).toThrow();
+		expect(reads).toBe(0);
+		expect(() =>
+			createCodebaseEvidencePack(
+				new Proxy(
+					{},
+					{
+						get: () => {
+							reads++;
+							return "demo";
+						},
+					},
+				) as never,
+			),
+		).toThrow();
+		expect(reads).toBe(0);
+		expect(() =>
+			createCodebaseEvidencePack({
+				projectId: "x".repeat(70_000),
+				affectedFiles: ["src/a.ts"],
+				tools: successfulTools,
+			}),
+		).toThrow();
 	});
 });

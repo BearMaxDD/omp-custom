@@ -10,6 +10,24 @@
 /** SHA-256 hex digest branded as a template literal type. */
 export type SHA256Hash = `sha256:${string}`;
 
+export type TaskContractSource = "tdd" | "lightweight";
+
+/** Immutable execution contract shared by formal TDD and low-risk tasks. */
+export interface TaskContract {
+	readonly source: TaskContractSource;
+	readonly taskId: string;
+	readonly projectId: string;
+	readonly gitHead: string;
+	readonly affectedFiles: readonly string[];
+	readonly scope: readonly string[];
+	readonly acceptanceCriteria: readonly string[];
+	readonly verificationCommands: readonly string[];
+	readonly delegationRequired: boolean;
+	readonly revision: SHA256Hash;
+	readonly contractHash?: SHA256Hash;
+	readonly tddPath?: string;
+}
+
 /** A limited-content summary extracted from the TDD markdown. */
 export interface ContractSummary {
 	/** The top-level goal or objective extracted from the TDD. */
