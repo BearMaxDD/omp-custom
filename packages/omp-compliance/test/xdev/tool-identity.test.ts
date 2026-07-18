@@ -143,15 +143,56 @@ describe("canonicalizeToolIdentity", () => {
 		}
 	});
 
-	it("总节点数和嵌套深度超过预算时 fail closed", () => {
-		const tooManyNodes = Array.from({ length: 256 }, () => Array.from({ length: 32 }, () => null));
-		let tooDeep: Record<string, unknown> = { leaf: true };
-		for (let depth = 0; depth < 40; depth++) tooDeep = { child: tooDeep };
+	it("大量节点只要规范 JSON 低于 64KiB 就应成功", () => {
+		const manyNodes = Array.from({ length: 256 }, () => Array.from({ length: 32 }, () => null));
 
-		expect(canonicalJson(tooManyNodes)).toBeNull();
-		expect(canonicalArgsFingerprint(tooManyNodes)).toBeNull();
-		expect(canonicalJson(tooDeep)).toBeNull();
-		expect(canonicalArgsFingerprint(tooDeep)).toBeNull();
+		expect(canonicalJson(manyNodes)).not.toBeNull();
+		expect(canonicalArgsFingerprint(manyNodes)).toMatch(/^sha256:[a-f0-9]{64}$/);
+	});
+
+	it("1025 个零的数组低于 64KiB 时应成功规范化", () => {
+		const value = Array.from({ length: 1025 }, () => 0);
+		const canonical = canonicalJson(value);
+
+		expect(canonical).not.toBeNull();
+		expect(new TextEncoder().encode(canonical ?? "").byteLength).toBeLessThan(CANONICAL_ARGS_MAX_BYTES);
+		expect(canonicalArgsFingerprint(value)).toMatch(/^sha256:[a-f0-9]{64}$/);
+	});
+
+	it("1025 键对象低于 64KiB 时应成功且排序稳定", () => {
+		const entries = Array.from({ length: 1025 }, (_, index) => [`key-${String(index).padStart(4, "0")}`, 0] as const);
+		const ascending = Object.fromEntries(entries);
+		const descending = Object.fromEntries([...entries].reverse());
+		const canonical = canonicalJson(descending);
+
+		expect(canonical).not.toBeNull();
+		expect(new TextEncoder().encode(canonical ?? "").byteLength).toBeLessThan(CANONICAL_ARGS_MAX_BYTES);
+		expect(canonical).toBe(canonicalJson(ascending));
+		expect(canonicalArgsFingerprint(descending)).toBe(canonicalArgsFingerprint(ascending));
+	});
+
+	it("33 层嵌套低于 64KiB 时应成功规范化", () => {
+		let value: unknown = 0;
+		for (let depth = 0; depth < 33; depth++) value = { child: value };
+
+		expect(canonicalJson(value)).not.toBeNull();
+		expect(canonicalArgsFingerprint(value)).toMatch(/^sha256:[a-f0-9]{64}$/);
+	});
+
+	it.each(["object", "array"] as const)("%s accessor 不得执行 getter并必须 fail closed", (kind) => {
+		let reads = 0;
+		const value: Record<string, unknown> | unknown[] = kind === "array" ? [] : {};
+		Object.defineProperty(value, kind === "array" ? "0" : "value", {
+			enumerable: true,
+			get: () => {
+				reads++;
+				return "forged";
+			},
+		});
+
+		expect(canonicalJson(value)).toBeNull();
+		expect(canonicalArgsFingerprint(value)).toBeNull();
+		expect(reads).toBe(0);
 	});
 
 	it("规范化 xd 外层 write", () => {

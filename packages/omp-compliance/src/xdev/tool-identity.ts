@@ -25,22 +25,13 @@ export interface ToolIdentityInput {
 
 const HELP_CONTENT_RE = /^(?:|\?|help|describe)$/i;
 export const CANONICAL_ARGS_MAX_BYTES = 64 * 1024;
-const CANONICAL_ARGS_MAX_DEPTH = 32;
-const CANONICAL_ARGS_MAX_NODES = 4096;
-const CANONICAL_ARGS_MAX_KEYS = 4096;
-const CANONICAL_ARGS_MAX_OBJECT_KEYS = 1024;
-const CANONICAL_ARGS_MAX_ARRAY_LENGTH = 1024;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-interface CanonicalizeState {
-	remainingNodes: number;
-	remainingKeys: number;
-}
-
 function boundedJsonStringBytes(value: string, maxBytes: number): number | null {
+	if (maxBytes < 2) return null;
 	let bytes = 2;
 	for (let index = 0; index < value.length; index++) {
 		const code = value.charCodeAt(index);
@@ -82,102 +73,125 @@ function boundedJsonString(value: string, maxBytes: number): string | null {
 	return boundedJsonStringBytes(value, maxBytes) === null ? null : JSON.stringify(value);
 }
 
-function consumeKey(state: CanonicalizeState): boolean {
-	if (state.remainingKeys <= 0) return false;
-	state.remainingKeys--;
-	return true;
+interface ObjectEntry {
+	key: string;
+	value: unknown;
 }
 
-function canonicalizeJsonValue(
-	value: unknown,
-	ancestors: Set<object>,
-	state: CanonicalizeState,
-	depth: number,
-	maxBytes: number,
-): string | null {
-	if (depth > CANONICAL_ARGS_MAX_DEPTH || state.remainingNodes <= 0 || maxBytes <= 0) return null;
-	state.remainingNodes--;
-	if (value === null) return "null";
-	if (typeof value === "string") return boundedJsonString(value, maxBytes);
-	if (typeof value === "boolean") return maxBytes >= 4 + Number(value) ? String(value) : null;
-	if (typeof value === "number") {
-		if (!Number.isFinite(value)) return null;
-		const serialized = String(value);
-		return Buffer.byteLength(serialized, "utf8") <= maxBytes ? serialized : null;
-	}
-	if (typeof value !== "object") return null;
-	if (ancestors.has(value)) return null;
-	ancestors.add(value);
-	try {
-		if (Array.isArray(value)) {
-			if (value.length > CANONICAL_ARGS_MAX_ARRAY_LENGTH) return null;
-			let expectedIndex = 0;
-			for (const key in value) {
-				if (!consumeKey(state) || !Object.hasOwn(value, key) || key !== String(expectedIndex)) return null;
-				expectedIndex++;
-			}
-			if (expectedIndex !== value.length) return null;
-			const items: string[] = [];
-			let bytes = 2;
-			for (const item of value) {
-				const separatorBytes = items.length === 0 ? 0 : 1;
-				const canonical = canonicalizeJsonValue(item, ancestors, state, depth + 1, maxBytes - bytes - separatorBytes);
-				if (canonical === null) return null;
-				bytes += Buffer.byteLength(canonical, "utf8") + separatorBytes;
-				if (bytes > maxBytes) return null;
-				items.push(canonical);
-			}
-			return `[${items.join(",")}]`;
-		}
-		const prototype = Object.getPrototypeOf(value);
-		if (prototype !== Object.prototype && prototype !== null) return null;
-		const keys: string[] = [];
-		let serializedKeyBytes = 2;
-		for (const key in value) {
-			if (!consumeKey(state) || !Object.hasOwn(value, key)) return null;
-			if (keys.length >= CANONICAL_ARGS_MAX_OBJECT_KEYS) return null;
-			const keyBytes = boundedJsonStringBytes(key, maxBytes - serializedKeyBytes);
-			if (keyBytes === null) return null;
-			serializedKeyBytes += keyBytes + (keys.length === 0 ? 0 : 1);
-			keys.push(key);
-		}
-		keys.sort();
-		const fields: string[] = [];
-		let bytes = 2;
-		for (const key of keys) {
-			const separatorBytes = fields.length === 0 ? 0 : 1;
-			const keyJson = boundedJsonString(key, maxBytes - bytes - separatorBytes);
-			if (keyJson === null) return null;
-			const overhead = separatorBytes + Buffer.byteLength(keyJson, "utf8") + 1;
-			const canonical = canonicalizeJsonValue(
-				(value as Record<string, unknown>)[key],
-				ancestors,
-				state,
-				depth + 1,
-				maxBytes - bytes - overhead,
-			);
-			if (canonical === null) return null;
-			const field = `${keyJson}:${canonical}`;
-			bytes += Buffer.byteLength(field, "utf8") + separatorBytes;
-			if (bytes > maxBytes) return null;
-			fields.push(field);
-		}
-		return `{${fields.join(",")}}`;
-	} catch {
-		return null;
-	} finally {
-		ancestors.delete(value);
-	}
-}
+type SerializationFrame =
+	| { kind: "value"; value: unknown }
+	| { kind: "key"; value: string }
+	| { kind: "token"; value: ":" | "," }
+	| { kind: "close"; value: object; token: "]" | "}" };
 
 export function canonicalJson(value: unknown): string | null {
-	return canonicalizeJsonValue(
-		value,
-		new Set(),
-		{ remainingNodes: CANONICAL_ARGS_MAX_NODES, remainingKeys: CANONICAL_ARGS_MAX_KEYS },
-		0,
-		CANONICAL_ARGS_MAX_BYTES,
-	);
+	const parts: string[] = [];
+	const active = new Set<object>();
+	const stack: SerializationFrame[] = [{ kind: "value", value }];
+	let usedBytes = 0;
+	const append = (token: string): boolean => {
+		const tokenBytes = Buffer.byteLength(token, "utf8");
+		if (usedBytes + tokenBytes > CANONICAL_ARGS_MAX_BYTES) return false;
+		parts.push(token);
+		usedBytes += tokenBytes;
+		return true;
+	};
+
+	try {
+		while (stack.length > 0) {
+			const frame = stack.pop();
+			if (!frame) return null;
+			if (frame.kind === "token") {
+				if (!append(frame.value)) return null;
+				continue;
+			}
+			if (frame.kind === "key") {
+				const serialized = boundedJsonString(frame.value, CANONICAL_ARGS_MAX_BYTES - usedBytes);
+				if (serialized === null || !append(serialized)) return null;
+				continue;
+			}
+			if (frame.kind === "close") {
+				if (!append(frame.token)) return null;
+				active.delete(frame.value);
+				continue;
+			}
+
+			const current = frame.value;
+			if (current === null) {
+				if (!append("null")) return null;
+				continue;
+			}
+			if (typeof current === "string") {
+				const serialized = boundedJsonString(current, CANONICAL_ARGS_MAX_BYTES - usedBytes);
+				if (serialized === null || !append(serialized)) return null;
+				continue;
+			}
+			if (typeof current === "boolean") {
+				if (!append(String(current))) return null;
+				continue;
+			}
+			if (typeof current === "number") {
+				if (!Number.isFinite(current) || !append(String(current))) return null;
+				continue;
+			}
+			if (typeof current !== "object" || active.has(current)) return null;
+
+			const remainingBytes = CANONICAL_ARGS_MAX_BYTES - usedBytes;
+			if (Array.isArray(current)) {
+				if (remainingBytes < 2 || current.length > Math.floor((remainingBytes - 1) / 2)) return null;
+				const values: unknown[] = [];
+				for (let index = 0; index < current.length; index++) {
+					const descriptor = Object.getOwnPropertyDescriptor(current, String(index));
+					if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) return null;
+					values.push(descriptor.value);
+				}
+				let enumerableIndex = 0;
+				for (const key in current) {
+					if (!Object.hasOwn(current, key) || key !== String(enumerableIndex)) return null;
+					enumerableIndex++;
+				}
+				if (enumerableIndex !== current.length || !append("[")) return null;
+				active.add(current);
+				stack.push({ kind: "close", value: current, token: "]" });
+				for (let index = values.length - 1; index >= 0; index--) {
+					stack.push({ kind: "value", value: values[index] });
+					if (index > 0) stack.push({ kind: "token", value: "," });
+				}
+				continue;
+			}
+
+			const prototype = Object.getPrototypeOf(current);
+			if (prototype !== Object.prototype && prototype !== null) return null;
+			const entries: ObjectEntry[] = [];
+			let minimumBytes = 2;
+			for (const key in current) {
+				if (!Object.hasOwn(current, key)) return null;
+				const separatorBytes = entries.length === 0 ? 0 : 1;
+				const keyBytes = boundedJsonStringBytes(key, remainingBytes - minimumBytes - separatorBytes - 2);
+				if (keyBytes === null) return null;
+				minimumBytes += separatorBytes + keyBytes + 2;
+				if (minimumBytes > remainingBytes) return null;
+				const descriptor = Object.getOwnPropertyDescriptor(current, key);
+				if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) return null;
+				entries.push({ key, value: descriptor.value });
+			}
+			entries.sort((left, right) => (left.key < right.key ? -1 : left.key > right.key ? 1 : 0));
+			if (!append("{")) return null;
+			active.add(current);
+			stack.push({ kind: "close", value: current, token: "}" });
+			for (let index = entries.length - 1; index >= 0; index--) {
+				const entry = entries[index];
+				stack.push({ kind: "value", value: entry.value });
+				stack.push({ kind: "token", value: ":" });
+				stack.push({ kind: "key", value: entry.key });
+				if (index > 0) stack.push({ kind: "token", value: "," });
+			}
+		}
+	} catch {
+		return null;
+	}
+
+	return parts.join("");
 }
 
 export function canonicalArgsFingerprint(value: unknown): `sha256:${string}` | null {
