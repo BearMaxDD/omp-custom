@@ -151,7 +151,8 @@ function requestFor(intent: ReviewIntent): AdvisorReviewRequest {
 			evidenceRevision: intent.evidenceRevision,
 			gitHead: intent.gitHead,
 			diffHash: intent.diffHash,
-			attempt: intent.attempt,
+			attempt: intent.taskAttempt ?? intent.attempt,
+			reviewAttempt: intent.attempt,
 		},
 	};
 }
@@ -421,6 +422,24 @@ export class ReviewScheduler {
 					updatedAt: safeNow(this.#clock),
 				});
 			});
+		});
+	}
+
+	abandonReview(reviewId: string): Promise<boolean> {
+		return this.#serialize(async () => {
+			const intent = [...this.#queued, ...(this.#inFlight ? [this.#inFlight] : []), ...this.#completed].find(
+				(candidate) => candidate.reviewId === reviewId,
+			);
+			if (!intent) return false;
+			await this.#transaction(() => {
+				this.#queued = this.#queued.filter((candidate) => candidate.reviewId !== reviewId);
+				if (this.#inFlight?.reviewId === reviewId) this.#inFlight = undefined;
+				this.#completed = this.#completed.filter((candidate) => candidate.reviewId !== reviewId);
+				this.#dedupeLedger.delete(intent.dedupeKey);
+				this.#lifecycleWaiters.get(reviewId)?.();
+				this.#lifecycleWaiters.delete(reviewId);
+			});
+			return true;
 		});
 	}
 

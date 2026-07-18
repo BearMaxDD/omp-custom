@@ -115,6 +115,7 @@ export function createReviewEnvelope(input: ReviewEnvelopeInput, reviewAttempt =
 		evidenceRevision: normalized.evidenceRevision,
 		gitHead: normalized.gitHead,
 		diffHash: normalized.diffHash,
+		taskAttempt: normalized.attempt,
 	});
 	return Object.freeze({
 		...normalized,

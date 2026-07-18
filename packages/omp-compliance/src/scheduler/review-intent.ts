@@ -23,6 +23,7 @@ export interface ReviewIntentInput {
 	readonly evidenceRevision: string;
 	readonly gitHead: string;
 	readonly diffHash: string;
+	readonly taskAttempt?: number;
 	readonly force?: boolean;
 	readonly metadata?: Readonly<Record<string, unknown>>;
 }
@@ -167,6 +168,10 @@ export function normalizeReviewIntentInput(input: ReviewIntentInput): ReviewInte
 	const force = value("force");
 	if (force !== undefined && typeof force !== "boolean") throw new Error("force must be boolean");
 	if (force && trigger !== "manual_review") throw new Error("force is only valid for manual_review");
+	const taskAttempt = value("taskAttempt");
+	if (taskAttempt !== undefined && (!Number.isSafeInteger(taskAttempt) || (taskAttempt as number) < 1)) {
+		throw new Error("taskAttempt must be a positive safe integer");
+	}
 	return Object.freeze({
 		trigger: trigger as ReviewTrigger,
 		priority: expectedPriority,
@@ -177,6 +182,7 @@ export function normalizeReviewIntentInput(input: ReviewIntentInput): ReviewInte
 		evidenceRevision: boundedString("evidenceRevision", value("evidenceRevision"), true),
 		gitHead: boundedString("gitHead", value("gitHead"), true),
 		diffHash: boundedString("diffHash", value("diffHash"), true),
+		taskAttempt: taskAttempt as number | undefined,
 		force: force === true ? true : undefined,
 		metadata: sanitizeMetadata(value("metadata")),
 	});
@@ -190,6 +196,7 @@ export function sameReviewScope(left: ReviewIntentInput, right: ReviewIntentInpu
 		left.contractHash === right.contractHash &&
 		left.evidenceRevision === right.evidenceRevision &&
 		left.gitHead === right.gitHead &&
-		left.diffHash === right.diffHash
+		left.diffHash === right.diffHash &&
+		left.taskAttempt === right.taskAttempt
 	);
 }

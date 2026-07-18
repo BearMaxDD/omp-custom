@@ -3,6 +3,7 @@ import { mkdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AdvisorReviewReceipt, AdvisorReviewRequest } from "@oh-my-pi/pi-coding-agent/advisor/index";
+import { createComplianceAdvisorHook } from "../../src/advisor/compliance-advisor-hook";
 import { ComplianceReviewRegistry } from "../../src/advisor/review-envelope";
 import type { ComplianceReviewDependencies } from "../../src/advisor/review-envelope";
 import { createReviewEnvelope } from "../../src/contracts/review-envelope";
@@ -10,6 +11,7 @@ import { EvidenceStore } from "../../src/evidence/evidence-store";
 import { buildCompletionSnapshot } from "../../src/runtime/completion-gate";
 import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
 import type { ComplianceRuntimeDependencies } from "../../src/runtime/compliance-runtime";
+import type { ReviewSchedulerState, ReviewSchedulerStore } from "../../src/scheduler/review-scheduler";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
 import { createStrictRuntimeDependencies } from "../support/strict-runtime-dependencies";
 
@@ -32,6 +34,18 @@ class MinimalAPI {
 	}
 
 	logger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
+}
+
+class ControllableSchedulerStore implements ReviewSchedulerStore {
+	state: ReviewSchedulerState | undefined;
+	failWhen: ((state: ReviewSchedulerState) => boolean) | undefined;
+	async load(): Promise<ReviewSchedulerState | undefined> {
+		return this.state ? structuredClone(this.state) : undefined;
+	}
+	async save(state: ReviewSchedulerState): Promise<void> {
+		if (this.failWhen?.(state)) throw new Error("scheduler disk down");
+		this.state = structuredClone(state);
+	}
 }
 
 // ─── Test Setup ─────────────────────────────────────────────────────
@@ -123,6 +137,14 @@ function finding(
 	const f: { id: string; reason: string; required_fix?: string } = { id, reason };
 	if (requiredFix !== undefined) f.required_fix = requiredFix;
 	return f;
+}
+
+async function waitUntil(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate()) {
+		if (Date.now() >= deadline) throw new Error("timed out waiting for test condition");
+		await Bun.sleep(5);
+	}
 }
 
 beforeEach(() => {
@@ -285,7 +307,7 @@ describe("ComplianceRuntime — requestCompletion", () => {
 // ─── Tests: Request Completion — Advisor Review Path ─────────────────
 
 describe("ComplianceRuntime — requestCompletion advisor review path", () => {
-	it("Envelope 持久化失败时保持 active 且不入队", async () => {
+	it("Envelope 持久化失败时进入 stalled 且不入队", async () => {
 		await runtime.start("tdd.md");
 		const original = store.append.bind(store);
 		store.append = async (record) => {
@@ -293,7 +315,7 @@ describe("ComplianceRuntime — requestCompletion advisor review path", () => {
 			await original(record);
 		};
 		await expect(runtime.requestCompletion({ summary: "Done" })).rejects.toThrow("disk down");
-		expect(runtime.currentTaskState?.status).toBe("active");
+		expect(runtime.currentTaskState?.status).toBe("stalled");
 		expect(mockRequestReviewCalls).toHaveLength(0);
 	});
 
@@ -346,7 +368,7 @@ describe("ComplianceRuntime — requestCompletion advisor review path", () => {
 			});
 		await runtime.start("tdd.md");
 		const pending = runtime.requestCompletion({ summary: "Done" });
-		await Bun.sleep(10);
+		await waitUntil(() => resolveReceipt !== undefined);
 		expect(runtime.currentTaskState?.status).toBe("completion_requested");
 		resolveReceipt?.({ status: "accepted", reviewId: "ignored" });
 		await pending;
@@ -361,7 +383,7 @@ describe("ComplianceRuntime — requestCompletion advisor review path", () => {
 			});
 		const { taskId } = await runtime.start("tdd.md");
 		const pending = runtime.requestCompletion({ summary: "Done" });
-		await Bun.sleep(10);
+		await waitUntil(() => resolveReceipt !== undefined);
 
 		const result = await runtime.acceptVerdict(advisorVerdict(runtime, { status: "pass" }));
 		const evidence = await store.readAll(taskId);
@@ -408,6 +430,19 @@ describe("ComplianceRuntime — lifecycle 与严格 Verdict 绑定", () => {
 			const records = await store.readAll(taskId);
 			expect(records.some((record) => record.event === "completion_retry" && record.signalDigest)).toBe(true);
 			expect(reviewDeps.registry.get(request.reviewId)).toBeDefined();
+			const hook = createComplianceAdvisorHook(reviewDeps.registry, runtime);
+			const augmentation = hook({
+				type: "advisor_before_run",
+				reviewId: request.reviewId,
+				trigger: "compliance_review",
+				priority: 100,
+				metadata: request.metadata,
+				primarySessionId: "primary",
+				advisorSessionId: "advisor",
+			});
+			expect(request.metadata?.attempt).toBe(1);
+			expect(request.metadata?.reviewAttempt).toBe(2);
+			expect(augmentation?.additionalTools?.[0]?.name).toBe("compliance_verdict");
 			retryObserved = true;
 			return { status: "accepted", reviewId: request.reviewId };
 		};
@@ -427,6 +462,83 @@ describe("ComplianceRuntime — lifecycle 与严格 Verdict 绑定", () => {
 
 		expect(retryObserved).toBe(true);
 		expect(runtime.currentTaskState?.status).toBe("advisor_reviewing");
+	});
+
+	it("retry Scheduler 落盘失败后回到 stalled 并可再次重试", async () => {
+		let now = Date.now();
+		let reject = true;
+		const schedulerStore = new ControllableSchedulerStore();
+		reviewDeps.requestAdvisorReview = async (request) => {
+			if (reject) throw new Error("temporary unavailable");
+			return { status: "accepted", reviewId: request.reviewId };
+		};
+		runtimeDependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			now: () => now,
+			schedulerStore,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		});
+		runtime = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps, runtimeDependencies);
+		await runtime.start("tdd.md");
+		expect((await runtime.requestCompletion({ summary: "Done" })).status).toBe("stalled");
+
+		reject = false;
+		now += 5_000;
+		schedulerStore.failWhen = (state) => state.inFlight?.attempt === 2;
+		await runtime.retryDueReviews();
+		expect(runtime.currentTaskState?.status).toBe("stalled");
+
+		schedulerStore.failWhen = undefined;
+		await runtime.retryDueReviews();
+		expect(runtime.currentTaskState?.status).toBe("advisor_reviewing");
+	});
+
+	it("Verdict 与失败 lifecycle 并发时保持单一 completed 终态", async () => {
+		await runtime.start("tdd.md");
+		await runtime.requestCompletion({ summary: "Done" });
+		const reviewId = String(runtime.currentTaskState?.activeReviewId);
+		const verdict = advisorVerdict(runtime, { status: "pass" });
+		const persistedEnvelope = await runtimeDependencies.readEnvelope(
+			String(runtime.currentTaskState?.taskId),
+			reviewId,
+		);
+		if (!persistedEnvelope) throw new Error("missing persisted envelope");
+		let releaseEnvelope: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			releaseEnvelope = resolve;
+		});
+		envelopeOverride = async () => {
+			await gate;
+			return persistedEnvelope;
+		};
+		const accepting = runtime.acceptVerdict(verdict);
+		await Bun.sleep(10);
+		const lifecycle = runtime.handleAdvisorLifecycle({
+			type: "advisor_run_failed",
+			reviewId,
+			trigger: "compliance_review",
+			priority: 100,
+			primarySessionId: "primary",
+			advisorSessionId: "advisor",
+			timestamp: new Date().toISOString(),
+			failureClass: "provider",
+			errorSummary: "late failure",
+		});
+		releaseEnvelope?.();
+		expect((await accepting).accepted).toBe(true);
+		await lifecycle;
+		expect(runtime.currentTaskState?.status).toBe("completed");
+	});
+
+	it("并发 completion 请求只持久化一个权威 Envelope", async () => {
+		const { taskId } = await runtime.start("tdd.md");
+		const first = runtime.requestCompletion({ summary: "first" });
+		const second = runtime.requestCompletion({ summary: "second" });
+		await first;
+		await expect(second).rejects.toThrow("Cannot request completion");
+		const records = await store.readAll(taskId);
+		expect(records.filter((record) => record.event === "completion_requested")).toHaveLength(1);
 	});
 
 	it("宿主完成但没有 Verdict 时进入 stalled", async () => {
@@ -558,6 +670,102 @@ describe("ComplianceRuntime — lifecycle 与严格 Verdict 绑定", () => {
 		expect(evidence.filter((record) => record.event === "completed")).toHaveLength(1);
 	});
 
+	it("终态后续队列派发失败不反转当前 Verdict 结果", async () => {
+		const schedulerStore = new ControllableSchedulerStore();
+		runtimeDependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			schedulerStore,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		});
+		runtime = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps, runtimeDependencies);
+		await runtime.start("tdd.md");
+		await runtime.requestCompletion({ summary: "Done" });
+		const state = runtime.currentTaskState as NonNullable<typeof runtime.currentTaskState>;
+		await runtimeDependencies.scheduler.enqueue({
+			trigger: "manual_review",
+			priority: 80,
+			projectId: state.projectId,
+			taskId: state.taskId,
+			contractHash: state.contractHash,
+			evidenceRevision: state.evidenceRevision,
+			gitHead: state.gitHead,
+			diffHash: state.diffHash,
+			force: true,
+		});
+		schedulerStore.failWhen = (schedulerState) => schedulerState.inFlight?.trigger === "manual_review";
+
+		const result = await runtime.acceptVerdict(advisorVerdict(runtime, { status: "pass" }));
+		expect(result.accepted).toBe(true);
+		expect(runtime.currentTaskState?.status).toBe("completed");
+	});
+
+	it("重启时从持久化 journal 恢复 Scheduler 已提交但终态 Evidence 未写入的 Verdict", async () => {
+		const schedulerStore = new ControllableSchedulerStore();
+		runtimeDependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			schedulerStore,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		});
+		runtime = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps, runtimeDependencies);
+		const { taskId } = await runtime.start("tdd.md");
+		await runtime.requestCompletion({ summary: "Done" });
+		const state = runtime.currentTaskState as NonNullable<typeof runtime.currentTaskState>;
+		const records = (await store.readAll(taskId)) as Array<{
+			event: string;
+			reviewEnvelope?: ReturnType<typeof createReviewEnvelope>;
+		}>;
+		const envelope = records.find((record) => record.event === "completion_requested")?.reviewEnvelope;
+		if (!envelope) throw new Error("missing completion envelope");
+		await store.append({
+			schemaVersion: 1,
+			timestamp: new Date().toISOString(),
+			taskId,
+			contractPath: "tdd.md",
+			contractHash: state.contractHash,
+			attempt: state.attempt,
+			event: "verdict_commit_prepared",
+			signalDigest: envelope.reviewId,
+			commitRecovery: { reviewEnvelope: envelope, status: "pass" },
+		} as never);
+		await runtimeDependencies.scheduler.handleLifecycle(
+			{
+				type: "advisor_run_completed",
+				reviewId: envelope.reviewId,
+				trigger: "compliance_review",
+				priority: 100,
+				primarySessionId: "primary",
+				advisorSessionId: "advisor",
+				timestamp: new Date().toISOString(),
+				verdictSubmitted: true,
+			},
+			false,
+		);
+
+		const recoveredDependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			schedulerStore,
+			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
+		});
+		const recovered = new ComplianceRuntime(
+			() => store,
+			new CollectorRuntime(),
+			api,
+			tmpDir,
+			reviewDeps,
+			recoveredDependencies,
+		);
+		const result = await recovered.start("tdd.md");
+		expect(result.status).toBe("completed");
+		expect(recovered.currentTaskState?.status).toBe("completed");
+		const recoveredEvidence = await store.readAll(taskId);
+		expect(
+			recoveredEvidence.some((record) => record.event === "completed" && record.signalDigest === envelope.reviewId),
+		).toBe(true);
+	});
+
 	it("缺任一严格 Verdict 字段均拒绝", async () => {
 		const fields = ["review_id", "project_id", "evidence_revision", "git_head", "diff_hash", "trigger"] as const;
 		for (const field of fields) {
@@ -644,6 +852,23 @@ describe("ComplianceRuntime — acceptVerdict (remediation)", () => {
 		// resumeAfterRemediation should return "active"
 		const status = runtime.resumeAfterRemediation();
 		expect(status).toBe("active");
+		const secondRound = await runtime.requestCompletion({ summary: "第二次" });
+		const request = mockRequestReviewCalls.at(-1);
+		if (!request) throw new Error("missing second-round review request");
+		expect(request.metadata?.attempt).toBe(2);
+		expect(request.metadata?.reviewAttempt).toBe(1);
+		const hook = createComplianceAdvisorHook(reviewDeps.registry, runtime);
+		expect(
+			hook({
+				type: "advisor_before_run",
+				reviewId: secondRound.reviewId,
+				trigger: "compliance_review",
+				priority: 100,
+				metadata: request.metadata,
+				primarySessionId: "primary",
+				advisorSessionId: "advisor",
+			})?.additionalTools?.[0]?.name,
+		).toBe("compliance_verdict");
 	});
 
 	it("should not inject remediation when requiredFixes is empty", async () => {

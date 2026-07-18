@@ -88,6 +88,16 @@ describe("TaskStateMachine — 只有有效 pass verdict 能完成任务", () =>
 		expect(reviewing.status).toBe("advisor_reviewing");
 	});
 
+	it("Envelope persistence failure from active enters stalled", () => {
+		const next = transition(activeTask(), {
+			type: "completion_failed",
+			reviewId: "review:persistence-failed",
+			reason: "disk down",
+		});
+		expect(next.status).toBe("stalled");
+		expect(next.error).toBe("disk down");
+	});
+
 	it("review failure stalls and retry returns to completion_requested", () => {
 		const reviewing = minimalState("advisor_reviewing", { activeReviewId: "review:1" });
 		const stalled = transition(reviewing, { type: "review_failed", reviewId: "review:1", reason: "no_verdict" });

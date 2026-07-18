@@ -103,6 +103,17 @@ export interface StrictCompletionEvidence {
 	readonly delegations: readonly DelegationRecord[];
 }
 
+interface VerdictCommitRecovery {
+	readonly reviewEnvelope: ReviewEnvelope;
+	readonly status: "pass" | "remediate";
+	readonly summary?: string;
+	readonly requiredFixes?: readonly string[];
+}
+
+type VerdictCommitEvidenceRecord = EvidenceRecord & {
+	readonly commitRecovery?: VerdictCommitRecovery;
+};
+
 export interface ComplianceRuntimeDependencies {
 	readonly scheduler: ReviewScheduler;
 	readonly strictEvidence: () => StrictCompletionEvidence;
@@ -129,7 +140,7 @@ export class ComplianceRuntime {
 	private readonly receiptFor: (reviewId: string) => AdvisorReviewReceipt | undefined;
 	private activeEnvelope: ReviewEnvelope | undefined;
 	private schedulerRestored = false;
-	private verdictCommitInProgress = false;
+	private runtimeOperationTail: Promise<void> = Promise.resolve();
 
 	constructor(
 		private readonly getEvidenceStore: () => EvidenceStore,
@@ -200,6 +211,12 @@ export class ComplianceRuntime {
 			throw new Error("TaskContract does not match the loaded TDD contract");
 		}
 		const taskId = strictContract.taskId;
+		const recovered = await this.recoverInterruptedVerdictCommit(strictContract, contract);
+		if (recovered) {
+			this.taskState = recovered;
+			this.contract = contract;
+			return { taskId, status: recovered.status };
+		}
 		const now = new Date().toISOString();
 		const seedFingerprint = `initial-${Date.now()}`;
 		const currentGit = this.authoritativeGit();
@@ -314,7 +331,19 @@ export class ComplianceRuntime {
 	 * @returns status and completion snapshot
 	 * @throws if no task is active or task is not in a completable state
 	 */
-	async requestCompletion(params: {
+	requestCompletion(params: {
+		summary: string;
+		claimedVerification?: string[];
+	}): Promise<{
+		status: string;
+		completionSnapshot: CompletionSnapshot;
+		reviewId: string;
+		receipt: AdvisorReviewReceipt;
+	}> {
+		return this.serializeRuntimeOperation(() => this.requestCompletionExclusive(params));
+	}
+
+	private async requestCompletionExclusive(params: {
 		summary: string;
 		claimedVerification?: string[];
 	}): Promise<{
@@ -368,13 +397,21 @@ export class ComplianceRuntime {
 			trigger: "compliance_review",
 			createdAt: new Date().toISOString(),
 		});
-		this.activeEnvelope = strictEnvelope;
-
 		// Envelope persistence is the commit point: state cannot advance before this succeeds.
-		await this.writeEvidenceRecord("completion_requested", {
-			signalDigest: strictEnvelope.envelopeHash,
-			reviewEnvelope: strictEnvelope,
-		});
+		try {
+			await this.writeEvidenceRecord("completion_requested", {
+				signalDigest: strictEnvelope.envelopeHash,
+				reviewEnvelope: strictEnvelope,
+			});
+		} catch (error) {
+			this.taskState = transition(this.taskState, {
+				type: "completion_failed",
+				reviewId: strictEnvelope.reviewId,
+				reason: error instanceof Error ? error.message : "Completion Envelope persistence failed",
+			});
+			throw error;
+		}
+		this.activeEnvelope = strictEnvelope;
 
 		this.taskState = transition(this.taskState, {
 			type: "completion_requested",
@@ -411,6 +448,7 @@ export class ComplianceRuntime {
 				evidenceRevision: strictEnvelope.evidenceRevision,
 				gitHead: strictEnvelope.gitHead,
 				diffHash: strictEnvelope.diffHash,
+				taskAttempt: strictEnvelope.attempt,
 				metadata: {
 					sessionId,
 					envelopeHash: strictEnvelope.envelopeHash,
@@ -468,15 +506,10 @@ export class ComplianceRuntime {
 	 * @param verdict — raw advisor verdict (schema_version, task_id, ...)
 	 */
 	async acceptVerdict(verdict: Record<string, unknown>): Promise<{ accepted: boolean; reason?: string }> {
-		if (this.verdictCommitInProgress) {
-			return { accepted: false, reason: "A verdict commit is already in progress" };
+		if (this.taskState?.status === "completion_requested") {
+			return { accepted: false, reason: "No matching active Advisor review" };
 		}
-		this.verdictCommitInProgress = true;
-		try {
-			return await this.acceptVerdictExclusive(verdict);
-		} finally {
-			this.verdictCommitInProgress = false;
-		}
+		return this.serializeRuntimeOperation(() => this.acceptVerdictExclusive(verdict));
 	}
 
 	private async acceptVerdictExclusive(
@@ -599,12 +632,20 @@ export class ComplianceRuntime {
 				summary: findings.length > 0 ? findings[0].reason : undefined,
 				schemaValid: true,
 			});
+			await this.writeEvidenceRecord("verdict_commit_prepared", {
+				signalDigest: this.activeEnvelope.reviewId,
+				commitRecovery: {
+					reviewEnvelope: this.activeEnvelope,
+					status: "pass",
+					summary: findings.length > 0 ? findings[0].reason : undefined,
+				},
+			});
 			const committed = prepared.commit();
 			if (committed.status !== "accepted") return { accepted: false, reason: committed.reason };
 			try {
 				await this.commitAdvisorLifecycle();
 				await this.writeEvidenceRecord("completed", {
-					signalDigest: "advisor-pass",
+					signalDigest: this.activeEnvelope.reviewId,
 					verdictSummary: findings.length > 0 ? findings[0].reason : undefined,
 				});
 				this.taskState = nextState;
@@ -613,7 +654,7 @@ export class ComplianceRuntime {
 				await this.compensateAdvisorLifecycle();
 				throw error;
 			}
-			await this.scheduler.pump();
+			await this.dispatchFollowingReviews();
 			return { accepted: true };
 		}
 
@@ -629,13 +670,22 @@ export class ComplianceRuntime {
 			requiredFixes: fixes,
 			schemaValid: true,
 		});
+		await this.writeEvidenceRecord("verdict_commit_prepared", {
+			signalDigest: this.activeEnvelope.reviewId,
+			commitRecovery: {
+				reviewEnvelope: this.activeEnvelope,
+				status: "remediate",
+				summary: findings.length > 0 ? findings[0].reason : undefined,
+				requiredFixes: fixes,
+			},
+		});
 
 		const committed = prepared.commit();
 		if (committed.status !== "accepted") return { accepted: false, reason: committed.reason };
 		try {
 			await this.commitAdvisorLifecycle();
 			await this.writeEvidenceRecord("remediation_required", {
-				signalDigest: "advisor-remediate",
+				signalDigest: this.activeEnvelope.reviewId,
 				verdictSummary: findings.length > 0 ? findings[0].reason : undefined,
 			});
 			this.taskState = nextState;
@@ -644,7 +694,7 @@ export class ComplianceRuntime {
 			await this.compensateAdvisorLifecycle();
 			throw error;
 		}
-		await this.scheduler.pump();
+		await this.dispatchFollowingReviews();
 
 		// Only inject if not stalled
 		if (this.taskState.status !== "stalled") {
@@ -664,7 +714,11 @@ export class ComplianceRuntime {
 		return { accepted: true };
 	}
 
-	async handleAdvisorLifecycle(event: AdvisorReviewLifecycleEvent): Promise<void> {
+	handleAdvisorLifecycle(event: AdvisorReviewLifecycleEvent): Promise<void> {
+		return this.serializeRuntimeOperation(() => this.handleAdvisorLifecycleExclusive(event));
+	}
+
+	private async handleAdvisorLifecycleExclusive(event: AdvisorReviewLifecycleEvent): Promise<void> {
 		await this.scheduler.handleLifecycle(event);
 		if (!this.taskState || event.reviewId !== this.taskState.activeReviewId) return;
 		if (
@@ -680,7 +734,11 @@ export class ComplianceRuntime {
 		}
 	}
 
-	async retryDueReviews(): Promise<void> {
+	retryDueReviews(): Promise<void> {
+		return this.serializeRuntimeOperation(() => this.retryDueReviewsExclusive());
+	}
+
+	private async retryDueReviewsExclusive(): Promise<void> {
 		if (this.taskState?.status !== "stalled" || !this.activeEnvelope) return;
 		const queued = this.scheduler.nextDueIntent(this.activeEnvelope.taskId, "compliance_review");
 		if (!queued) return;
@@ -714,7 +772,19 @@ export class ComplianceRuntime {
 				Object.freeze({ ...previous, reviewId: retryEnvelope.reviewId, createdAt: retryEnvelope.createdAt }),
 			);
 		}
-		await this.scheduler.pump();
+		try {
+			await this.scheduler.pump();
+		} catch (error) {
+			this.taskState = transition(this.taskState, {
+				type: "review_failed",
+				reviewId: retryEnvelope.reviewId,
+				reason: error instanceof Error ? error.message : "Scheduler retry dispatch failed",
+			});
+			await this.writeEvidenceRecord("advisor_unavailable", {
+				signalDigest: "scheduler-retry-dispatch-failed",
+			});
+			return;
+		}
 		const receipt = this.receiptFor(retryEnvelope.reviewId);
 		if (receipt?.status !== "accepted" || this.scheduler.snapshot().inFlight?.reviewId !== retryEnvelope.reviewId) {
 			this.taskState = transition(this.taskState, {
@@ -791,6 +861,23 @@ export class ComplianceRuntime {
 	}
 
 	// ─── Private helpers ───────────────────────────────────────────
+	private serializeRuntimeOperation<T>(operation: () => Promise<T>): Promise<T> {
+		const result = this.runtimeOperationTail.then(operation, operation);
+		this.runtimeOperationTail = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
+	}
+
+	private async dispatchFollowingReviews(): Promise<void> {
+		try {
+			await this.scheduler.pump();
+		} catch {
+			// The current verdict is already durable; a later scheduler tick retries queued work.
+		}
+	}
+
 	private validateStrictEvidence(
 		currentGit: { gitHead: string; diffHash: `sha256:${string}` },
 		snapshot: CompletionSnapshot,
@@ -826,6 +913,88 @@ export class ComplianceRuntime {
 				evidenceFacts: snapshot.evidenceFacts,
 			}),
 		);
+	}
+
+	private async recoverInterruptedVerdictCommit(
+		taskContract: TaskContract,
+		contract: ComplianceContract,
+	): Promise<TaskState | undefined> {
+		const taskId = taskContract.taskId;
+		const records = (await this.evidenceStore.readAll(taskId)) as VerdictCommitEvidenceRecord[];
+		const preparedIndex = records.findLastIndex((record) => record.event === "verdict_commit_prepared");
+		if (preparedIndex < 0) return undefined;
+		const prepared = records[preparedIndex];
+		const recovery = prepared.commitRecovery;
+		if (
+			!recovery ||
+			(recovery.status !== "pass" && recovery.status !== "remediate") ||
+			(recovery.summary !== undefined && (typeof recovery.summary !== "string" || recovery.summary.length > 2_048)) ||
+			!this.persistedEnvelopeMatches(recovery.reviewEnvelope, recovery.reviewEnvelope) ||
+			recovery.reviewEnvelope.taskId !== taskContract.taskId ||
+			recovery.reviewEnvelope.projectId !== taskContract.projectId ||
+			recovery.reviewEnvelope.contractHash !== taskContract.contractHash
+		) {
+			throw new Error("Verdict commit recovery journal is invalid");
+		}
+		if (
+			recovery.status === "remediate" &&
+			(!Array.isArray(recovery.requiredFixes) ||
+				recovery.requiredFixes.length === 0 ||
+				recovery.requiredFixes.some((fix) => typeof fix !== "string" || fix.length === 0 || fix.length > 2_048))
+		) {
+			throw new Error("Verdict commit recovery fixes are invalid");
+		}
+		const expectedTerminal = recovery.status === "pass" ? "completed" : "remediation_required";
+		const terminal = records
+			.slice(preparedIndex + 1)
+			.find((record) => record.signalDigest === recovery.reviewEnvelope.reviewId && record.event === expectedTerminal);
+		const schedulerState = this.scheduler.snapshot();
+		const schedulerCompleted = schedulerState.completed.some(
+			(intent) => intent.reviewId === recovery.reviewEnvelope.reviewId,
+		);
+		if (!terminal && !schedulerCompleted) {
+			await this.scheduler.abandonReview(recovery.reviewEnvelope.reviewId);
+			return undefined;
+		}
+		if (!schedulerCompleted) await this.scheduler.abandonReview(recovery.reviewEnvelope.reviewId);
+		if (!terminal) {
+			await this.evidenceStore.append({
+				schemaVersion: 1,
+				timestamp: new Date().toISOString(),
+				taskId,
+				contractPath: contract.tddPath,
+				contractHash: contract.contractHash,
+				attempt: recovery.reviewEnvelope.attempt,
+				event: expectedTerminal,
+				signalDigest: recovery.reviewEnvelope.reviewId,
+				verdictSummary: recovery.summary,
+				worktreeFingerprint: "recovered-verdict-commit",
+			});
+		}
+		this.activeEnvelope = recovery.reviewEnvelope;
+		const now = new Date().toISOString();
+		return {
+			taskId,
+			projectId: recovery.reviewEnvelope.projectId,
+			status: recovery.status === "pass" ? "completed" : "remediation_required",
+			attempt: recovery.reviewEnvelope.attempt,
+			contractHash: contract.contractHash,
+			evidenceRevision: recovery.reviewEnvelope.evidenceRevision,
+			gitHead: recovery.reviewEnvelope.gitHead,
+			diffHash: recovery.reviewEnvelope.diffHash,
+			activeReviewId: recovery.reviewEnvelope.reviewId,
+			tddPath: contract.tddPath,
+			worktreeFingerprint: "recovered-verdict-commit",
+			createdAt: recovery.reviewEnvelope.createdAt,
+			updatedAt: now,
+			lastVerdict: {
+				status: recovery.status === "pass" ? "pass" : "remediation_required",
+				summary: recovery.summary,
+				requiredFixes: recovery.status === "remediate" ? [...(recovery.requiredFixes ?? [])] : undefined,
+				schemaValid: true,
+			},
+			consecutiveStalledFingerprints: 0,
+		};
 	}
 
 	private persistedEnvelopeMatches(persisted: ReviewEnvelope | undefined, active: ReviewEnvelope | undefined): boolean {
@@ -885,13 +1054,16 @@ export class ComplianceRuntime {
 
 	private async writeEvidenceRecord(
 		event: string,
-		extra: Partial<EvidenceRecord> & { reviewEnvelope?: ReviewEnvelope },
+		extra: Partial<EvidenceRecord> & {
+			reviewEnvelope?: ReviewEnvelope;
+			commitRecovery?: VerdictCommitRecovery;
+		},
 	): Promise<void> {
 		if (!this.taskState || !this.contract) {
 			return;
 		}
 
-		const record: EvidenceRecord & { reviewEnvelope?: ReviewEnvelope } = {
+		const record: VerdictCommitEvidenceRecord & { reviewEnvelope?: ReviewEnvelope } = {
 			schemaVersion: 1,
 			timestamp: new Date().toISOString(),
 			taskId: this.taskState.taskId,
@@ -903,6 +1075,7 @@ export class ComplianceRuntime {
 			verdictSummary: extra.verdictSummary,
 			worktreeFingerprint: extra.worktreeFingerprint ?? this.taskState.worktreeFingerprint,
 			...(extra.reviewEnvelope ? { reviewEnvelope: extra.reviewEnvelope } : {}),
+			...(extra.commitRecovery ? { commitRecovery: extra.commitRecovery } : {}),
 		};
 
 		await this.evidenceStore.append(record);

@@ -91,6 +91,12 @@ function transitionActive(state: TaskState, event: TaskEvent): TaskState {
 				diffHash: event.diffHash,
 				error: undefined,
 			});
+		case "completion_failed":
+			return update(state, {
+				status: "stalled",
+				activeReviewId: event.reviewId,
+				error: event.reason,
+			});
 		default:
 			return withError(state, `Cannot handle ${event.type} from active`);
 	}

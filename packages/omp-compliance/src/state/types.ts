@@ -76,6 +76,7 @@ export type TaskEvent =
 			diffHash: string;
 	  }
 	| { type: "advisor_accepted"; reviewId: string }
+	| { type: "completion_failed"; reviewId: string; reason: string }
 	| { type: "review_failed"; reviewId: string; reason: string }
 	| { type: "retry"; reviewId: string }
 	| { type: "override"; reason: string; actor: "user" }

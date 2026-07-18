@@ -15,6 +15,7 @@ export function buildReviewDedupeKey(input: ReviewIntentInput): string {
 		input.evidenceRevision,
 		input.gitHead,
 		input.diffHash,
+		input.taskAttempt ?? null,
 	]);
 }
 

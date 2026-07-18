@@ -146,9 +146,18 @@ describe("ReviewScheduler", () => {
 			{ evidenceRevision: "evidence-8" },
 			{ gitHead: "def456" },
 			{ diffHash: "sha256:diff-b" },
+			{ taskAttempt: 2 },
 		]) {
 			expect(buildReviewDedupeKey({ ...base, ...changed })).not.toBe(key);
 		}
+	});
+
+	it("keeps task attempt separate from scheduler review attempt", async () => {
+		const { requests, scheduler } = harness();
+		await scheduler.enqueue(intent({ trigger: "compliance_review", priority: 100, taskAttempt: 7 }));
+		await scheduler.pump();
+		expect(requests[0]?.metadata?.attempt).toBe(7);
+		expect(requests[0]?.metadata?.reviewAttempt).toBe(1);
 	});
 
 	it("deduplicates stable intents, lets impact absorb file change, and force nonce creates a new manual request", async () => {
@@ -701,6 +710,18 @@ describe("ReviewScheduler", () => {
 		await scheduler.restoreCompleted(reviewId);
 		expect(scheduler.snapshot().completed.map((item) => item.reviewId)).not.toContain(reviewId);
 		expect(scheduler.snapshot().inFlight?.reviewId).toBe(reviewId);
+	});
+
+	it("abandons an interrupted review and releases its dedupe identity for recovery", async () => {
+		const { scheduler } = harness();
+		const input = intent({ trigger: "compliance_review", priority: 100, taskAttempt: 1 });
+		await scheduler.enqueue(input);
+		await scheduler.pump();
+		const reviewId = defined(scheduler.snapshot().inFlight).reviewId;
+
+		expect(await scheduler.abandonReview(reviewId)).toBe(true);
+		expect(scheduler.snapshot().inFlight).toBeUndefined();
+		expect((await scheduler.enqueue(input)).kind).toBe("enqueued");
 	});
 
 	it("saturates the retry counter without ever stopping retries", async () => {

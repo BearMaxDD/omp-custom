@@ -12,7 +12,11 @@ import {
 } from "../../src/delegation/delegation-supervisor";
 import type { EvidenceStore } from "../../src/evidence/evidence-store";
 import { type ComplianceRuntimeDependencies, readAuthoritativeGitContext } from "../../src/runtime/compliance-runtime";
-import { JsonFileReviewSchedulerStore, ReviewScheduler } from "../../src/scheduler/review-scheduler";
+import {
+	JsonFileReviewSchedulerStore,
+	ReviewScheduler,
+	type ReviewSchedulerStore,
+} from "../../src/scheduler/review-scheduler";
 import { createCodebaseEvidencePack, createTrustedCodebaseValidationContext } from "../../src/signals/codebase-memory";
 import { createControlledCollectorRuntime } from "../../src/signals/collector-runtime";
 
@@ -88,6 +92,7 @@ export function createStrictRuntimeDependencies(input: {
 	store: EvidenceStore;
 	requestAdvisorReview: (request: AdvisorReviewRequest) => Promise<AdvisorReviewReceipt>;
 	now?: () => number;
+	schedulerStore?: ReviewSchedulerStore;
 }): ComplianceRuntimeDependencies {
 	const tddPath = input.tddPath ?? "tdd.md";
 	const absoluteTddPath = join(input.repoRoot, tddPath);
@@ -153,7 +158,9 @@ export function createStrictRuntimeDependencies(input: {
 	const scheduler = new ReviewScheduler({
 		clock: { now: input.now ?? (() => Date.now()) },
 		random: () => 0,
-		store: new JsonFileReviewSchedulerStore(join(input.repoRoot, ".omp", "compliance", "review-scheduler.json")),
+		store:
+			input.schedulerStore ??
+			new JsonFileReviewSchedulerStore(join(input.repoRoot, ".omp", "compliance", "review-scheduler.json")),
 		requester: async (request) => {
 			try {
 				const hostReceipt = await input.requestAdvisorReview(request);
