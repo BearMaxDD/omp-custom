@@ -1080,13 +1080,19 @@ describe("ComplianceRuntime — lifecycle 与严格 Verdict 绑定", () => {
 
 	it("后续 completion 已开始时不得复活旧 remediation journal", async () => {
 		const schedulerStore = new ControllableSchedulerStore();
-		runtimeDependencies = createStrictRuntimeDependencies({
+		let persisted: ComplianceRuntimePersistenceSnapshot | undefined;
+		const initialDependencies = createStrictRuntimeDependencies({
 			repoRoot: tmpDir,
 			store,
 			schedulerStore,
 			requestAdvisorReview: (request) => reviewDeps.requestAdvisorReview(request),
 		});
-		runtime = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps, runtimeDependencies);
+		runtime = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps, {
+			...initialDependencies,
+			persistRuntimeState: (_taskId, snapshot) => {
+				persisted = structuredClone(snapshot);
+			},
+		});
 		await runtime.start("tdd.md");
 		await runtime.requestCompletion({ summary: "first" });
 		await runtime.acceptVerdict(
@@ -1097,6 +1103,12 @@ describe("ComplianceRuntime — lifecycle 与严格 Verdict 绑定", () => {
 		);
 		await runtime.resumeAfterRemediation();
 		const second = await runtime.requestCompletion({ summary: "second" });
+		if (!persisted?.taskState || persisted.taskState.activeReviewId !== second.reviewId) {
+			throw new Error("second-round state was not persisted");
+		}
+		const oldJournalReviewId = (await store.readAll(persisted.taskState.taskId)).find(
+			(record) => record.event === "verdict_commit_prepared",
+		)?.signalDigest;
 
 		const recoveredDependencies = createStrictRuntimeDependencies({
 			repoRoot: tmpDir,
@@ -1112,18 +1124,16 @@ describe("ComplianceRuntime — lifecycle 与严格 Verdict 绑定", () => {
 			reviewDeps,
 			recoveredDependencies,
 		);
-		const result = await recovered.start("tdd.md");
+		await recoveredDependencies.scheduler.restore();
+		await recovered.restorePersistedState(initialDependencies.strictEvidence().taskContract, persisted);
+		await recovered.retryDueReviews();
 
-		expect(result.status).not.toBe("remediation_required");
-		expect(recovered.currentTaskState?.activeReviewId).not.toBe(
-			(await store.readAll(String(recovered.currentTaskState?.taskId))).find(
-				(record) => record.event === "verdict_commit_prepared",
-			)?.signalDigest,
-		);
+		expect(recovered.currentTaskState?.status).toBe("advisor_reviewing");
+		expect(recovered.currentTaskState?.activeReviewId).not.toBe(oldJournalReviewId);
+		expect(recovered.currentTaskState?.activeReviewId).not.toBe(second.reviewId);
+		expect(mockRequestReviewCalls.length).toBe(3);
 		const schedulerState = recoveredDependencies.scheduler.snapshot();
-		expect(schedulerState.inFlight?.reviewId).not.toBe(second.reviewId);
-		expect(schedulerState.queued.some((intent) => intent.reviewId === second.reviewId)).toBe(false);
-		expect(schedulerState.completed.some((intent) => intent.reviewId === second.reviewId)).toBe(false);
+		expect(schedulerState.inFlight?.reviewId).toBe(recovered.currentTaskState?.activeReviewId);
 	});
 
 	it("工作区 Git 上下文变化后不得恢复旧 pass", async () => {

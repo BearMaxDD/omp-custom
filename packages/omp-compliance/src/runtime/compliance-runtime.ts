@@ -1174,16 +1174,6 @@ export class ComplianceRuntime {
 		const prepared = records[preparedIndex];
 		const laterRecords = records.slice(preparedIndex + 1);
 		if (laterRecords.some((record) => record.event === "completion_requested" || record.event === "completion_retry")) {
-			const supersededReviewIds = new Set<string>();
-			for (const record of laterRecords) {
-				if (
-					(record.event === "completion_requested" || record.event === "completion_retry") &&
-					record.reviewEnvelope?.reviewId
-				) {
-					supersededReviewIds.add(record.reviewEnvelope.reviewId);
-				}
-			}
-			for (const reviewId of supersededReviewIds) await this.scheduler.abandonReview(reviewId);
 			return undefined;
 		}
 		const recovery = prepared.commitRecovery;
