@@ -401,6 +401,17 @@ function createRuntimeBundle(
 					record.reviewEnvelope?.reviewId === reviewId,
 			)?.reviewEnvelope;
 		},
+		readAdvisorEnvelope: async (taskId, reviewId) => {
+			const records = (await getEvidenceStore().readAll(taskId)) as Array<{
+				event: string;
+				advisorEnvelope?: import("./advisor/review-envelope").ComplianceReviewEnvelope;
+			}>;
+			return records.findLast(
+				(record) =>
+					(record.event === "completion_requested" || record.event === "completion_retry") &&
+					record.advisorEnvelope?.reviewId === reviewId,
+			)?.advisorEnvelope;
+		},
 		receiptFor: (reviewId) => receipts.get(reviewId),
 		persistRuntimeState: (taskId, snapshot) => policyEvidence.task(taskId).state.write(snapshot),
 	});
@@ -473,6 +484,8 @@ function createRuntimeBundle(
 					await runtime.stallForInfrastructure("Pre-tool Evidence persistence failed");
 				}
 				result = { block: true, reason: decision.reason };
+			} else if (decision.invalidatesEvidence) {
+				collector.invalidateCodebaseEvidence();
 			}
 		}
 		collector.recordToolCall(event, context);

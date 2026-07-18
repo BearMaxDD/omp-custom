@@ -10,7 +10,10 @@ import { createReviewEnvelope } from "../../src/contracts/review-envelope";
 import { EvidenceStore } from "../../src/evidence/evidence-store";
 import { buildCompletionSnapshot } from "../../src/runtime/completion-gate";
 import { ComplianceRuntime } from "../../src/runtime/compliance-runtime";
-import type { ComplianceRuntimeDependencies } from "../../src/runtime/compliance-runtime";
+import type {
+	ComplianceRuntimeDependencies,
+	ComplianceRuntimePersistenceSnapshot,
+} from "../../src/runtime/compliance-runtime";
 import type { ReviewSchedulerState, ReviewSchedulerStore } from "../../src/scheduler/review-scheduler";
 import { CollectorRuntime } from "../../src/signals/collector-runtime";
 import { createStrictRuntimeDependencies } from "../support/strict-runtime-dependencies";
@@ -237,6 +240,14 @@ describe("ComplianceRuntime — start", () => {
 		expect(runtime.start("tdd.md")).rejects.toThrow("already active");
 	});
 
+	it("stalled 任务也不能通过再次 start 重置失败状态", async () => {
+		await runtime.start("tdd.md");
+		await runtime.stallForInfrastructure("disk down");
+		expect(runtime.currentTaskState?.status).toBe("stalled");
+		await expect(runtime.start("tdd.md")).rejects.toThrow("already active");
+		expect(runtime.currentTaskState?.status).toBe("stalled");
+	});
+
 	it("并发 start 只允许一个调用建立 active 任务", async () => {
 		const results = await Promise.allSettled([runtime.start("tdd.md"), runtime.start("tdd.md")]);
 		expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
@@ -245,6 +256,66 @@ describe("ComplianceRuntime — start", () => {
 		if (!taskId) throw new Error("missing active task");
 		const evidence = await store.readAll(taskId);
 		expect(evidence.filter((record) => record.event === "active")).toHaveLength(1);
+	});
+});
+
+describe("ComplianceRuntime — persisted recovery", () => {
+	it("重启后将 Scheduler 回收的 in-flight Completion Review 自动重新提交", async () => {
+		const schedulerStore = new ControllableSchedulerStore();
+		let persisted: ComplianceRuntimePersistenceSnapshot | undefined;
+		let reviewRequests = 0;
+		const firstDependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			schedulerStore,
+			requestAdvisorReview: async (request) => {
+				reviewRequests += 1;
+				return { status: "accepted", reviewId: request.reviewId };
+			},
+		});
+		const firstRuntime = new ComplianceRuntime(() => store, collector, api, tmpDir, reviewDeps, {
+			...firstDependencies,
+			persistRuntimeState: (_taskId, snapshot) => {
+				persisted = structuredClone(snapshot);
+			},
+		});
+		await firstRuntime.start("tdd.md");
+		expect((await firstRuntime.requestCompletion({ summary: "Done" })).status).toBe("advisor_reviewing");
+		if (!persisted) throw new Error("runtime state was not persisted");
+
+		const secondDependencies = createStrictRuntimeDependencies({
+			repoRoot: tmpDir,
+			store,
+			schedulerStore,
+			requestAdvisorReview: async (request) => {
+				reviewRequests += 1;
+				return { status: "accepted", reviewId: request.reviewId };
+			},
+		});
+		const recoveredRuntime = new ComplianceRuntime(
+			() => store,
+			new CollectorRuntime(),
+			api,
+			tmpDir,
+			reviewDeps,
+			secondDependencies,
+		);
+		await secondDependencies.scheduler.restore();
+		const originalAdvisorEnvelope = reviewDeps.registry.get(String(persisted.activeEnvelope?.reviewId));
+		if (!originalAdvisorEnvelope) throw new Error("authoritative Advisor Envelope was not registered");
+		const tamperedSnapshot = {
+			...persisted,
+			advisorEnvelope: { ...originalAdvisorEnvelope, context: "UNTRUSTED STATE INJECTION" },
+		} as unknown as ComplianceRuntimePersistenceSnapshot;
+		await recoveredRuntime.restorePersistedState(firstDependencies.strictEvidence().taskContract, tamperedSnapshot);
+		expect(reviewDeps.registry.get(String(persisted.activeEnvelope?.reviewId))?.context).not.toContain(
+			"UNTRUSTED STATE INJECTION",
+		);
+		await recoveredRuntime.retryDueReviews();
+
+		expect(reviewRequests).toBe(2);
+		expect(recoveredRuntime.currentTaskState?.status).toBe("advisor_reviewing");
+		expect(recoveredRuntime.currentTaskState?.activeReviewId).not.toBe(persisted.activeEnvelope?.reviewId);
 	});
 });
 

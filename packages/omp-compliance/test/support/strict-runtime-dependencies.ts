@@ -192,6 +192,17 @@ export function createStrictRuntimeDependencies(input: {
 					record.reviewEnvelope?.reviewId === reviewId,
 			)?.reviewEnvelope;
 		},
+		readAdvisorEnvelope: async (taskId, reviewId) => {
+			const records = (await input.store.readAll(taskId)) as Array<{
+				event: string;
+				advisorEnvelope?: import("../../src/advisor/review-envelope").ComplianceReviewEnvelope;
+			}>;
+			return records.findLast(
+				(record) =>
+					(record.event === "completion_requested" || record.event === "completion_retry") &&
+					record.advisorEnvelope?.reviewId === reviewId,
+			)?.advisorEnvelope;
+		},
 		receiptFor: (reviewId) => receipts.get(reviewId),
 	};
 }

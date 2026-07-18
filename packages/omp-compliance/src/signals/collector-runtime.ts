@@ -40,6 +40,11 @@ export class CollectorRuntime {
 		return undefined;
 	}
 
+	invalidateCodebaseEvidence(): undefined {
+		this.collector.invalidateCodebaseMemory();
+		return undefined;
+	}
+
 	recordTurnEnd(_event: Record<string, unknown>): undefined {
 		return undefined;
 	}

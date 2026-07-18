@@ -688,6 +688,13 @@ export class ToolEventCollector {
 		this.retired = new RetiredCallBloom();
 	}
 
+	/** Remove only graph-derived evidence after the repository index is rebuilt. */
+	invalidateCodebaseMemory(): void {
+		for (const [storageId, call] of this.calls) {
+			if (call.serverName === "codebase-memory") this.evictCall(storageId);
+		}
+	}
+
 	// ─── Private helpers ────────────────────────────────────────
 
 	private isXdevCandidate(toolName: string, input: object): boolean {

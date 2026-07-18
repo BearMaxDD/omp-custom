@@ -130,6 +130,7 @@ interface VerdictCommitRecovery {
 type VerdictCommitEvidenceRecord = EvidenceRecord & {
 	readonly commitRecovery?: VerdictCommitRecovery;
 	readonly reviewEnvelope?: ReviewEnvelope;
+	readonly advisorEnvelope?: ComplianceReviewEnvelope;
 };
 
 export interface ComplianceRuntimeDependencies {
@@ -137,6 +138,7 @@ export interface ComplianceRuntimeDependencies {
 	readonly strictEvidence: () => StrictCompletionEvidence;
 	readonly gitContext: () => { gitHead: string; diffHash: `sha256:${string}` };
 	readonly readEnvelope: (taskId: string, reviewId: string) => Promise<ReviewEnvelope | undefined>;
+	readonly readAdvisorEnvelope: (taskId: string, reviewId: string) => Promise<ComplianceReviewEnvelope | undefined>;
 	readonly receiptFor: (reviewId: string) => AdvisorReviewReceipt | undefined;
 	readonly persistRuntimeState?: (
 		taskId: string,
@@ -148,7 +150,6 @@ export interface ComplianceRuntimePersistenceSnapshot {
 	readonly schemaVersion: 1;
 	readonly taskState: TaskState | null;
 	readonly activeEnvelope?: ReviewEnvelope;
-	readonly advisorEnvelope?: ComplianceReviewEnvelope;
 }
 
 /**
@@ -166,6 +167,10 @@ export class ComplianceRuntime {
 	private readonly strictEvidence: () => StrictCompletionEvidence;
 	private readonly authoritativeGit: () => { gitHead: string; diffHash: `sha256:${string}` };
 	private readonly authoritativeEnvelope: (taskId: string, reviewId: string) => Promise<ReviewEnvelope | undefined>;
+	private readonly authoritativeAdvisorEnvelope: (
+		taskId: string,
+		reviewId: string,
+	) => Promise<ComplianceReviewEnvelope | undefined>;
 	private readonly receiptFor: (reviewId: string) => AdvisorReviewReceipt | undefined;
 	private readonly persistRuntimeState?: ComplianceRuntimeDependencies["persistRuntimeState"];
 	private activeEnvelope: ReviewEnvelope | undefined;
@@ -187,6 +192,7 @@ export class ComplianceRuntime {
 			typeof dependencies.strictEvidence !== "function" ||
 			typeof dependencies.gitContext !== "function" ||
 			typeof dependencies.readEnvelope !== "function" ||
+			typeof dependencies.readAdvisorEnvelope !== "function" ||
 			typeof dependencies.receiptFor !== "function"
 		) {
 			throw new Error("Strict authoritative providers and injected Scheduler are required");
@@ -195,6 +201,7 @@ export class ComplianceRuntime {
 		this.strictEvidence = dependencies.strictEvidence;
 		this.authoritativeGit = dependencies.gitContext;
 		this.authoritativeEnvelope = dependencies.readEnvelope;
+		this.authoritativeAdvisorEnvelope = dependencies.readAdvisorEnvelope;
 		this.receiptFor = dependencies.receiptFor;
 		this.persistRuntimeState = dependencies.persistRuntimeState;
 	}
@@ -209,6 +216,9 @@ export class ComplianceRuntime {
 			const state = snapshot.taskState;
 			const contract = loadComplianceContract(join(this.repoRoot, taskContract.tddPath ?? ""), this.repoRoot);
 			const currentGit = this.authoritativeGit();
+			const authoritativeAdvisor = state.activeReviewId
+				? await this.authoritativeAdvisorEnvelope(state.taskId, state.activeReviewId)
+				: undefined;
 			if (
 				!RECOVERABLE_TASK_STATUSES.has(state.status) ||
 				state.taskId !== taskContract.taskId ||
@@ -234,7 +244,7 @@ export class ComplianceRuntime {
 				if (
 					state.diffHash !== currentGit.diffHash ||
 					!snapshot.activeEnvelope ||
-					!snapshot.advisorEnvelope ||
+					!authoritativeAdvisor ||
 					!this.persistedEnvelopeMatches(snapshot.activeEnvelope, snapshot.activeEnvelope) ||
 					snapshot.activeEnvelope.reviewId !== state.activeReviewId ||
 					snapshot.activeEnvelope.taskId !== state.taskId ||
@@ -245,31 +255,44 @@ export class ComplianceRuntime {
 					snapshot.activeEnvelope.diffHash !== state.diffHash ||
 					snapshot.activeEnvelope.attempt !== state.attempt ||
 					snapshot.activeEnvelope.trigger !== "compliance_review" ||
-					snapshot.advisorEnvelope.reviewId !== state.activeReviewId ||
-					snapshot.advisorEnvelope.taskId !== state.taskId ||
-					snapshot.advisorEnvelope.projectId !== state.projectId ||
-					snapshot.advisorEnvelope.contractHash !== state.contractHash ||
-					snapshot.advisorEnvelope.evidenceRevision !== snapshot.activeEnvelope.evidenceRevision ||
-					snapshot.advisorEnvelope.gitHead !== snapshot.activeEnvelope.gitHead ||
-					snapshot.advisorEnvelope.diffHash !== snapshot.activeEnvelope.diffHash ||
-					snapshot.advisorEnvelope.trigger !== "compliance_review" ||
-					typeof snapshot.advisorEnvelope.sessionId !== "string" ||
-					snapshot.advisorEnvelope.sessionId.length === 0 ||
-					snapshot.advisorEnvelope.sessionId.length > 512 ||
-					typeof snapshot.advisorEnvelope.context !== "string" ||
-					snapshot.advisorEnvelope.context.length > 256 * 1024 ||
-					typeof snapshot.advisorEnvelope.rules !== "string" ||
-					snapshot.advisorEnvelope.rules.length > 64 * 1024
+					authoritativeAdvisor.reviewId !== state.activeReviewId ||
+					authoritativeAdvisor.taskId !== state.taskId ||
+					authoritativeAdvisor.projectId !== state.projectId ||
+					authoritativeAdvisor.contractHash !== state.contractHash ||
+					authoritativeAdvisor.evidenceRevision !== snapshot.activeEnvelope.evidenceRevision ||
+					authoritativeAdvisor.gitHead !== snapshot.activeEnvelope.gitHead ||
+					authoritativeAdvisor.diffHash !== snapshot.activeEnvelope.diffHash ||
+					authoritativeAdvisor.attempt !== snapshot.activeEnvelope.attempt ||
+					authoritativeAdvisor.createdAt !== snapshot.activeEnvelope.createdAt ||
+					authoritativeAdvisor.trigger !== "compliance_review" ||
+					typeof authoritativeAdvisor.sessionId !== "string" ||
+					authoritativeAdvisor.sessionId.length === 0 ||
+					authoritativeAdvisor.sessionId.length > 512 ||
+					typeof authoritativeAdvisor.context !== "string" ||
+					authoritativeAdvisor.context.length > 256 * 1024 ||
+					typeof authoritativeAdvisor.rules !== "string" ||
+					authoritativeAdvisor.rules.length > 64 * 1024
 				) {
 					throw new Error("Persisted compliance Review Envelope mismatch");
 				}
-			} else if (snapshot.activeEnvelope || snapshot.advisorEnvelope) {
+			} else if (snapshot.activeEnvelope) {
 				throw new Error("Persisted compliance Review Envelope is unexpected");
 			}
 			this.taskState = structuredClone(state);
+			if (
+				state.activeReviewId &&
+				(state.status === "completion_requested" || state.status === "advisor_reviewing") &&
+				this.scheduler.nextDueIntent(state.taskId, "compliance_review")
+			) {
+				this.taskState = transition(this.taskState, {
+					type: "review_failed",
+					reviewId: state.activeReviewId,
+					reason: "Advisor review interrupted by runtime restart",
+				});
+			}
 			this.contract = contract;
 			this.activeEnvelope = snapshot.activeEnvelope;
-			this.activeAdvisorEnvelope = snapshot.advisorEnvelope;
+			this.activeAdvisorEnvelope = authoritativeAdvisor;
 			if (this.activeAdvisorEnvelope) this.reviewDeps.registry.put(this.activeAdvisorEnvelope);
 			return this.taskState;
 		});
@@ -309,7 +332,7 @@ export class ComplianceRuntime {
 	}
 
 	private async startExclusive(tddPath: string): Promise<{ taskId: string; status: string }> {
-		if (this.taskState && this.taskState.status !== "stalled") {
+		if (this.taskState) {
 			throw new Error("A compliance task is already active");
 		}
 		if (!this.schedulerRestored) {
@@ -520,11 +543,27 @@ export class ComplianceRuntime {
 			trigger: "compliance_review",
 			createdAt: new Date().toISOString(),
 		});
+		const envelope: ComplianceReviewEnvelope = Object.freeze({
+			reviewId: strictEnvelope.reviewId,
+			sessionId,
+			taskId: strictEnvelope.taskId,
+			projectId: strictEnvelope.projectId,
+			contractHash: strictEnvelope.contractHash as `sha256:${string}`,
+			evidenceRevision: strictEnvelope.evidenceRevision,
+			gitHead: strictEnvelope.gitHead,
+			diffHash: strictEnvelope.diffHash,
+			trigger: strictEnvelope.trigger,
+			attempt: strictEnvelope.attempt,
+			context,
+			rules,
+			createdAt: strictEnvelope.createdAt,
+		});
 		// Envelope persistence is the commit point: state cannot advance before this succeeds.
 		try {
 			await this.writeEvidenceRecord("completion_requested", {
 				signalDigest: strictEnvelope.envelopeHash,
 				reviewEnvelope: strictEnvelope,
+				advisorEnvelope: envelope,
 			});
 		} catch (error) {
 			this.taskState = transition(this.taskState, {
@@ -542,21 +581,6 @@ export class ComplianceRuntime {
 			evidenceRevision,
 			gitHead: currentGit.gitHead,
 			diffHash: currentGit.diffHash,
-		});
-		const envelope: ComplianceReviewEnvelope = Object.freeze({
-			reviewId: strictEnvelope.reviewId,
-			sessionId,
-			taskId: strictEnvelope.taskId,
-			projectId: strictEnvelope.projectId,
-			contractHash: strictEnvelope.contractHash as `sha256:${string}`,
-			evidenceRevision: strictEnvelope.evidenceRevision,
-			gitHead: strictEnvelope.gitHead,
-			diffHash: strictEnvelope.diffHash,
-			trigger: strictEnvelope.trigger,
-			attempt: strictEnvelope.attempt,
-			context,
-			rules,
-			createdAt: strictEnvelope.createdAt,
 		});
 		this.activeAdvisorEnvelope = envelope;
 		this.reviewDeps.registry.put(envelope);
@@ -883,19 +907,21 @@ export class ComplianceRuntime {
 		);
 		const expectedReviewId = `review:${queued.dedupeKey.slice("sha256:".length)}:${reviewAttempt}`;
 		if (retryEnvelope.reviewId !== expectedReviewId) throw new Error("Scheduler retry identity mismatch");
+		if (!this.activeAdvisorEnvelope) throw new Error("Authoritative Advisor Envelope is missing");
+		const retryAdvisorEnvelope = Object.freeze({
+			...this.activeAdvisorEnvelope,
+			reviewId: retryEnvelope.reviewId,
+			createdAt: retryEnvelope.createdAt,
+		});
 		await this.writeEvidenceRecord("completion_retry", {
 			signalDigest: retryEnvelope.envelopeHash,
 			reviewEnvelope: retryEnvelope,
+			advisorEnvelope: retryAdvisorEnvelope,
 		});
-		const previousReviewId = this.activeEnvelope.reviewId;
 		this.activeEnvelope = retryEnvelope;
+		this.activeAdvisorEnvelope = retryAdvisorEnvelope;
 		this.taskState = transition(this.taskState, { type: "retry", reviewId: retryEnvelope.reviewId });
-		const previous = this.reviewDeps.registry.get(previousReviewId);
-		if (previous) {
-			this.reviewDeps.registry.put(
-				Object.freeze({ ...previous, reviewId: retryEnvelope.reviewId, createdAt: retryEnvelope.createdAt }),
-			);
-		}
+		this.reviewDeps.registry.put(retryAdvisorEnvelope);
 		try {
 			await this.scheduler.pump();
 		} catch (error) {
@@ -1020,7 +1046,6 @@ export class ComplianceRuntime {
 						schemaVersion: 1,
 						taskState: this.taskState ? structuredClone(this.taskState) : null,
 						...(this.activeEnvelope ? { activeEnvelope: this.activeEnvelope } : {}),
-						...(this.activeAdvisorEnvelope ? { advisorEnvelope: this.activeAdvisorEnvelope } : {}),
 					});
 				}
 			}
@@ -1244,6 +1269,7 @@ export class ComplianceRuntime {
 		event: string,
 		extra: Partial<EvidenceRecord> & {
 			reviewEnvelope?: ReviewEnvelope;
+			advisorEnvelope?: ComplianceReviewEnvelope;
 			commitRecovery?: VerdictCommitRecovery;
 		},
 	): Promise<void> {
@@ -1251,7 +1277,7 @@ export class ComplianceRuntime {
 			return;
 		}
 
-		const record: VerdictCommitEvidenceRecord & { reviewEnvelope?: ReviewEnvelope } = {
+		const record: VerdictCommitEvidenceRecord = {
 			schemaVersion: 1,
 			timestamp: new Date().toISOString(),
 			taskId: this.taskState.taskId,
@@ -1263,6 +1289,7 @@ export class ComplianceRuntime {
 			verdictSummary: extra.verdictSummary,
 			worktreeFingerprint: extra.worktreeFingerprint ?? this.taskState.worktreeFingerprint,
 			...(extra.reviewEnvelope ? { reviewEnvelope: extra.reviewEnvelope } : {}),
+			...(extra.advisorEnvelope ? { advisorEnvelope: extra.advisorEnvelope } : {}),
 			...(extra.commitRecovery ? { commitRecovery: extra.commitRecovery } : {}),
 		};
 

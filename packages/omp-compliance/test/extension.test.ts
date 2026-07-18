@@ -449,6 +449,20 @@ describe("extension activate — no lazy file side-effects", () => {
 			newText: "export const value = 2;",
 		});
 		expect(decision).toEqual({ block: false, reasons: [] });
+		expect(
+			await api.fireToolCall(
+				"mcp__codebase_memory_mcp__index_repository",
+				{ repo_path: realpathSync(sessionRoot), mode: "fast" },
+				"policy-reindex",
+			),
+		).toEqual({ block: false, reasons: [] });
+		const staleDecision = await api.fireToolCall("edit", {
+			path: "src/index.ts",
+			oldText: "export const value = 1;",
+			newText: "export const value = 2;",
+		});
+		expect(staleDecision.block).toBe(true);
+		expect(staleDecision.reasons).toContain("missing_codebase_evidence");
 		writeFileSync(join(sessionRoot, "src/index.ts"), "export const value = 2;\n");
 
 		const restarted = new FakeExtensionAPI(
