@@ -105,17 +105,29 @@ describe("upstream API contract — REAL shapes", () => {
 
 		it("keeps the v17 Host declaration portable", () => {
 			const packageJson = JSON.parse(readFileSync(join(import.meta.dir, "../../package.json"), "utf8")) as {
+				dependencies?: Record<string, string>;
 				peerDependencies?: Record<string, string>;
+				peerDependenciesMeta?: Record<string, { optional?: boolean }>;
 				devDependencies?: Record<string, string>;
+				optionalDependencies?: Record<string, string>;
 			};
 			const lockfile = readFileSync(join(import.meta.dir, "../../../../bun.lock"), "utf8");
+			const dependencyValues = [
+				...Object.values(packageJson.dependencies ?? {}),
+				...Object.values(packageJson.devDependencies ?? {}),
+				...Object.values(packageJson.optionalDependencies ?? {}),
+				...Object.values(packageJson.peerDependencies ?? {}),
+			];
 
 			expect(packageJson.peerDependencies?.["@oh-my-pi/pi-coding-agent"]).toBe(">=17.0.1 <18");
+			expect(packageJson.peerDependenciesMeta?.["@oh-my-pi/pi-coding-agent"]).toEqual({ optional: true });
 			expect(packageJson.devDependencies?.["@oh-my-pi/pi-coding-agent"]).toBeUndefined();
-			expect(JSON.stringify(packageJson)).not.toContain("file:/Users/");
-			expect(JSON.stringify(packageJson)).not.toContain("oh-my-pi-v17-advisor-protocol");
-			expect(lockfile).not.toContain("file:/Users/");
-			expect(lockfile).not.toContain("oh-my-pi-v17-advisor-protocol");
+			expect(dependencyValues.some((value) => value.startsWith("file:"))).toBe(false);
+			for (const localPath of [/file:\/(?:Users|home)\//, /file:[A-Za-z]:[\\/]/]) {
+				expect(JSON.stringify(packageJson)).not.toMatch(localPath);
+				expect(lockfile).not.toMatch(localPath);
+			}
+			expect(lockfile).not.toMatch(/"[^"\n]*pi-coding-agent[^"\n]*":\s*\["@oh-my-pi\/pi-coding-agent@file:/);
 		});
 
 		it("registers all public tools with the v17 execute contract", () => {

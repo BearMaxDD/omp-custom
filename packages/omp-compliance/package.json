@@ -21,6 +21,11 @@
   "peerDependencies": {
     "@oh-my-pi/pi-coding-agent": ">=17.0.1 <18"
   },
+  "peerDependenciesMeta": {
+    "@oh-my-pi/pi-coding-agent": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@oh-my-pi/pi-agent-core": "17.0.1",
     "@biomejs/biome": "^1.9.4",

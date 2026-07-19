@@ -15,13 +15,15 @@ function defined(value: string | undefined, fallback: string): string {
 }
 
 function isSourceHash(value: string): value is `sha256:${string}` {
-	return value.startsWith("sha256:") && value.length > "sha256:".length;
+	return value === "sha256:development" || /^sha256:[0-9a-f]{64}$/.test(value);
 }
 
 function sourceHash(value: string | undefined): `sha256:${string}` {
 	const resolved = defined(value, "sha256:development");
 	if (!isSourceHash(resolved)) {
-		throw new Error("OMP compliance source hash must start with sha256: and include a value");
+		throw new Error(
+			"OMP compliance source hash must be sha256:development or sha256: followed by 64 lowercase hexadecimal characters",
+		);
 	}
 	return resolved;
 }
