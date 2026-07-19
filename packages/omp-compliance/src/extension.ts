@@ -51,6 +51,7 @@ import { deterministicEvidenceEventId } from "./evidence/event-log";
 import { EvidenceRepository } from "./evidence/evidence-repository";
 import { EvidenceStore } from "./evidence/evidence-store";
 import { SnapshotStore } from "./evidence/snapshot-store";
+import type { EmbeddedExtensionContext } from "./host/extension-api";
 import type { ProjectBinding } from "./project/project-identity";
 import { ProjectIdentityStore } from "./project/project-identity";
 import {
@@ -191,6 +192,7 @@ function evidenceMetadata(collector: CollectorRuntime): {
 export interface ComplianceExtensionHost {
 	logger: ExtensionAPI["logger"];
 	readonly advisorReviewCapabilities?: AdvisorReviewCapabilities;
+	readonly embeddedExtensionContext?: EmbeddedExtensionContext;
 	registerTool: ExtensionAPI["registerTool"];
 	registerCommand(
 		name: string,
@@ -223,6 +225,31 @@ export interface ComplianceExtensionHost {
 export function bindCollectorEvents(api: ComplianceExtensionHost, collector: CollectorRuntime): void {
 	api.on("tool_call", (event, context) => collector.recordToolCall(event, context));
 	api.on("tool_result", (event, context) => collector.recordToolResult(event, context));
+}
+
+function logEmbeddedExtensionDoctorChecks(api: ComplianceExtensionHost): void {
+	const embedding = api.embeddedExtensionContext;
+	const productionIdentity =
+		embedding?.identity.packageName === "@bearmaxdd/omp-compliance" &&
+		embedding.identity.protocol === "advisor-review/v1" &&
+		/^[0-9a-f]{40}$/.test(embedding.identity.gitCommit) &&
+		/^sha256:[0-9a-f]{64}$/.test(embedding.identity.sourceHash);
+	if (embedding && productionIdentity) {
+		api.logger.info(
+			`Doctor embedding: ready — ${embedding.identity.packageName} ${embedding.identity.packageVersion}`,
+		);
+		api.logger.info(`Doctor source: ready — ${embedding.identity.gitCommit} / ${embedding.identity.sourceHash}`);
+	} else {
+		api.logger.info("Doctor embedding: missing — embedded compliance build identity unavailable");
+		api.logger.info("Doctor source: missing — embedded compliance build identity unavailable");
+	}
+	if (embedding) {
+		api.logger.info(
+			`Doctor duplicate: ready — suppressed external duplicates: ${embedding.suppressedExternalDuplicates.length}`,
+		);
+	} else {
+		api.logger.info("Doctor duplicate: missing — embedded extension context unavailable");
+	}
 }
 
 function createLazyEvidenceStore(repoRoot: string): () => EvidenceStore {
@@ -615,6 +642,7 @@ export default function activate(api: ComplianceExtensionHost): void {
 	const deferredRuntime = runtimeProxy(getBundle);
 	const commandServices: ComplianceCommandServices = {
 		doctor: async (context) => {
+			logEmbeddedExtensionDoctorChecks(api);
 			const root = repositoryRoot(context.cwd);
 			let identity: ReturnType<typeof ProjectIdentityStore.inspect>;
 			let identityError: string | undefined;

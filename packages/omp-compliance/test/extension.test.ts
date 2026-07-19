@@ -367,6 +367,50 @@ describe("extension activate — no lazy file side-effects", () => {
 		rmSync(sessionRoot, { recursive: true, force: true });
 	});
 
+	it("真实命令 doctor 展示内置扩展身份与重复插件抑制状态", async () => {
+		const sessionRoot = mkdtempSync(join(tmpdir(), "ext-doctor-embedded-"));
+		Bun.spawnSync(["git", "init"], { cwd: sessionRoot });
+		const api = new FakeExtensionAPI(
+			createFakeExtensionContext({ cwd: sessionRoot, sessionId: "doctor-embedded-session" }),
+		);
+		api.embeddedExtensionContext = {
+			identity: {
+				packageName: "@bearmaxdd/omp-compliance",
+				packageVersion: "0.1.0",
+				gitCommit: "a".repeat(40),
+				sourceHash: `sha256:${"b".repeat(64)}`,
+				protocol: "advisor-review/v1",
+			},
+			suppressedExternalDuplicates: ["@bearmaxdd/omp-compliance"],
+		};
+		const activate = (await import("../src/extension")).default;
+		activate(api.toAPI());
+		await api.fireSessionStart();
+
+		await api.fireCommand("compliance", "doctor");
+
+		expect(api.logs.some((line) => line.includes("Doctor embedding: ready"))).toBe(true);
+		expect(api.logs.some((line) => line.includes("Doctor source: ready"))).toBe(true);
+		expect(api.logs.some((line) => line.includes("Doctor duplicate: ready"))).toBe(true);
+		rmSync(sessionRoot, { recursive: true, force: true });
+	});
+
+	it("doctor 在缺少内置扩展上下文时报告 embedding missing", async () => {
+		const sessionRoot = mkdtempSync(join(tmpdir(), "ext-doctor-no-embedding-"));
+		Bun.spawnSync(["git", "init"], { cwd: sessionRoot });
+		const api = new FakeExtensionAPI(
+			createFakeExtensionContext({ cwd: sessionRoot, sessionId: "doctor-no-embedding-session" }),
+		);
+		const activate = (await import("../src/extension")).default;
+		activate(api.toAPI());
+		await api.fireSessionStart();
+
+		await api.fireCommand("compliance", "doctor");
+
+		expect(api.logs.some((line) => line.includes("Doctor embedding: missing"))).toBe(true);
+		rmSync(sessionRoot, { recursive: true, force: true });
+	});
+
 	it("doctor 在 Codebase 工具未发现时不得仅凭派生绑定报告 ready", async () => {
 		const root = mkdtempSync(join(tmpdir(), "ext-doctor-no-codebase-"));
 		Bun.spawnSync(["git", "init"], { cwd: root });

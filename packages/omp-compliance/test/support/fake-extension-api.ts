@@ -15,6 +15,7 @@ import type {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { CustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
 import type { ComplianceExtensionHost } from "../../src/extension";
+import type { EmbeddedExtensionContext } from "../../src/host/extension-api";
 
 /**
  * A minimal fake implementation of ExtensionAPI for testing.
@@ -40,6 +41,7 @@ export class FakeExtensionAPI {
 		lifecycleEvents: true,
 		finalReceipt: true,
 	};
+	public embeddedExtensionContext: EmbeddedExtensionContext | undefined = undefined;
 
 	constructor(private readonly extensionContext: ExtensionContext = createFakeExtensionContext()) {}
 
@@ -211,6 +213,7 @@ export class FakeExtensionAPI {
 			getAllTools: this.getAllTools.bind(this),
 			requestAdvisorReview: this.requestAdvisorReview.bind(this),
 			advisorReviewCapabilities: this.advisorReviewCapabilities,
+			embeddedExtensionContext: this.embeddedExtensionContext,
 			logger: {
 				info: (message: string) => this.logs.push(message),
 				warn: () => {},
