@@ -1,15 +1,13 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { execFileSync } from "node:child_process";
 /**
  * Upstream API Contract Test.
  *
- * Guards the extension against drifting away from the pinned OMP v17 Host
- * package and against introducing local protocol-type intermediaries.
+ * Guards the extension's portable OMP v17 Host contract and against
+ * introducing local protocol-type intermediaries.
  */
-import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import type { AdvisorBeforeRunEvent } from "@oh-my-pi/pi-coding-agent/advisor/index";
 import ts from "typescript";
 import { createComplianceAdvisorHook } from "../../src/advisor/compliance-advisor-hook";
@@ -21,8 +19,6 @@ import { TopicStore } from "../../src/brainstorm/topic-store";
 import activate from "../../src/extension";
 import { FakeExtensionAPI } from "../support/fake-extension-api";
 
-const HOST_PACKAGE = "/Users/mima1234/Code/super/.worktrees/oh-my-pi-v17-advisor-protocol/packages/coding-agent";
-const HOST_HEAD = "2adbf91f6d73534342f194f99b1a305db37ae1cf";
 const PACKAGE_ROOT = join(import.meta.dir, "../..");
 const ROOT_TYPES_MODULE = join(PACKAGE_ROOT, "src/types");
 const ADVISOR_INDEX_MODULE = "@oh-my-pi/pi-coding-agent/advisor/index";
@@ -107,32 +103,19 @@ describe("upstream API contract — REAL shapes", () => {
 			expect(packageJson.devDependencies?.["@typescript/native-preview"]).toBe("7.0.0-dev.20260707.2");
 		});
 
-		it("resolves the v17 development dependency from the pinned Host worktree", () => {
+		it("keeps the v17 Host declaration portable", () => {
 			const packageJson = JSON.parse(readFileSync(join(import.meta.dir, "../../package.json"), "utf8")) as {
 				peerDependencies?: Record<string, string>;
 				devDependencies?: Record<string, string>;
 			};
+			const lockfile = readFileSync(join(import.meta.dir, "../../../../bun.lock"), "utf8");
 
 			expect(packageJson.peerDependencies?.["@oh-my-pi/pi-coding-agent"]).toBe(">=17.0.1 <18");
-			expect(packageJson.devDependencies?.["@oh-my-pi/pi-coding-agent"]).toBe(`file:${HOST_PACKAGE}`);
-
-			const resolvedPackageJson = realpathSync(
-				fileURLToPath(import.meta.resolve("@oh-my-pi/pi-coding-agent/package.json")),
-			);
-			expect(readFileSync(resolvedPackageJson, "utf8")).toBe(readFileSync(join(HOST_PACKAGE, "package.json"), "utf8"));
-			const resolvedTypes = join(dirname(resolvedPackageJson), "src/extensibility/extensions/types.ts");
-			expect(readFileSync(resolvedTypes, "utf8")).toBe(
-				readFileSync(join(HOST_PACKAGE, "src/extensibility/extensions/types.ts"), "utf8"),
-			);
-			const lockfile = readFileSync(join(import.meta.dir, "../../../../bun.lock"), "utf8");
-			expect(lockfile).toContain(
-				"@oh-my-pi/pi-coding-agent@file:../oh-my-pi-v17-advisor-protocol/packages/coding-agent",
-			);
-			expect(
-				execFileSync("git", ["-C", HOST_PACKAGE, "rev-parse", "HEAD"], {
-					encoding: "utf8",
-				}).trim(),
-			).toBe(HOST_HEAD);
+			expect(packageJson.devDependencies?.["@oh-my-pi/pi-coding-agent"]).toBeUndefined();
+			expect(JSON.stringify(packageJson)).not.toContain("file:/Users/");
+			expect(JSON.stringify(packageJson)).not.toContain("oh-my-pi-v17-advisor-protocol");
+			expect(lockfile).not.toContain("file:/Users/");
+			expect(lockfile).not.toContain("oh-my-pi-v17-advisor-protocol");
 		});
 
 		it("registers all public tools with the v17 execute contract", () => {

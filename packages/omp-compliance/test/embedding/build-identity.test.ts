@@ -1,12 +1,14 @@
 import { describe, expect, it } from "bun:test";
+import { resolve } from "node:path";
 import { embeddedComplianceBuildIdentity } from "../../src/embedding/build-identity";
 
 type BuildDefines = Record<string, string>;
 type BuildIdentityModule = typeof import("../../src/embedding/build-identity");
+const BUILD_IDENTITY_ENTRYPOINT = resolve(import.meta.dir, "../../src/embedding/build-identity.ts");
 
 async function embeddedIdentityFromDefines(defines: BuildDefines) {
 	const result = await Bun.build({
-		entrypoints: ["packages/omp-compliance/src/embedding/build-identity.ts"],
+		entrypoints: [BUILD_IDENTITY_ENTRYPOINT],
 		format: "esm",
 		target: "bun",
 		define: defines,
@@ -68,5 +70,15 @@ describe("embeddedComplianceBuildIdentity", () => {
 			protocol: "advisor-review/v1",
 		});
 		expect(Object.isFrozen(identity)).toBe(true);
+	});
+
+	it.each(["not-a-sha256-hash", "sha256:"])("rejects invalid source hash injection %s", async (sourceHash) => {
+		await expect(
+			embeddedIdentityFromDefines({
+				__OMP_COMPLIANCE_PACKAGE_VERSION__: '"1.2.3"',
+				__OMP_COMPLIANCE_GIT_COMMIT__: '"abc123"',
+				__OMP_COMPLIANCE_SOURCE_HASH__: JSON.stringify(sourceHash),
+			}),
+		).rejects.toThrow("OMP compliance source hash must start with sha256: and include a value");
 	});
 });
