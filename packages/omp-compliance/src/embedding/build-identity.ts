@@ -10,14 +10,24 @@ export interface EmbeddedComplianceBuildIdentity {
 	readonly protocol: "advisor-review/v1";
 }
 
+function defined(value: string | undefined, fallback: string): string {
+	return value === undefined || value.length === 0 ? fallback : value;
+}
+
 const buildIdentity = Object.freeze({
 	packageName: "@bearmaxdd/omp-compliance",
-	packageVersion: typeof __OMP_COMPLIANCE_PACKAGE_VERSION__ === "string" ? __OMP_COMPLIANCE_PACKAGE_VERSION__ : "development",
-	gitCommit: typeof __OMP_COMPLIANCE_GIT_COMMIT__ === "string" ? __OMP_COMPLIANCE_GIT_COMMIT__ : "development",
-	sourceHash:
-		typeof __OMP_COMPLIANCE_SOURCE_HASH__ === "string"
-			? (__OMP_COMPLIANCE_SOURCE_HASH__ as `sha256:${string}`)
-			: "sha256:development",
+	packageVersion: defined(
+		typeof __OMP_COMPLIANCE_PACKAGE_VERSION__ === "string" ? __OMP_COMPLIANCE_PACKAGE_VERSION__ : undefined,
+		"development",
+	),
+	gitCommit: defined(
+		typeof __OMP_COMPLIANCE_GIT_COMMIT__ === "string" ? __OMP_COMPLIANCE_GIT_COMMIT__ : undefined,
+		"development",
+	),
+	sourceHash: defined(
+		typeof __OMP_COMPLIANCE_SOURCE_HASH__ === "string" ? __OMP_COMPLIANCE_SOURCE_HASH__ : undefined,
+		"sha256:development",
+	) as `sha256:${string}`,
 	protocol: "advisor-review/v1",
 } satisfies EmbeddedComplianceBuildIdentity);
 
