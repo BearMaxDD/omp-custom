@@ -164,7 +164,7 @@ Bun `--compile` 生成的二进制必须包含 `compliance_complete`、`brainsto
 1. 在 `omp-custom` 完成功能、测试和提交；
 2. 记录该 commit 的全量门禁 Evidence；
 3. 在 `oh-my-pi/vendor/omp-custom` 更新 gitlink；
-4. 运行跨仓契约测试和双平台 release 验收；
+4. 运行跨仓契约测试、macOS 真实验收和 Linux 构建验收；
 5. 使用中文提交说明更新指针；
 6. 禁止引用未推送、脏工作区或浮动分支。
 
@@ -195,9 +195,9 @@ Doctor duplicate: ready — no external duplicate loaded
 - 伪造文件名但 package identity 不匹配时不得误去重。
 - 内置激活失败时 Session 创建失败关闭。
 
-### 9.2 成品二进制验收
+### 9.2 macOS ARM64 成品真实验收
 
-macOS ARM64 与 Linux x64 都必须在新鲜临时 HOME 中执行：
+macOS ARM64 必须在新鲜临时 HOME 中执行：
 
 1. 确认不存在用户级和项目级扩展；
 2. 运行 `--version`、`--help` 和 `--smoke-test`；
@@ -209,15 +209,28 @@ macOS ARM64 与 Linux x64 都必须在新鲜临时 HOME 中执行：
 8. 安装一个旧外部扩展夹具，确认只加载内置版本；
 9. 断开网络后重复关键启动检查。
 
-只验证 `file`、字符串、`--version` 或交叉编译成功不算 Linux 运行验收。
+只验证 `file`、字符串、`--version` 或编译成功，不能替代上述 macOS 真实闭环。
+
+### 9.3 Linux x64 构建验收
+
+Linux x64 不要求运行真实 Session 或完整 Advisor 闭环，只要求：
+
+- 交叉编译成功并生成 ELF x86-64 可执行文件；
+- 记录文件大小、SHA-256、ELF 架构、解释器和最低内核信息；
+- 静态确认二进制包含内置扩展 ID、构建身份、`compliance_complete` 和 `brainstorm_topic_ready`；
+- 构建日志不存在 native sentinel mismatch、未解析模块或外部扩展路径；
+- Linux 产物与 macOS 产物嵌入相同的 submodule commit 和源码 hash。
+
+Linux 真实运行可以作为发布后的增强验证，但不作为本设计的完成门。
 
 ## 10. 验收标准
 
 只有同时满足以下条件才可声明单二进制完成：
 
-- 两个平台均生成可执行产物并记录 SHA-256；
-- 新鲜 HOME 无需安装扩展即可通过真实 Doctor；
-- 完整 remediate 到 pass 闭环在两个平台通过；
+- macOS ARM64 与 Linux x64 均生成目标格式产物并记录 SHA-256；
+- macOS 新鲜 HOME 无需安装扩展即可通过真实 Doctor；
+- 完整 remediate 到 pass 闭环在 macOS ARM64 通过；
+- Linux x64 通过第 9.3 节定义的构建验收；
 - `--no-extensions` 不能绕过合规层；
 - 旧外部插件不会重复执行；
 - 二进制离线启动；
