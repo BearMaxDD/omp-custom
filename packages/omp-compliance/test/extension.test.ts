@@ -392,6 +392,49 @@ describe("extension activate — no lazy file side-effects", () => {
 		expect(api.logs.some((line) => line.includes("Doctor embedding: ready"))).toBe(true);
 		expect(api.logs.some((line) => line.includes("Doctor source: ready"))).toBe(true);
 		expect(api.logs.some((line) => line.includes("Doctor duplicate: ready"))).toBe(true);
+		expect(api.logs.some((line) => line.includes("Doctor embedding: ready") && line.includes("0.1.0"))).toBe(true);
+		expect(
+			api.logs.some(
+				(line) =>
+					line.includes("Doctor source: ready") &&
+					line.includes("a".repeat(40)) &&
+					line.includes(`sha256:${"b".repeat(64)}`),
+			),
+		).toBe(true);
+		expect(
+			api.logs.some(
+				(line) =>
+					line.includes("Doctor duplicate: ready") && line.includes("suppressed external duplicates: 1"),
+			),
+		).toBe(true);
+		rmSync(sessionRoot, { recursive: true, force: true });
+	});
+
+	it("doctor 在内置身份非生产时报告 embedding 与 source missing", async () => {
+		const sessionRoot = mkdtempSync(join(tmpdir(), "ext-doctor-nonproduction-"));
+		Bun.spawnSync(["git", "init"], { cwd: sessionRoot });
+		const api = new FakeExtensionAPI(
+			createFakeExtensionContext({ cwd: sessionRoot, sessionId: "doctor-nonproduction-session" }),
+		);
+		api.embeddedExtensionContext = {
+			identity: {
+				packageName: "@bearmaxdd/omp-compliance",
+				packageVersion: "0.1.0",
+				gitCommit: "development",
+				sourceHash: `sha256:${"b".repeat(64)}`,
+				protocol: "advisor-review/v1",
+			},
+			suppressedExternalDuplicates: [],
+		};
+		const activate = (await import("../src/extension")).default;
+		activate(api.toAPI());
+		await api.fireSessionStart();
+
+		await api.fireCommand("compliance", "doctor");
+
+		expect(api.logs.some((line) => line.includes("Doctor embedding: missing"))).toBe(true);
+		expect(api.logs.some((line) => line.includes("Doctor source: missing"))).toBe(true);
+		expect(api.logs.some((line) => line.includes("Doctor duplicate: ready"))).toBe(true);
 		rmSync(sessionRoot, { recursive: true, force: true });
 	});
 
@@ -408,6 +451,8 @@ describe("extension activate — no lazy file side-effects", () => {
 		await api.fireCommand("compliance", "doctor");
 
 		expect(api.logs.some((line) => line.includes("Doctor embedding: missing"))).toBe(true);
+		expect(api.logs.some((line) => line.includes("Doctor source: missing"))).toBe(true);
+		expect(api.logs.some((line) => line.includes("Doctor duplicate: missing"))).toBe(true);
 		rmSync(sessionRoot, { recursive: true, force: true });
 	});
 
